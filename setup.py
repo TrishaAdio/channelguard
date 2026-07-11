@@ -10,43 +10,31 @@ Run:  python setup.py
 from __future__ import annotations
 
 import asyncio
-from getpass import getpass
 
 from telethon import TelegramClient
 
 import config
-
-
-def ask(prompt: str, default: str | None = None, secret: bool = False) -> str:
-    label = prompt + (f" [{default}]" if default else "") + ": "
-    while True:
-        value = (getpass(label) if secret else input(label)).strip()
-        if not value and default is not None:
-            return default
-        if value:
-            return value
-        print("  (required)")
+import ui
+from ui import ask
 
 
 async def main() -> None:
-    print("=" * 60)
-    print(" Channel guard — setup")
-    print(" API_ID / API_HASH come from https://my.telegram.org")
-    print("=" * 60)
+    ui.banner("Channel guard - setup")
+    ui.info("API_ID / API_HASH come from " + ui.cyan("https://my.telegram.org"))
+    print()
 
     api_id = ask("API_ID")
     api_hash = ask("API_HASH", secret=True)
 
-    print("\n" + "-" * 60)
-    print(" Logging in your userbot account.")
-    print(" Telegram sends a login code to your app; enter it when asked.")
-    print("-" * 60)
+    print()
+    ui.rule("Logging in your userbot account")
+    ui.info("Telegram sends a login code to your app; enter it when asked.")
     phone = ask("Phone number (with country code, e.g. +15551234567)")
 
     client = TelegramClient(config.SESSION, int(api_id), api_hash)
     await client.start(phone=lambda: phone)  # prompts OTP + 2FA itself
     me = await client.get_me()
-    print(f"Logged in as {me.first_name} (id {me.id}).")
+    ui.success(f"Logged in as {ui.bold(me.first_name)} (id {me.id}).")
 
     # Choose the channel to guard (must be logged in first).
     from resolve import choose_channel
@@ -66,10 +54,11 @@ async def main() -> None:
         "OWNER": owner,
         "ROTATE_MINUTES": rotate,
     })
-    print(f"\nWrote {config.ENV_PATH}")
-    print("\nStart it with:\n  python guard.py")
-    print("\nMake sure this account is an ADMIN of the channel with "
-          "'Invite via link' + 'Ban users' rights.")
+    ui.success(f"Wrote {config.ENV_PATH}")
+    print()
+    ui.info("Start it with:  " + ui.bold("python guard.py"))
+    ui.warn("This account must be an ADMIN of the channel with "
+            "'Invite via link' + 'Ban users' rights.")
 
 
 if __name__ == "__main__":

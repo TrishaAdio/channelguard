@@ -122,20 +122,23 @@ async def list_channels(client: TelegramClient) -> list[dict]:
 
 async def choose_channel(client: TelegramClient) -> str:
     """Interactive terminal picker. Returns the chosen CHANNEL value."""
-    print("\nLoading your channels...")
+    import ui
+
+    ui.info("Loading your channels...")
     chans = await list_channels(client)
     if chans:
-        print("\nChannels this account is in:")
+        print(ui.bold("\nChannels this account is in:"))
         for i, c in enumerate(chans, 1):
             kind = "channel" if c["broadcast"] else "group"
-            adm = "admin" if c["can_manage"] else "NOT admin"
-            print(f"  {i:>2}. {c['title']}   [{kind}, {adm}]   id={c['id']}")
+            adm = ui.green("admin") if c["can_manage"] else ui.red("NOT admin")
+            print(f"  {ui.cyan(f'{i:>2}')}. {ui.bold(c['title'])}   "
+                  f"[{kind}, {adm}]   {ui.dim('id=' + str(c['id']))}")
     else:
-        print("\nThis account isn't in any channels yet.")
-    print("  (or paste a @username or an invite link)")
+        ui.warn("This account isn't in any channels yet.")
+    print(ui.dim("  (or paste a @username or an invite link)"))
 
     while True:
-        raw = input("\nPick a number, or paste @username / invite link / id: ").strip()
+        raw = input(ui.cyan("> ") + "Pick a number, or paste @username / link / id: ").strip()
         if not raw:
             continue
         if raw.isdigit() and chans:
@@ -143,9 +146,9 @@ async def choose_channel(client: TelegramClient) -> str:
             if 1 <= idx <= len(chans):
                 chosen = chans[idx - 1]
                 if not chosen["can_manage"]:
-                    print("  Note: this account isn't an admin there — it needs "
-                          "'Invite via link' + 'Ban users' rights to guard it.")
+                    ui.warn("This account isn't an admin there — it needs "
+                            "'Invite via link' + 'Ban users' rights to guard it.")
                 return str(chosen["id"])
-            print("  out of range")
+            ui.warn("out of range")
             continue
         return raw

@@ -18,6 +18,7 @@ from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import UpdateChannelParticipant
 
 import config
+import ui
 
 client: TelegramClient | None = None
 _state = {"self_id": 0, "channel": None, "channel_id": 0, "owner": None, "owner_id": 0}
@@ -39,7 +40,7 @@ async def rotate_once() -> None:
     link = res.link
     title = getattr(_state["channel"], "title", "channel")
     await notify(f"<b>{title}</b>\n<code>{link}</code>")
-    print(f"rotated invite link: {link}")
+    print(ui.green("[link] ") + f"rotated -> {ui.bold(link)}")
 
 
 async def rotate_loop() -> None:
@@ -57,10 +58,10 @@ async def kick(user_id: int) -> None:
         return
     try:
         await client.kick_participant(_state["channel"], user_id)
-        print(f"kicked {user_id}")
+        print(ui.yellow("[kick] ") + f"removed {user_id}")
         await notify(f"Kicked <code>{user_id}</code>")
     except Exception as e:  # noqa: BLE001 - e.g. admins can't be kicked
-        print(f"kick {user_id} failed: {type(e).__name__}: {e}")
+        print(ui.red("[kick] ") + f"{user_id} failed: {type(e).__name__}")
 
 
 async def on_participant(update):
@@ -90,12 +91,12 @@ async def main() -> None:
     if config.CHANNEL_RAW.strip():
         channel = await resolve_channel(client, config.channel())
         if channel is None:
-            print(f"\nCould not use CHANNEL={config.CHANNEL_RAW!r}. Pick one below.")
+            ui.warn(f"Could not use CHANNEL={config.CHANNEL_RAW!r}. Pick one below.")
     while channel is None:
         value = await choose_channel(client)
         channel = await resolve_channel(client, config.coerce(value))
         if channel is None:
-            print("  Couldn't access that one — try another.")
+            ui.warn("Couldn't access that one — try another.")
             continue
         config.save_env({"CHANNEL": value})
     _state["channel"] = channel
@@ -110,9 +111,9 @@ async def main() -> None:
     try:
         owner = await client.get_entity(owner_val)
     except Exception as e:  # noqa: BLE001
-        print(f"\nCouldn't resolve owner {owner_val!r}: {type(e).__name__}.")
-        print("Use a @username, or make sure the account has a chat with the "
-              "userbot (or is in the channel).")
+        ui.error(f"Couldn't resolve owner {owner_val!r}: {type(e).__name__}.")
+        ui.info("Use a @username, or make sure the account has a chat with the "
+                "userbot (or is in the channel).")
         await client.disconnect()
         return
     _state["owner"] = owner
@@ -123,10 +124,11 @@ async def main() -> None:
     asyncio.create_task(rotate_loop())
 
     title = getattr(channel, "title", channel)
-    print(f"Guarding: {title}")
-    print(f"Owner: {getattr(owner, 'first_name', owner.id)} (id {owner.id})")
-    print(f"Rotating invite link every {config.ROTATE_MINUTES:g} min; "
-          "joiners are kicked. Ctrl+C to stop.")
+    ui.banner("Channel guard - running")
+    ui.success(f"Guarding: {ui.bold(str(title))}")
+    ui.info(f"Owner: {getattr(owner, 'first_name', owner.id)} (id {owner.id})")
+    ui.info(f"Rotating invite link every {ui.bold(f'{config.ROTATE_MINUTES:g}')} min; "
+            "joiners are kicked. " + ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 
 

@@ -70,6 +70,10 @@ methods (`getQuickReplies` / `editMessage` with `quick_reply_shortcut_id`, or
 | `resolve.py`    | Channel resolver + interactive picker                         |
 | `guard.py`      | Link rotation (DM owner) + auto-kick joiners                  |
 | `quickreply.py` | 2nd userbot: keep `/demo` quick reply = the latest link       |
+| `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
+
+The setup, channel picker, and runtime output are **colorized** via `colorama`
+(auto-falls back to plain text if it isn't installed).
 
 ## `.env`
 

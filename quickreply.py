@@ -26,6 +26,7 @@ from telethon.tl.functions.messages import (
 from telethon.tl.types import InputPeerSelf, InputQuickReplyShortcut
 
 import config
+import ui
 
 # Matches private invite links:  https://t.me/+HASH  or  t.me/joinchat/HASH
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
@@ -78,11 +79,11 @@ async def on_msg(event):
     try:
         status = await set_shortcut(config.SHORTCUT, link)
         _state["last"] = link
-        print(f"/{config.SHORTCUT} -> {link} ({status})", flush=True)
+        print(ui.green(f"[/{config.SHORTCUT}] ") + f"{ui.bold(link)} ({status})", flush=True)
     except Exception as e:  # noqa: BLE001
-        print(f"quick-reply update failed: {type(e).__name__}: {e}")
+        ui.error(f"quick-reply update failed: {type(e).__name__}: {e}")
         if "PREMIUM" in str(e).upper():
-            print("  (Business quick replies require Telegram Premium.)")
+            ui.warn("Business quick replies require Telegram Premium.")
 
 
 async def main() -> None:
@@ -95,9 +96,10 @@ async def main() -> None:
 
     src_raw = config.LINK_SOURCE_RAW.strip()
     if not src_raw:
-        src_raw = input(
-            "Account that SENDS the invite link (username/id, blank = any): "
-        ).strip()
+        src_raw = ui.ask(
+            "Account that SENDS the invite link (username/id, blank = any)",
+            default="",
+        )
         if src_raw:
             config.save_env({"LINK_SOURCE": src_raw})
     if src_raw:
@@ -105,12 +107,14 @@ async def main() -> None:
             ent = await client.get_entity(config.coerce(src_raw))
             _state["source_id"] = ent.id
         except Exception:
-            print("Couldn't resolve LINK_SOURCE — accepting links from any private chat.")
+            ui.warn("Couldn't resolve LINK_SOURCE — accepting links from any private chat.")
 
     client.add_event_handler(on_msg, events.NewMessage)
     where = f"from {src_raw}" if _state["source_id"] else "from any private chat"
-    print(f"Quick-reply updater running as {me.first_name} (id {me.id}).")
-    print(f"Keeping /{config.SHORTCUT} = the latest invite link ({where}). Ctrl+C to stop.")
+    ui.banner("Quick-reply updater - running")
+    ui.success(f"As {ui.bold(me.first_name)} (id {me.id}).")
+    ui.info(f"Keeping /{ui.bold(config.SHORTCUT)} = the latest invite link ({where}). "
+            + ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 
 
