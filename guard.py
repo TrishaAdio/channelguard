@@ -67,30 +67,51 @@ async def rotate_loop() -> None:
         await asyncio.sleep(config.ROTATE_MINUTES * 60)
 
 
-async def kick(user_id: int, announce: bool = True) -> bool:
-    """Remove the user, then immediately lift the ban so it's a kick (they can
-    rejoin) — never a lasting ban. Returns True if removed."""
-    if user_id in (_state["self_id"], _state["owner_id"]):
-        return False
-    channel = _state["channel"]
+async def _resolve_user(user):
+    """A fully-resolved input peer (with access hash). A raw int often resolves
+    to an incomplete peer that the ban silently no-ops on."""
+    if not isinstance(user, int):
+        return user
     try:
-        await client(EditBannedRequest(channel, user_id, _KICK_RIGHTS))   # remove
-        await asyncio.sleep(0.4)
-        await client(EditBannedRequest(channel, user_id, _UNBAN_RIGHTS))  # unban
-        print(ui.yellow("[kick] ") + f"removed + unbanned {user_id}")
+        return await client.get_input_entity(user)
+    except Exception:
+        return user
+
+
+async def kick(user, announce: bool = True) -> bool:
+    """Remove the user via kick_participant (ban+unban, no lasting ban). Returns
+    True if removed. `user` may be an entity (preferred) or a raw id."""
+    uid = user if isinstance(user, int) else getattr(user, "id", user)
+    if uid in (_state["self_id"], _state["owner_id"]):
+        return False
+    try:
+        target = await _resolve_user(user)
+        # kick_participant bans then immediately unbans -> removed, not banned.
+        await client.kick_participant(_state["channel"], target)
+        print(ui.yellow("[kick] ") + f"removed {uid}")
         if announce:
-            await notify(f"Kicked <code>{user_id}</code>")
+            await notify(f"Kicked <code>{uid}</code>")
         return True
     except Exception as e:  # noqa: BLE001 - e.g. admins can't be kicked
-        print(ui.red("[kick] ") + f"{user_id} failed: {type(e).__name__}")
+        print(ui.red("[kick] ") + f"{uid} failed: {type(e).__name__}: {e}")
         return False
+
+
+async def _member_count() -> int | None:
+    try:
+        return (await client.get_participants(_state["channel"], limit=1)).total
+    except Exception:
+        return None
 
 
 async def sweep_members() -> int:
     """Security check: kick every non-admin member (catches anyone who joined
     while the guard was offline — the live handler only sees new joins)."""
     channel = _state["channel"]
-    kicked = 0
+    before = await _member_count()
+
+    # Collect first, then kick — kicking while iterating can skip members.
+    targets = []
     try:
         async for user in client.iter_participants(channel):
             if user.id in (_state["self_id"], _state["owner_id"]):
@@ -98,11 +119,22 @@ async def sweep_members() -> int:
             p = getattr(user, "participant", None)
             if isinstance(p, (ChannelParticipantCreator, ChannelParticipantAdmin)):
                 continue  # keep admins/creator
-            if await kick(user.id, announce=False):
-                kicked += 1
-            await asyncio.sleep(0.3)
+            targets.append(user)
     except Exception as e:  # noqa: BLE001
-        print(ui.red("[sweep] ") + f"failed: {type(e).__name__}: {e}")
+        print(ui.red("[sweep] ") + f"list failed: {type(e).__name__}: {e}")
+
+    kicked = 0
+    for user in targets:
+        if await kick(user, announce=False):
+            kicked += 1
+
+    after = await _member_count()
+    if before is not None and after is not None:
+        print(ui.dim(f"[sweep] members {before} -> {after}"))
+        if kicked and after >= before:
+            ui.warn("Kicks reported success but the member count didn't drop — "
+                    "this account likely can't actually remove users here "
+                    "(needs full admin with 'Ban users' / 'Remove users').")
     return kicked
 
 
