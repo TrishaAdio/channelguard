@@ -63,10 +63,21 @@ On each new link it swaps the link inside the shortcut's messages in place
 `quick_reply_shortcut_id`), preserving all other text and entities.
 
 With `GREET_NEW=1` it also acts as a **first-contact auto-responder**: when
-anyone DMs this account for the **first time**, it copies your current Business
-**away message** and sends it to them (via `users.getFullUser` ->
-`business_away_message.shortcut_id` -> `sendQuickReplyMessages`). Greeted user
-ids are remembered in `data/greeted.json`, so nobody is greeted twice.
+someone starts a **brand-new** DM conversation (their first-ever message), it
+sends them your **greeting post**. Existing chats are never greeted, and each
+user is greeted at most once (`data/greeted.json`).
+
+Set the greeting from your own **Saved Messages** — no Premium needed:
+
+| Saved Messages command | Effect                                  |
+|------------------------|-----------------------------------------|
+| reply to a post + `/set` | use that post as the greeting         |
+| `/unset`               | clear the greeting                      |
+| `/show`                | whether a greeting is set               |
+
+The greeting post can be anything (text, media, markdown, premium emoji) and its
+invite link is kept current on each rotation too. If no greeting is set, it
+falls back to the Business away message (`business_away_message.shortcut_id`).
 
 > Business quick replies require **Telegram Premium** on that account.
 

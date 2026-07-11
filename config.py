@@ -30,6 +30,7 @@ ENV_PATH = BASE_DIR / ".env"
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 GREETED_FILE = DATA_DIR / "greeted.json"     # user ids already auto-replied to
+GREETING_FILE = DATA_DIR / "greeting.json"   # the /set greeting post reference
 
 
 def coerce(s: str):
