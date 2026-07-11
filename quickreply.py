@@ -262,6 +262,31 @@ async def _swap_in_greeting(new_link: str) -> str:
         return f"edit error: {type(e).__name__}: {e}"
 
 
+async def _current_link():
+    """The latest invite link: what the guard last sent, else whatever link is
+    already in the /SHORTCUT post."""
+    if _state["last"]:
+        return _state["last"]
+    try:
+        res = await client(GetQuickRepliesRequest(hash=0))
+        for q in getattr(res, "quick_replies", []) or []:
+            if getattr(q, "shortcut", None) != config.SHORTCUT:
+                continue
+            msgs = await client(GetQuickReplyMessagesRequest(
+                shortcut_id=q.shortcut_id, hash=0, id=None))
+            for m in getattr(msgs, "messages", []) or []:
+                hit = FIND_LINK_RE.search(m.message or "")
+                if hit:
+                    return hit.group(0)
+                for e in (m.entities or []):
+                    url = getattr(e, "url", None)
+                    if url and FIND_LINK_RE.search(url):
+                        return url
+    except Exception:
+        pass
+    return None
+
+
 async def _is_new_user(event) -> bool:
     """True only if this is the first message in the conversation."""
     try:
@@ -292,7 +317,14 @@ async def on_command(event):
             await event.reply("Reply to a post with /set to use it as the greeting.")
             return
         _save_greeting(event.chat_id, reply.id)
-        await event.reply("Greeting saved. New users who DM you first will get this.")
+        # Apply the current link right away — no restart, no waiting for the
+        # next rotation.
+        link = await _current_link()
+        note = ""
+        if link:
+            result = await _swap_in_greeting(link)
+            note = f"\nLink -> {link} ({result})"
+        await event.reply("Greeting saved. New users who DM you first get this." + note)
     elif low == "/unset":
         await event.reply("Greeting cleared." if _clear_greeting() else "No greeting was set.")
     elif low == "/show":
