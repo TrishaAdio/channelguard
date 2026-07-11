@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import (
@@ -104,13 +105,29 @@ async def _member_count() -> int | None:
         return None
 
 
+async def _set_banned(user, rights) -> bool:
+    """Apply banned rights to one user (resolves a full peer first). Waits out
+    short flood limits. Returns True on success."""
+    target = await _resolve_user(user)
+    for _ in range(2):
+        try:
+            await client(EditBannedRequest(_state["channel"], target, rights))
+            return True
+        except FloodWaitError as e:
+            await asyncio.sleep(min(int(e.seconds), 60) + 1)
+        except Exception as e:  # noqa: BLE001
+            print(ui.red("[ban] ") + f"{getattr(user, 'id', user)}: {type(e).__name__}")
+            return False
+    return False
+
+
 async def sweep_members() -> int:
-    """Security check: kick every non-admin member (catches anyone who joined
-    while the guard was offline — the live handler only sees new joins)."""
+    """Security sweep in two phases: BAN every non-admin member first (that is
+    what actually removes them), THEN unban them all so nobody is left banned."""
     channel = _state["channel"]
     before = await _member_count()
 
-    # Collect first, then kick — kicking while iterating can skip members.
+    # Collect all non-admin members first.
     targets = []
     try:
         async for user in client.iter_participants(channel):
@@ -123,19 +140,29 @@ async def sweep_members() -> int:
     except Exception as e:  # noqa: BLE001
         print(ui.red("[sweep] ") + f"list failed: {type(e).__name__}: {e}")
 
-    kicked = 0
+    # Phase 1 — ban everyone (removes them from the channel).
+    banned = []
     for user in targets:
-        if await kick(user, announce=False):
-            kicked += 1
+        if await _set_banned(user, _KICK_RIGHTS):
+            banned.append(user)
+            print(ui.yellow("[ban] ") + f"removed {user.id}")
+            await asyncio.sleep(0.2)
+
+    # Phase 2 — unban them all (kick, not a lasting ban).
+    for user in banned:
+        await _set_banned(user, _UNBAN_RIGHTS)
+        await asyncio.sleep(0.2)
+    if banned:
+        print(ui.green("[unban] ") + f"cleared {len(banned)} ban(s)")
 
     after = await _member_count()
     if before is not None and after is not None:
         print(ui.dim(f"[sweep] members {before} -> {after}"))
-        if kicked and after >= before:
-            ui.warn("Kicks reported success but the member count didn't drop — "
-                    "this account likely can't actually remove users here "
-                    "(needs full admin with 'Ban users' / 'Remove users').")
-    return kicked
+        if banned and after >= before:
+            ui.warn("Banned users but the member count didn't drop — this "
+                    "account likely can't remove users here (needs full admin "
+                    "with 'Ban users').")
+    return len(banned)
 
 
 async def sweep_loop() -> None:
