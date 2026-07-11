@@ -99,38 +99,46 @@ def _u16(s: str) -> int:
 
 
 def _swap_link(text: str, entities, new_link: str):
-    """Replace the first invite link in `text` with `new_link`, shifting all
-    entity offsets/lengths so formatting + custom emoji stay aligned.
+    """Point the invite link at `new_link`, covering BOTH forms:
+      (a) a hyperlink where the URL lives in a text_url entity's `.url`, and
+      (b) a raw link in the visible text (offsets/lengths are re-aligned so
+          formatting + custom emoji stay attached).
 
-    Returns (new_text, new_entities) or None if there's nothing to change.
+    Returns (new_text, entities) or None if nothing needed changing.
     """
-    m = FIND_LINK_RE.search(text or "")
-    if not m:
-        return None
-    old = m.group(0)
-    if old == new_link:
-        return None
+    entities = list(entities or [])
+    changed = False
 
-    pi = m.start()
-    o = _u16(text[:pi])          # utf-16 offset where the link starts
-    old_len = _u16(old)
-    new_len = _u16(new_link)
-    delta = new_len - old_len
-    r_start, r_end = o, o + old_len
+    # (a) hyperlinked invite links -> just repoint the entity's url
+    for e in entities:
+        url = getattr(e, "url", None)
+        if url and FIND_LINK_RE.search(url) and url != new_link:
+            e.url = new_link
+            changed = True
 
-    new_text = text[:pi] + new_link + text[pi + len(old):]
+    # (b) a raw invite link in the visible text -> swap + shift offsets
+    new_text = text or ""
+    m = FIND_LINK_RE.search(new_text)
+    if m and m.group(0) != new_link:
+        old = m.group(0)
+        pi = m.start()
+        o = _u16(new_text[:pi])
+        old_len = _u16(old)
+        new_len = _u16(new_link)
+        delta = new_len - old_len
+        r_start, r_end = o, o + old_len
+        for e in entities:
+            start, end = e.offset, e.offset + e.length
+            if end <= r_start:
+                pass                              # before the link
+            elif start >= r_end:
+                e.offset = e.offset + delta       # after -> shift
+            else:
+                e.length = max(0, e.length + delta)  # covers/equals -> resize
+        new_text = new_text[:pi] + new_link + new_text[pi + len(old):]
+        changed = True
 
-    new_entities = []
-    for e in (entities or []):
-        start, end = e.offset, e.offset + e.length
-        if end <= r_start:
-            pass                                  # entirely before the link
-        elif start >= r_end:
-            e.offset = e.offset + delta           # entirely after -> shift
-        else:
-            e.length = max(0, e.length + delta)   # covers/equals the link -> resize
-        new_entities.append(e)
-    return new_text, new_entities
+    return (new_text, entities) if changed else None
 
 
 async def _swap_in_shortcut(shortcut_id: int, new_link: str) -> int:
@@ -235,16 +243,24 @@ async def _swap_in_greeting(new_link: str) -> bool:
         return False
     try:
         src = await client.get_messages(g["chat_id"], ids=g["message_id"])
-        if src is None:
-            return False
-        swapped = _swap_link(src.message or "", src.entities, new_link)
-        if swapped is None:
-            return False
-        new_text, ents = swapped
+    except Exception as e:  # noqa: BLE001
+        ui.error(f"greeting fetch failed: {type(e).__name__}: {e}")
+        return False
+    if src is None:
+        ui.warn("Greeting post not found (deleted?). Re-set it with /set.")
+        return False
+    swapped = _swap_link(src.message or "", src.entities, new_link)
+    if swapped is None:
+        return False  # no invite link in the greeting, or already current
+    new_text, ents = swapped
+    try:
         await client.edit_message(g["chat_id"], g["message_id"], new_text,
                                   formatting_entities=ents or None)
         return True
-    except Exception:
+    except MessageNotModifiedError:
+        return False
+    except Exception as e:  # noqa: BLE001
+        ui.error(f"greeting edit failed: {type(e).__name__}: {e}")
         return False
 
 

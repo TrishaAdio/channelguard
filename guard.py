@@ -110,14 +110,36 @@ async def unban_all() -> int:
     return cleared
 
 
+def _can_ban(channel) -> bool:
+    """Whether this account can remove users (creator, or admin with ban_users)."""
+    if getattr(channel, "creator", False):
+        return True
+    ar = getattr(channel, "admin_rights", None)
+    return bool(ar and getattr(ar, "ban_users", False))
+
+
 async def on_participant(update):
     if not isinstance(update, UpdateChannelParticipant):
         return
-    if update.channel_id != _state["channel_id"]:
+    if _state["channel_id"] and update.channel_id != _state["channel_id"]:
         return
-    # A join: no previous participant, a new one present.
-    if update.prev_participant is None and update.new_participant is not None:
+    joined = update.prev_participant is None and update.new_participant is not None
+    print(ui.dim(
+        f"[participant] user={update.user_id} "
+        f"prev={type(update.prev_participant).__name__ if update.prev_participant else None} "
+        f"new={type(update.new_participant).__name__ if update.new_participant else None}"
+        f" -> {'JOIN' if joined else 'change'}"
+    ))
+    if joined:
         await kick(update.user_id)
+
+
+async def on_chat_action(event):
+    """Backup path (fires for supergroups; broadcast channels use the raw update)."""
+    if not (event.user_joined or event.user_added):
+        return
+    for uid in (event.user_ids or ([event.user_id] if event.user_id else [])):
+        await kick(uid)
 
 
 async def main() -> None:
@@ -148,6 +170,12 @@ async def main() -> None:
     _state["channel"] = channel
     _state["channel_id"] = channel.id
 
+    if not _can_ban(channel):
+        ui.warn("This account is NOT an admin with 'Ban users' rights on that "
+                "channel — auto-kick WON'T work (Telegram won't send join "
+                "updates and kicks are rejected). Make it an admin with the "
+                "'Ban users' right, then restart.")
+
     # --- owner --------------------------------------------------------------
     owner_val = config.owner()
     if not owner_val:
@@ -171,7 +199,11 @@ async def main() -> None:
         ui.success(f"Unbanned {cleared} previously-banned user(s).")
 
     # --- run ----------------------------------------------------------------
-    client.add_event_handler(on_participant, events.Raw(UpdateChannelParticipant))
+    # Raw participant updates catch broadcast-channel joins; ChatAction is a
+    # backup for supergroups. Listen to ALL raw updates and filter in-handler
+    # (a type-filtered Raw can miss updates on some layers).
+    client.add_event_handler(on_participant, events.Raw)
+    client.add_event_handler(on_chat_action, events.ChatAction(chats=channel))
     asyncio.create_task(rotate_loop())
 
     title = getattr(channel, "title", channel)
