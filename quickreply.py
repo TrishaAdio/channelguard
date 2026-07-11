@@ -2,8 +2,9 @@
 
 Runs on the account that holds the Business quick reply (typically the OWNER).
 When it receives a message containing a t.me invite link from LINK_SOURCE (the
-guard account), it updates the "/SHORTCUT" quick reply so it contains ONLY that
-link — nothing else. So the shortcut always expands to the current invite link.
+guard account), it swaps ONLY the invite link inside your "/SHORTCUT" post and
+leaves everything else untouched — your text, markdown formatting, and premium
+(custom) emoji all stay exactly as they were.
 
 Business quick replies require Telegram Premium.
 
@@ -18,51 +19,105 @@ import re
 from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.messages import (
-    DeleteQuickReplyShortcutRequest,
     EditMessageRequest,
     GetQuickRepliesRequest,
+    GetQuickReplyMessagesRequest,
     SendMessageRequest,
 )
-from telethon.tl.types import InputPeerSelf, InputQuickReplyShortcut
+from telethon.tl.types import (
+    InputPeerSelf,
+    InputQuickReplyShortcut,
+    MessageMediaWebPage,
+)
 
 import config
 import ui
 
-# Matches private invite links:  https://t.me/+HASH  or  t.me/joinchat/HASH
+# The link the guard sends us (full https invite link).
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
+# The link inside the saved post (may or may not include the scheme).
+FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 
 client: TelegramClient | None = None
 _state = {"source_id": None, "last": None}
 
 
-async def set_shortcut(name: str, text: str) -> str:
-    """Make the quick reply `name` contain exactly one message: `text`."""
+def _u16(s: str) -> int:
+    """Length in UTF-16 code units (how Telegram counts entity offsets)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _swap_link(text: str, entities, new_link: str):
+    """Replace the first invite link in `text` with `new_link`, shifting all
+    entity offsets/lengths so formatting + custom emoji stay aligned.
+
+    Returns (new_text, new_entities) or None if there's nothing to change.
+    """
+    m = FIND_LINK_RE.search(text or "")
+    if not m:
+        return None
+    old = m.group(0)
+    if old == new_link:
+        return None
+
+    pi = m.start()
+    o = _u16(text[:pi])          # utf-16 offset where the link starts
+    old_len = _u16(old)
+    new_len = _u16(new_link)
+    delta = new_len - old_len
+    r_start, r_end = o, o + old_len
+
+    new_text = text[:pi] + new_link + text[pi + len(old):]
+
+    new_entities = []
+    for e in (entities or []):
+        start, end = e.offset, e.offset + e.length
+        if end <= r_start:
+            pass                                  # entirely before the link
+        elif start >= r_end:
+            e.offset = e.offset + delta           # entirely after -> shift
+        else:
+            e.length = max(0, e.length + delta)   # covers/equals the link -> resize
+        new_entities.append(e)
+    return new_text, new_entities
+
+
+async def update_link(name: str, new_link: str) -> str:
     res = await client(GetQuickRepliesRequest(hash=0))
     shortcuts = getattr(res, "quick_replies", []) or []
     target = next((q for q in shortcuts if getattr(q, "shortcut", None) == name), None)
 
-    # Exactly one message -> edit it in place (no flicker, keeps the shortcut).
-    if target is not None and getattr(target, "count", 0) == 1:
+    # No saved post yet -> create a minimal one (just the link) so it works.
+    if target is None:
+        await client(SendMessageRequest(
+            peer=InputPeerSelf(), message=new_link,
+            quick_reply_shortcut=InputQuickReplyShortcut(shortcut=name),
+            random_id=random.randrange(-(2 ** 63), 2 ** 63),
+        ))
+        return "created (no existing post to preserve)"
+
+    msgs = await client(GetQuickReplyMessagesRequest(
+        shortcut_id=target.shortcut_id, hash=0, id=None,
+    ))
+    updated = 0
+    for msg in getattr(msgs, "messages", []) or []:
+        text = getattr(msg, "message", "") or ""
+        swapped = _swap_link(text, getattr(msg, "entities", None), new_link)
+        if swapped is None:
+            continue
+        new_text, new_entities = swapped
+        had_preview = isinstance(getattr(msg, "media", None), MessageMediaWebPage)
         try:
             await client(EditMessageRequest(
-                peer=InputPeerSelf(), id=target.top_message, message=text,
+                peer=InputPeerSelf(), id=msg.id, message=new_text,
+                entities=new_entities or None,
                 quick_reply_shortcut_id=target.shortcut_id,
+                no_webpage=not had_preview,
             ))
-            return "edited"
+            updated += 1
         except MessageNotModifiedError:
-            return "unchanged"
-
-    # Wrong number of messages -> wipe the shortcut so only the link remains.
-    if target is not None:
-        await client(DeleteQuickReplyShortcutRequest(shortcut_id=target.shortcut_id))
-
-    # (Re)create by sending one message into the shortcut.
-    await client(SendMessageRequest(
-        peer=InputPeerSelf(), message=text,
-        quick_reply_shortcut=InputQuickReplyShortcut(shortcut=name),
-        random_id=random.randrange(-(2 ** 63), 2 ** 63),
-    ))
-    return "created"
+            pass
+    return f"updated link in {updated} message(s)" if updated else "no link in the post"
 
 
 async def on_msg(event):
@@ -77,7 +132,7 @@ async def on_msg(event):
     if link == _state["last"]:
         return
     try:
-        status = await set_shortcut(config.SHORTCUT, link)
+        status = await update_link(config.SHORTCUT, link)
         _state["last"] = link
         print(ui.green(f"[/{config.SHORTCUT}] ") + f"{ui.bold(link)} ({status})", flush=True)
     except Exception as e:  # noqa: BLE001

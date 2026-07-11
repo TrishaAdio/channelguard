@@ -34,9 +34,12 @@ minutes, and joiners get removed.
 
 ## Quick-reply userbot (`quickreply.py`) — optional second account
 
-Keeps a Telegram **Business quick reply** (default `/demo`) always equal to the
-**latest invite link** — only the link, nothing else. So typing `/demo` in a
-Business chat expands to the current link.
+Keeps your **Business quick reply** (default `/demo`) pointing at the **latest
+invite link**. It swaps **only the link** inside your post and leaves everything
+else exactly as-is — your text, markdown formatting, and premium (custom) emoji
+are preserved (entity offsets are re-aligned automatically). Set up your
+`/demo` post once (link + whatever text/emoji you want); the bot only rewrites
+the link part on each rotation.
 
 How it fits together:
 
