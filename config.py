@@ -20,6 +20,8 @@ ROTATE_MINUTES = float(os.getenv("ROTATE_MINUTES", "5"))
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")
+# Also swap the link inside the Business AWAY message (if one is set).
+UPDATE_AWAY = os.getenv("UPDATE_AWAY", "1").strip().lower() not in ("0", "false", "no", "")
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session

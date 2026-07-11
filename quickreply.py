@@ -24,9 +24,11 @@ from telethon.tl.functions.messages import (
     GetQuickReplyMessagesRequest,
     SendMessageRequest,
 )
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     InputPeerSelf,
     InputQuickReplyShortcut,
+    InputUserSelf,
     MessageMediaWebPage,
 )
 
@@ -82,6 +84,33 @@ def _swap_link(text: str, entities, new_link: str):
     return new_text, new_entities
 
 
+async def _swap_in_shortcut(shortcut_id: int, new_link: str) -> int:
+    """Swap the link inside every message of a quick-reply shortcut. Returns
+    how many messages were changed."""
+    msgs = await client(GetQuickReplyMessagesRequest(
+        shortcut_id=shortcut_id, hash=0, id=None,
+    ))
+    updated = 0
+    for msg in getattr(msgs, "messages", []) or []:
+        text = getattr(msg, "message", "") or ""
+        swapped = _swap_link(text, getattr(msg, "entities", None), new_link)
+        if swapped is None:
+            continue
+        new_text, new_entities = swapped
+        had_preview = isinstance(getattr(msg, "media", None), MessageMediaWebPage)
+        try:
+            await client(EditMessageRequest(
+                peer=InputPeerSelf(), id=msg.id, message=new_text,
+                entities=new_entities or None,
+                quick_reply_shortcut_id=shortcut_id,
+                no_webpage=not had_preview,
+            ))
+            updated += 1
+        except MessageNotModifiedError:
+            pass
+    return updated
+
+
 async def update_link(name: str, new_link: str) -> str:
     res = await client(GetQuickRepliesRequest(hash=0))
     shortcuts = getattr(res, "quick_replies", []) or []
@@ -96,28 +125,22 @@ async def update_link(name: str, new_link: str) -> str:
         ))
         return "created (no existing post to preserve)"
 
-    msgs = await client(GetQuickReplyMessagesRequest(
-        shortcut_id=target.shortcut_id, hash=0, id=None,
-    ))
-    updated = 0
-    for msg in getattr(msgs, "messages", []) or []:
-        text = getattr(msg, "message", "") or ""
-        swapped = _swap_link(text, getattr(msg, "entities", None), new_link)
-        if swapped is None:
-            continue
-        new_text, new_entities = swapped
-        had_preview = isinstance(getattr(msg, "media", None), MessageMediaWebPage)
-        try:
-            await client(EditMessageRequest(
-                peer=InputPeerSelf(), id=msg.id, message=new_text,
-                entities=new_entities or None,
-                quick_reply_shortcut_id=target.shortcut_id,
-                no_webpage=not had_preview,
-            ))
-            updated += 1
-        except MessageNotModifiedError:
-            pass
+    updated = await _swap_in_shortcut(target.shortcut_id, new_link)
     return f"updated link in {updated} message(s)" if updated else "no link in the post"
+
+
+async def update_away_message(new_link: str):
+    """Swap the link inside the Business AWAY message, if one is configured.
+
+    Returns a status string, or None if there's no away message set.
+    """
+    full = await client(GetFullUserRequest(InputUserSelf()))
+    away = getattr(full.full_user, "business_away_message", None)
+    shortcut_id = getattr(away, "shortcut_id", None) if away else None
+    if not shortcut_id:
+        return None
+    updated = await _swap_in_shortcut(shortcut_id, new_link)
+    return f"updated {updated} message(s)" if updated else "no link in away msg"
 
 
 async def on_msg(event):
@@ -133,8 +156,12 @@ async def on_msg(event):
         return
     try:
         status = await update_link(config.SHORTCUT, link)
-        _state["last"] = link
         print(ui.green(f"[/{config.SHORTCUT}] ") + f"{ui.bold(link)} ({status})", flush=True)
+        if config.UPDATE_AWAY:
+            away = await update_away_message(link)
+            if away is not None:
+                print(ui.green("[away] ") + f"{ui.bold(link)} ({away})", flush=True)
+        _state["last"] = link
     except Exception as e:  # noqa: BLE001
         ui.error(f"quick-reply update failed: {type(e).__name__}: {e}")
         if "PREMIUM" in str(e).upper():
@@ -168,7 +195,8 @@ async def main() -> None:
     where = f"from {src_raw}" if _state["source_id"] else "from any private chat"
     ui.banner("Quick-reply updater - running")
     ui.success(f"As {ui.bold(me.first_name)} (id {me.id}).")
-    ui.info(f"Keeping /{ui.bold(config.SHORTCUT)} = the latest invite link ({where}). "
+    targets = f"/{config.SHORTCUT}" + (" + away message" if config.UPDATE_AWAY else "")
+    ui.info(f"Keeping {ui.bold(targets)} link current ({where}). "
             + ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 

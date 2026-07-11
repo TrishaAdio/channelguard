@@ -58,9 +58,13 @@ quickreply.py (account B, the owner)  --sees the link-->  updates /demo
 python quickreply.py      # first run: logs in this account + asks LINK_SOURCE
 ```
 
-On each new link it updates the shortcut in place via the MTProto quick-reply
-methods (`getQuickReplies` / `editMessage` with `quick_reply_shortcut_id`, or
-`deleteQuickReplyShortcut` + `sendMessage` with `quick_reply_shortcut`).
+On each new link it swaps the link inside the shortcut's messages in place
+(`getQuickReplies` -> `getQuickReplyMessages` -> `editMessage` with
+`quick_reply_shortcut_id`), preserving all other text and entities.
+
+With `UPDATE_AWAY=1` it also swaps the link inside your Business **away message**
+(found via `users.getFullUser` -> `business_away_message.shortcut_id`), same
+surgical swap — only the link changes.
 
 > Business quick replies require **Telegram Premium** on that account.
 
