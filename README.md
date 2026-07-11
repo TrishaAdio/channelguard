@@ -4,10 +4,12 @@ Locks down a channel's access:
 
 1. Every **`ROTATE_MINUTES`** (default 5) it **revokes** the channel's invite
    link, issues a **fresh** one, and **DMs it to the owner**.
-2. Anyone who **joins** the channel is **kicked immediately** (the owner and
-   admins are exempt).
+2. Anyone who **joins** the channel is **kicked and immediately unbanned** —
+   removed but free to rejoin later, never a lasting ban (owner and admins are
+   exempt). On startup it also **clears every existing ban** in the channel.
 
-So a leaked link dies within minutes, and nobody who slips in stays.
+So a leaked link dies within minutes, nobody who slips in stays, and your
+channel never accumulates a banned-users list.
 
 ## Setup
 
@@ -111,5 +113,7 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 - The owner is resolved by `get_entity` — a **@username** always works. A bare
   user id works only if the account already shares a chat with the userbot
   (e.g. the owner is in the channel).
+- Kicks are ban-then-unban, so removed users are **not** left banned and can
+  rejoin (via a future link). Startup clears any pre-existing bans too.
 - Admins can't be kicked (Telegram restriction); those attempts are ignored.
 - `.env` and `*.session` are gitignored — never commit them.

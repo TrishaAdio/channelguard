@@ -2,7 +2,8 @@
 
 Every ROTATE_MINUTES it revokes the channel's primary invite link, issues a
 fresh one, and DMs it to the owner. Anyone who joins the channel is immediately
-kicked (the owner and admins are exempt).
+kicked AND unbanned (removed but free to rejoin — never a lasting ban); the
+owner and admins are exempt. On startup it also clears every existing ban.
 
 The logged-in account must be an ADMIN of the channel with "Invite users via
 link" and "Ban users" rights.
@@ -14,11 +15,20 @@ from __future__ import annotations
 import asyncio
 
 from telethon import TelegramClient, events
+from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
-from telethon.tl.types import UpdateChannelParticipant
+from telethon.tl.types import (
+    ChannelParticipantsKicked,
+    ChatBannedRights,
+    UpdateChannelParticipant,
+)
 
 import config
 import ui
+
+# Remove-from-channel rights (ban), and cleared rights (unban).
+_KICK_RIGHTS = ChatBannedRights(until_date=None, view_messages=True)
+_UNBAN_RIGHTS = ChatBannedRights(until_date=None)
 
 client: TelegramClient | None = None
 _state = {"self_id": 0, "channel": None, "channel_id": 0, "owner": None, "owner_id": 0}
@@ -54,14 +64,50 @@ async def rotate_loop() -> None:
 
 
 async def kick(user_id: int) -> None:
+    """Remove the user, then immediately lift the ban so it's a kick (they can
+    rejoin) — never a lasting ban."""
     if user_id in (_state["self_id"], _state["owner_id"]):
         return
+    channel = _state["channel"]
     try:
-        await client.kick_participant(_state["channel"], user_id)
-        print(ui.yellow("[kick] ") + f"removed {user_id}")
+        await client(EditBannedRequest(channel, user_id, _KICK_RIGHTS))   # remove
+        await asyncio.sleep(0.4)
+        await client(EditBannedRequest(channel, user_id, _UNBAN_RIGHTS))  # unban
+        print(ui.yellow("[kick] ") + f"removed + unbanned {user_id}")
         await notify(f"Kicked <code>{user_id}</code>")
     except Exception as e:  # noqa: BLE001 - e.g. admins can't be kicked
         print(ui.red("[kick] ") + f"{user_id} failed: {type(e).__name__}")
+
+
+async def unban_all() -> int:
+    """Clear every existing ban in the channel (so nobody stays banned)."""
+    channel = _state["channel"]
+    cleared = 0
+    offset = 0
+    while True:
+        try:
+            res = await client(GetParticipantsRequest(
+                channel, ChannelParticipantsKicked(q=""), offset, 100, hash=0,
+            ))
+        except Exception as e:  # noqa: BLE001
+            print(ui.red("[unban] ") + f"list failed: {type(e).__name__}")
+            break
+        if not res.participants:
+            break
+        for p in res.participants:
+            peer = getattr(p, "peer", None)
+            if peer is None:
+                continue
+            try:
+                await client(EditBannedRequest(channel, peer, _UNBAN_RIGHTS))
+                cleared += 1
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+        offset += len(res.participants)
+        if len(res.participants) < 100:
+            break
+    return cleared
 
 
 async def on_participant(update):
@@ -119,6 +165,11 @@ async def main() -> None:
     _state["owner"] = owner
     _state["owner_id"] = owner.id
 
+    # --- clear any existing bans up front -----------------------------------
+    cleared = await unban_all()
+    if cleared:
+        ui.success(f"Unbanned {cleared} previously-banned user(s).")
+
     # --- run ----------------------------------------------------------------
     client.add_event_handler(on_participant, events.Raw(UpdateChannelParticipant))
     asyncio.create_task(rotate_loop())
@@ -128,7 +179,8 @@ async def main() -> None:
     ui.success(f"Guarding: {ui.bold(str(title))}")
     ui.info(f"Owner: {getattr(owner, 'first_name', owner.id)} (id {owner.id})")
     ui.info(f"Rotating invite link every {ui.bold(f'{config.ROTATE_MINUTES:g}')} min; "
-            "joiners are kicked. " + ui.dim("Ctrl+C to stop."))
+            "joiners are kicked + unbanned (no lasting ban). "
+            + ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 
 
