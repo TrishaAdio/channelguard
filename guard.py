@@ -3,7 +3,9 @@
 Every ROTATE_MINUTES it revokes the channel's primary invite link, issues a
 fresh one, and DMs it to the owner. Anyone who joins the channel is immediately
 kicked AND unbanned (removed but free to rejoin — never a lasting ban); the
-owner and admins are exempt. On startup it also clears every existing ban.
+owner and admins are exempt. On startup it clears every existing ban and runs a
+security sweep (kick all non-admin members), then re-sweeps every SWEEP_MINUTES
+to catch anyone the live handler missed.
 
 The logged-in account must be an ADMIN of the channel with "Invite users via
 link" and "Ban users" rights.
@@ -18,6 +20,8 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import (
+    ChannelParticipantAdmin,
+    ChannelParticipantCreator,
     ChannelParticipantsKicked,
     ChatBannedRights,
     UpdateChannelParticipant,
@@ -63,20 +67,54 @@ async def rotate_loop() -> None:
         await asyncio.sleep(config.ROTATE_MINUTES * 60)
 
 
-async def kick(user_id: int) -> None:
+async def kick(user_id: int, announce: bool = True) -> bool:
     """Remove the user, then immediately lift the ban so it's a kick (they can
-    rejoin) — never a lasting ban."""
+    rejoin) — never a lasting ban. Returns True if removed."""
     if user_id in (_state["self_id"], _state["owner_id"]):
-        return
+        return False
     channel = _state["channel"]
     try:
         await client(EditBannedRequest(channel, user_id, _KICK_RIGHTS))   # remove
         await asyncio.sleep(0.4)
         await client(EditBannedRequest(channel, user_id, _UNBAN_RIGHTS))  # unban
         print(ui.yellow("[kick] ") + f"removed + unbanned {user_id}")
-        await notify(f"Kicked <code>{user_id}</code>")
+        if announce:
+            await notify(f"Kicked <code>{user_id}</code>")
+        return True
     except Exception as e:  # noqa: BLE001 - e.g. admins can't be kicked
         print(ui.red("[kick] ") + f"{user_id} failed: {type(e).__name__}")
+        return False
+
+
+async def sweep_members() -> int:
+    """Security check: kick every non-admin member (catches anyone who joined
+    while the guard was offline — the live handler only sees new joins)."""
+    channel = _state["channel"]
+    kicked = 0
+    try:
+        async for user in client.iter_participants(channel):
+            if user.id in (_state["self_id"], _state["owner_id"]):
+                continue
+            p = getattr(user, "participant", None)
+            if isinstance(p, (ChannelParticipantCreator, ChannelParticipantAdmin)):
+                continue  # keep admins/creator
+            if await kick(user.id, announce=False):
+                kicked += 1
+            await asyncio.sleep(0.3)
+    except Exception as e:  # noqa: BLE001
+        print(ui.red("[sweep] ") + f"failed: {type(e).__name__}: {e}")
+    return kicked
+
+
+async def sweep_loop() -> None:
+    if config.SWEEP_MINUTES <= 0:
+        return
+    while True:
+        await asyncio.sleep(config.SWEEP_MINUTES * 60)
+        n = await sweep_members()
+        if n:
+            print(ui.yellow("[sweep] ") + f"removed {n} member(s)")
+            await notify(f"Security sweep removed <b>{n}</b> member(s).")
 
 
 async def unban_all() -> int:
@@ -198,6 +236,12 @@ async def main() -> None:
     if cleared:
         ui.success(f"Unbanned {cleared} previously-banned user(s).")
 
+    # --- startup security sweep (catch offline joins) -----------------------
+    swept = await sweep_members()
+    if swept:
+        ui.success(f"Startup sweep removed {swept} non-admin member(s).")
+        await notify(f"Startup sweep removed <b>{swept}</b> member(s).")
+
     # --- run ----------------------------------------------------------------
     # Raw participant updates catch broadcast-channel joins; ChatAction is a
     # backup for supergroups. Listen to ALL raw updates and filter in-handler
@@ -205,13 +249,16 @@ async def main() -> None:
     client.add_event_handler(on_participant, events.Raw)
     client.add_event_handler(on_chat_action, events.ChatAction(chats=channel))
     asyncio.create_task(rotate_loop())
+    asyncio.create_task(sweep_loop())
 
+    sweep_note = (f"security sweep every {config.SWEEP_MINUTES:g} min; "
+                  if config.SWEEP_MINUTES > 0 else "")
     title = getattr(channel, "title", channel)
     ui.banner("Channel guard - running")
     ui.success(f"Guarding: {ui.bold(str(title))}")
     ui.info(f"Owner: {getattr(owner, 'first_name', owner.id)} (id {owner.id})")
     ui.info(f"Rotating invite link every {ui.bold(f'{config.ROTATE_MINUTES:g}')} min; "
-            "joiners are kicked + unbanned (no lasting ban). "
+            f"{sweep_note}joiners are kicked + unbanned (no lasting ban). "
             + ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 

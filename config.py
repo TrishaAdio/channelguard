@@ -13,6 +13,9 @@ API_HASH = os.getenv("API_HASH", "")
 CHANNEL_RAW = os.getenv("CHANNEL", "")
 OWNER_RAW = os.getenv("OWNER", "")
 ROTATE_MINUTES = float(os.getenv("ROTATE_MINUTES", "5"))
+# Security sweep: kick all non-admin members on startup and every N minutes.
+# 0 disables the recurring sweep (the startup sweep still runs).
+SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
 
 # --- Quick-reply updater (second userbot) ---------------------------------
 # Account that SENDS the invite link to the quick-reply userbot (usually the

@@ -115,5 +115,9 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
   (e.g. the owner is in the channel).
 - Kicks are ban-then-unban, so removed users are **not** left banned and can
   rejoin (via a future link). Startup clears any pre-existing bans too.
+- **Security sweep**: on startup and every `SWEEP_MINUTES` (default 5), all
+  non-admin members are kicked — this catches anyone who joined while the guard
+  was offline (the live handler only sees new joins). `SWEEP_MINUTES=0` runs the
+  sweep only at startup.
 - Admins can't be kicked (Telegram restriction); those attempts are ignored.
 - `.env` and `*.session` are gitignored — never commit them.
