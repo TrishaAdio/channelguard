@@ -236,32 +236,30 @@ async def send_greeting(event) -> str:
     return "none"
 
 
-async def _swap_in_greeting(new_link: str) -> bool:
-    """Keep the /set greeting post's link current too."""
+async def _swap_in_greeting(new_link: str) -> str:
+    """Keep the /set greeting post's link current. Returns a status string so
+    the caller can always report what happened."""
     g = _load_greeting()
     if not g:
-        return False
+        return "no greeting set"
     try:
         src = await client.get_messages(g["chat_id"], ids=g["message_id"])
     except Exception as e:  # noqa: BLE001
-        ui.error(f"greeting fetch failed: {type(e).__name__}: {e}")
-        return False
+        return f"fetch error: {type(e).__name__}"
     if src is None:
-        ui.warn("Greeting post not found (deleted?). Re-set it with /set.")
-        return False
+        return "post not found (re-set with /set)"
     swapped = _swap_link(src.message or "", src.entities, new_link)
     if swapped is None:
-        return False  # no invite link in the greeting, or already current
+        return "no invite link in the post"
     new_text, ents = swapped
     try:
         await client.edit_message(g["chat_id"], g["message_id"], new_text,
                                   formatting_entities=ents or None)
-        return True
+        return "updated"
     except MessageNotModifiedError:
-        return False
+        return "unchanged"
     except Exception as e:  # noqa: BLE001
-        ui.error(f"greeting edit failed: {type(e).__name__}: {e}")
-        return False
+        return f"edit error: {type(e).__name__}: {e}"
 
 
 async def _is_new_user(event) -> bool:
@@ -278,8 +276,8 @@ async def _handle_link(event, link: str) -> None:
         return
     status = await update_link(config.SHORTCUT, link)
     print(ui.green(f"[/{config.SHORTCUT}] ") + f"{ui.bold(link)} ({status})", flush=True)
-    if await _swap_in_greeting(link):
-        print(ui.green("[greeting] ") + f"{ui.bold(link)} (link updated)", flush=True)
+    g_status = await _swap_in_greeting(link)
+    print(ui.green("[greeting] ") + f"{ui.bold(link)} ({g_status})", flush=True)
     _state["last"] = link
 
 
