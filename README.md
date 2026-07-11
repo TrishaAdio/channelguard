@@ -62,9 +62,11 @@ On each new link it swaps the link inside the shortcut's messages in place
 (`getQuickReplies` -> `getQuickReplyMessages` -> `editMessage` with
 `quick_reply_shortcut_id`), preserving all other text and entities.
 
-With `UPDATE_AWAY=1` it also swaps the link inside your Business **away message**
-(found via `users.getFullUser` -> `business_away_message.shortcut_id`), same
-surgical swap — only the link changes.
+With `GREET_NEW=1` it also acts as a **first-contact auto-responder**: when
+anyone DMs this account for the **first time**, it copies your current Business
+**away message** and sends it to them (via `users.getFullUser` ->
+`business_away_message.shortcut_id` -> `sendQuickReplyMessages`). Greeted user
+ids are remembered in `data/greeted.json`, so nobody is greeted twice.
 
 > Business quick replies require **Telegram Premium** on that account.
 
@@ -91,6 +93,7 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 | `ROTATE_MINUTES` | How often to revoke + reissue the link (default 5)  |
 | `LINK_SOURCE`    | (quickreply) account that sends the link; blank = any |
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
+| `GREET_NEW`      | (quickreply) send away msg to first-time DMs (default 1) |
 
 ## Notes
 

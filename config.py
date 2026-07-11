@@ -20,13 +20,16 @@ ROTATE_MINUTES = float(os.getenv("ROTATE_MINUTES", "5"))
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")
-# Also swap the link inside the Business AWAY message (if one is set).
-UPDATE_AWAY = os.getenv("UPDATE_AWAY", "1").strip().lower() not in ("0", "false", "no", "")
+# Send the current Business AWAY message to anyone who DMs us the first time.
+GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "no", "")
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
 QR_SESSION = str(BASE_DIR / "quickreply")    # quick-reply account session
 ENV_PATH = BASE_DIR / ".env"
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+GREETED_FILE = DATA_DIR / "greeted.json"     # user ids already auto-replied to
 
 
 def coerce(s: str):
