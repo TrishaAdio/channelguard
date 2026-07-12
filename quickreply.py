@@ -18,9 +18,8 @@ Commands (send them yourself — outgoing):
   /show             whether a greeting is set                   (Saved Messages)
   /add <amt> [name] reply to an image -> log payment + post it  (any chat)
   /setdone <tpl>    set the post caption template (or reply to a post)
-  /setpostchannel   set where media is posted (blank = current chat)
+  .setchannel       type it in a channel -> post media there
   /stats            today's total (INR) + payment count + split
-  /scan             list your chats/channels in the terminal
   .help             show every command and template parameter
 
 Business quick replies require Telegram Premium (the payment logger does not).
@@ -209,9 +208,8 @@ HELP_TEXT = (
     "<b>Payment logger</b>\n"
     "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log the payment and post it\n"
     "<code>/setdone &lt;template&gt;</code> - set the caption (or reply to a post with /setdone)\n"
-    "<code>/setpostchannel [id]</code> - set the post channel (blank = current chat)\n"
-    "<code>/stats</code> - today's total, count, and split\n"
-    "<code>/scan</code> - print your chats/channels in the terminal\n\n"
+    "<code>.setchannel</code> - type it in a channel to post media there\n"
+    "<code>/stats</code> - today's total, count, and split\n\n"
     "<b>Caption parameters</b> (use inside /setdone)\n"
     "<code>{amount}</code> - this payment, in INR\n"
     "<code>{name}</code> - the name from /add\n"
@@ -221,17 +219,6 @@ HELP_TEXT = (
     "<b>Greeting</b> (Saved Messages)\n"
     "<code>/set</code> reply to a post - <code>/unset</code> clear - <code>/show</code> status"
 )
-
-
-async def _print_pay_dialogs() -> None:
-    print("\n=== Chats / channels this account is in ===")
-    print("%-16s  %s" % ("id", "title"))
-    print("-" * 60)
-    async for d in client.iter_dialogs():
-        if d.is_channel or d.is_group:
-            print("%-16s  %s" % (d.id, d.name))
-    print("-" * 60)
-    print("Use  /setpostchannel <id>  to pick where media is posted.\n")
 
 
 async def cmd_add(event) -> None:
@@ -253,7 +240,7 @@ async def cmd_add(event) -> None:
         await event.edit("Reply to an image/media message with /add.")
         return
     if not _pay.get("post_channel"):
-        await event.edit("No post channel set. Use /setpostchannel first.")
+        await event.edit("No post channel set. Type .setchannel in the target channel first.")
         return
 
     # Record first so today's totals include this payment when rendering.
@@ -289,25 +276,14 @@ async def cmd_setdone(event) -> None:
     await event.edit(f"Caption template saved ({len(template)} chars).")
 
 
-async def cmd_setpostchannel(event) -> None:
-    m = re.match(r"^/setpostchannel(?:\s+(.+))?$", event.raw_text or "")
-    arg = (m.group(1).strip() if m and m.group(1) else "")
-    if arg:
-        target = config.coerce(arg)
-        try:
-            entity = await client.get_entity(target)
-        except Exception as e:  # noqa: BLE001
-            await event.edit(f"Could not resolve that target: {type(e).__name__}")
-            return
-        chat_id = entity.id
-        title = getattr(entity, "title", None) or getattr(entity, "username", str(chat_id))
-    else:
-        chat_id = event.chat_id
-        chat = await event.get_chat()
-        title = getattr(chat, "title", None) or "this chat"
+async def cmd_setchannel(event) -> None:
+    """Set the CURRENT chat/channel as the post target."""
+    chat_id = event.chat_id
+    chat = await event.get_chat()
+    title = getattr(chat, "title", None) or "this chat"
     _pay["post_channel"] = chat_id
     _save_pay()
-    await event.edit(f"Post channel set: {title} ({chat_id})")
+    await event.edit(f"Post channel set here: {title} ({chat_id})")
 
 
 async def cmd_stats(event) -> None:
@@ -319,11 +295,6 @@ async def cmd_stats(event) -> None:
         f"Today - {fmt_inr(total)} - {len(day)} payments\n"
         f"Rio {fmt_inr(rio)} - Marco {fmt_inr(marco)}"
     )
-
-
-async def cmd_scan(event) -> None:
-    await _print_pay_dialogs()
-    await event.edit("Chat list printed in the terminal.")
 
 
 def _u16(s: str) -> int:
@@ -556,14 +527,11 @@ async def on_command(event):
     if low.startswith("/setdone"):
         await cmd_setdone(event)
         return
-    if low.startswith("/setpostchannel"):
-        await cmd_setpostchannel(event)
+    if low == ".setchannel":
+        await cmd_setchannel(event)
         return
     if low == "/stats":
         await cmd_stats(event)
-        return
-    if low == "/scan":
-        await cmd_scan(event)
         return
 
     # --- greeting (Saved Messages only) ---
@@ -672,7 +640,7 @@ async def main() -> None:
     pc = _pay.get("post_channel")
     day = _todays_payments()
     total = sum(p["amount"] for p in day)
-    pc_state = str(pc) if pc else ui.yellow("not set - use /setpostchannel")
+    pc_state = str(pc) if pc else ui.yellow("not set - type .setchannel in a channel")
     ui.info(f"Payment logger: post channel [{pc_state}]. "
             + ui.dim(f"today {fmt_inr(total)} / {len(day)} payment(s). '.help' for commands."))
     print(ui.dim("Ctrl+C to stop."))

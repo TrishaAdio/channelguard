@@ -99,9 +99,8 @@ to **your own** messages):
 |---|---|
 | `/add <amount> [name]` | reply to an image → log payment + post it |
 | `/setdone <template>` | set the caption template (or reply to a post with `/setdone`) |
-| `/setpostchannel [id]` | set the post channel (no argument = current chat) |
+| `.setchannel` | type it **in a channel** → posts go there |
 | `/stats` | today's total (₹), payment count, and Rio/Marco split |
-| `/scan` | print your chats/channels in the terminal (to find a channel id) |
 | `.help` | show every command and template parameter |
 
 **Caption template parameters** (use inside `/setdone`):
