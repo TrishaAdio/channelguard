@@ -31,6 +31,7 @@ Run:  python quickreply.py    (Ctrl+C to stop)
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import random
 import re
@@ -75,6 +76,9 @@ _greeted: set[int] = set()
 #    "payments": [...]}
 #   done_template    -> message sent to the USER in the private chat (/setdone)
 #   channel_template -> caption for the CHANNEL post (/setchannelpostofpayment)
+#   done_ref / channel_ref -> {chat_id, message_id} of the post a template was
+#     set from; used to keep formatting + premium emoji verbatim (the *_template
+#     strings stay as a plain-text fallback if that post is later deleted).
 _pay: dict = {}
 _TZ = ZoneInfo(config.TZ_NAME) if ZoneInfo else None
 
@@ -86,7 +90,8 @@ DEFAULT_CHANNEL = (
     "New payment received\n"
     "{name} paid {amount}\n\n"
     "Rio {rioshare} - Marco {marco}\n"
-    "Payments today: {total}"
+    "Payments today: {total}\n"
+    "Collected today: {todaytotal}"
 )
 
 
@@ -199,7 +204,7 @@ def parse_amount(raw: str) -> float:
     return float(str(raw).replace(",", "").replace("\u20b9", "").strip())
 
 
-def render_template(tpl: str, amount: float, name: str) -> str:
+def _pay_mapping(amount: float, name: str) -> dict:
     day = _todays_payments()
     today_total = sum(p["amount"] for p in day)
     today_count = len(day)
@@ -208,16 +213,82 @@ def render_template(tpl: str, amount: float, name: str) -> str:
     rio = base * config.RIO_PCT / 100.0
     marco = base * config.MARCO_PCT / 100.0
 
-    mapping = {
+    return {
         "{amount}": fmt_inr(amount),
         "{name}": name or "",
         "{rioshare}": fmt_inr(rio),
         "{marco}": fmt_inr(marco),
-        "{total}": str(today_count),
+        "{total}": str(today_count),        # count of payments today
+        "{todaytotal}": fmt_inr(today_total),  # total amount collected today
     }
-    for key, val in mapping.items():
-        tpl = tpl.replace(key, val)
-    return tpl
+
+
+def _substitute(text: str, entities, mapping: dict):
+    """Replace {tokens} in `text` with their values while keeping every entity
+    (bold/italic/links AND premium custom emoji) attached to the right span.
+
+    Entity offsets are counted in UTF-16 code units (Telegram's own unit), and
+    all replacement regions are measured in the ORIGINAL text so each entity can
+    be shifted/resized independently. Returns (new_text, new_entities).
+    """
+    text = text or ""
+    # Clone so we never mutate the source message's entity objects.
+    entities = [copy.copy(e) for e in (entities or [])]
+    if not mapping:
+        return text, entities
+
+    pattern = re.compile("|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True)))
+
+    repls = []       # (start_u16, end_u16, delta_u16) in ORIGINAL coordinates
+    parts, last = [], 0
+    for m in pattern.finditer(text):
+        val = mapping[m.group(0)]
+        start_u16 = _u16(text[:m.start()])
+        old_u16 = _u16(m.group(0))
+        new_u16 = _u16(val)
+        repls.append((start_u16, start_u16 + old_u16, new_u16 - old_u16))
+        parts.append(text[last:m.start()])
+        parts.append(val)
+        last = m.end()
+    parts.append(text[last:])
+    new_text = "".join(parts)
+
+    if repls:
+        for e in entities:
+            e_start, e_end = e.offset, e.offset + e.length
+            off_delta = len_delta = 0
+            for rs, re_, d in repls:
+                if re_ <= e_start:
+                    off_delta += d            # replacement is before -> shift
+                elif rs >= e_end:
+                    pass                      # replacement is after -> no effect
+                else:
+                    len_delta += d            # replacement is inside -> resize
+            e.offset += off_delta
+            e.length = max(0, e.length + len_delta)
+    return new_text, entities
+
+
+async def _resolve_template(kind: str):
+    """Return (text, entities) for kind in {'done', 'channel'}.
+
+    A message reference (set by replying to a post) is preferred so formatting
+    and premium emoji are kept verbatim; otherwise the plain-text template.
+    """
+    ref = _pay.get(f"{kind}_ref")
+    if ref:
+        try:
+            src = await client.get_messages(ref["chat_id"], ids=ref["message_id"])
+        except Exception:  # noqa: BLE001
+            src = None
+        if src is not None:
+            return src.message or "", list(src.entities or [])
+    return _pay.get(f"{kind}_template", ""), []
+
+
+async def _render(kind: str, amount: float, name: str):
+    text, ents = await _resolve_template(kind)
+    return _substitute(text, ents, _pay_mapping(amount, name))
 
 
 HELP_TEXT = (
@@ -232,7 +303,10 @@ HELP_TEXT = (
     "<code>{name}</code> - the name from /add\n"
     "<code>{rioshare}</code> - Rio's share, in INR\n"
     "<code>{marco}</code> - Marco's share, in INR\n"
-    "<code>{total}</code> - number of payments today\n\n"
+    "<code>{total}</code> - number of payments today\n"
+    "<code>{todaytotal}</code> - total amount collected today, in INR\n\n"
+    "<blockquote>Reply to a formatted post with /setdone or "
+    "/setchannelpostofpayment to keep bold, links and premium emoji.</blockquote>\n"
     "<b>Greeting</b> (Saved Messages)\n"
     "<code>/set</code> reply to a post - <code>/unset</code> clear - <code>/show</code> status"
 )
@@ -264,58 +338,57 @@ async def cmd_add(event) -> None:
     _pay["payments"].append({"amount": amount, "name": name, "ts": _now_ts()})
     _save_pay()
 
-    parse_mode = None if config.PAY_PARSE_MODE in ("", "none", "plain") else config.PAY_PARSE_MODE
-
-    # 1. Post the media + channel caption to the payment channel.
-    channel_caption = render_template(_pay["channel_template"], amount, name)
+    # 1. Post the media + channel caption to the payment channel
+    #    (formatting + premium emoji preserved via entities).
+    ch_text, ch_ents = await _render("channel", amount, name)
     try:
         await client.send_file(_pay["post_channel"], file=reply.media,
-                               caption=channel_caption, parse_mode=parse_mode)
+                               caption=ch_text, formatting_entities=ch_ents or None)
     except Exception as e:  # noqa: BLE001
         await event.edit(f"Recorded, but posting to the channel failed: {type(e).__name__}: {e}")
         return
 
-    # 2. Send the user the private-chat message (edit the /add command into it).
-    user_message = render_template(_pay["done_template"], amount, name)
+    # 2. Message the user in the private chat (edit the /add command into it).
+    us_text, us_ents = await _render("done", amount, name)
     try:
-        await event.edit(user_message, parse_mode=parse_mode)
+        await event.edit(us_text, formatting_entities=us_ents or None)
     except Exception:  # noqa: BLE001 - fall back to a fresh message
-        await event.respond(user_message, parse_mode=parse_mode)
+        await event.respond(us_text, formatting_entities=us_ents or None)
 
     count = len(_todays_payments())
     print(ui.green("[pay] ") + f"{fmt_inr(amount)} {name} -> posted (#{count} today)", flush=True)
 
 
+async def _set_template(event, kind: str, cmd: str, label: str) -> None:
+    """Store a template. Replying to a post keeps its formatting + premium emoji
+    (stored as a message reference); inline text is stored as plain text."""
+    reply = await event.get_reply_message()
+    if reply is not None and (reply.raw_text or ""):
+        _pay[f"{kind}_ref"] = {"chat_id": int(reply.chat_id), "message_id": int(reply.id)}
+        _pay[f"{kind}_template"] = reply.raw_text  # plain fallback if the post is deleted
+        _save_pay()
+        await event.edit(f"{label} saved from that post - formatting and premium emoji kept.")
+        return
+
+    m = re.match(rf"^{re.escape(cmd)}(?:\s+([\s\S]+))?$", event.raw_text or "")
+    template = (m.group(1).strip() if m and m.group(1) else "")
+    if not template:
+        await event.edit(f"Send the text after {cmd}, or reply to a formatted post with {cmd}.")
+        return
+    _pay[f"{kind}_template"] = template
+    _pay.pop(f"{kind}_ref", None)
+    _save_pay()
+    await event.edit(f"{label} saved ({len(template)} chars, plain text).")
+
+
 async def cmd_setdone(event) -> None:
     """Set the message the user gets in the private chat after /add."""
-    reply = await event.get_reply_message()
-    if reply and (reply.raw_text or ""):
-        template = reply.raw_text
-    else:
-        m = re.match(r"^/setdone(?:\s+([\s\S]+))?$", event.raw_text or "")
-        template = (m.group(1).strip() if m and m.group(1) else "")
-    if not template:
-        await event.edit("Send the message after /setdone, or reply to a post with /setdone.")
-        return
-    _pay["done_template"] = template
-    _save_pay()
-    await event.edit(f"Private-chat message saved ({len(template)} chars).")
+    await _set_template(event, "done", "/setdone", "Private-chat message")
 
 
 async def cmd_setchannelpost(event) -> None:
     """Set the caption used for the channel post after /add."""
-    reply = await event.get_reply_message()
-    if reply and (reply.raw_text or ""):
-        template = reply.raw_text
-    else:
-        m = re.match(r"^/setchannelpostofpayment(?:\s+([\s\S]+))?$", event.raw_text or "")
-        template = (m.group(1).strip() if m and m.group(1) else "")
-    if not template:
-        await event.edit("Send the caption after /setchannelpostofpayment, or reply to a post with it.")
-        return
-    _pay["channel_template"] = template
-    _save_pay()
-    await event.edit(f"Channel post caption saved ({len(template)} chars).")
+    await _set_template(event, "channel", "/setchannelpostofpayment", "Channel post caption")
 
 
 async def cmd_setchannel(event) -> None:

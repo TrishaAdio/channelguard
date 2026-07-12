@@ -119,6 +119,13 @@ to an existing post. **Template parameters** (work in both):
 | `{rioshare}` | Rio's share (`RIO_PCT`, default 55%), INR |
 | `{marco}` | Marco's share (`MARCO_PCT`, default 45%), INR |
 | `{total}` | number of payments received today |
+| `{todaytotal}` | total amount collected today, INR |
+
+**Formatting & premium emoji:** set a template by **replying** to a formatted
+post with `/setdone` or `/setchannelpostofpayment` — bold/italic, links and
+**premium (custom) emoji are kept exactly**. The `{...}` parameters are filled
+in without disturbing the styling (entity offsets are re-aligned). Passing the
+template inline as text stores it as plain text instead.
 
 `{rioshare}`/`{marco}` are a percentage of **today's total** by default
 (`SHARE_BASE=today`); set `SHARE_BASE=transaction` to split each single payment
