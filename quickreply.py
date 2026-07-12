@@ -22,6 +22,7 @@ Commands (send them yourself — outgoing):
   /setchannelpostofpayment <tpl>   caption for the channel post
   .setchannel       type it in a channel -> post media there
   /stats            today's total (INR) + payment count + split
+  /clear            reset today's stats to zero
   .help             show every command and template parameter
 
 Business quick replies require Telegram Premium (the payment logger does not).
@@ -297,7 +298,8 @@ HELP_TEXT = (
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
-    "<code>/stats</code> - today's total, count, and split\n\n"
+    "<code>/stats</code> - today's total, count, and split\n"
+    "<code>/clear</code> - reset today's stats to zero\n\n"
     "<b>Parameters</b> (work in both templates)\n"
     "<code>{amount}</code> - this payment, in INR\n"
     "<code>{name}</code> - the name from /add\n"
@@ -410,6 +412,16 @@ async def cmd_stats(event) -> None:
         f"Today - {fmt_inr(total)} - {len(day)} payments\n"
         f"Rio {fmt_inr(rio)} - Marco {fmt_inr(marco)}"
     )
+
+
+async def cmd_clear(event) -> None:
+    """Remove all of today's payments so today's stats reset to zero."""
+    key = _today_key()
+    before = len(_pay.get("payments", []))
+    _pay["payments"] = [p for p in _pay.get("payments", []) if _today_key(p["ts"]) != key]
+    removed = before - len(_pay["payments"])
+    _save_pay()
+    await event.edit(f"Today cleared - {removed} payment(s) removed.\nToday - {fmt_inr(0)} - 0 payments")
 
 
 def _u16(s: str) -> int:
@@ -650,6 +662,9 @@ async def on_command(event):
         return
     if low == "/stats":
         await cmd_stats(event)
+        return
+    if low == "/clear":
+        await cmd_clear(event)
         return
 
     # --- greeting (Saved Messages only) ---

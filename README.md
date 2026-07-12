@@ -107,6 +107,7 @@ to **your own** messages):
 | `/setchannelpostofpayment <template>` | caption for the **channel** post |
 | `.setchannel` | type it **in a channel** → posts go there |
 | `/stats` | today's total (₹), payment count, and Rio/Marco split |
+| `/clear` | reset today's stats to zero (removes today's payments) |
 | `.help` | show every command and template parameter |
 
 `/setdone` and `/setchannelpostofpayment` also accept the template as a **reply**
