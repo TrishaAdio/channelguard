@@ -89,21 +89,28 @@ falls back to the Business away message (`business_away_message.shortcut_id`).
 image** with `/add <amount> [name]` and it:
 
 1. records the payment (amount in **INR**, with the name),
-2. posts that image + a **templated caption** to your **post channel**, and
-3. updates today's running total and payment count.
+2. **messages the user** in that private chat using the `/setdone` template,
+3. **posts** that image + the `/setchannelpostofpayment` caption to your channel, and
+4. updates today's running total and payment count.
+
+There are **two separate templates** — one for the private-chat message to the
+user (`/setdone`), one for the channel post (`/setchannelpostofpayment`). Both
+accept the same parameters.
 
 No Premium needed for this part. Commands (send them yourself — they only react
 to **your own** messages):
 
 | Command | Effect |
 |---|---|
-| `/add <amount> [name]` | reply to an image → log payment + post it |
-| `/setdone <template>` | set the caption template (or reply to a post with `/setdone`) |
+| `/add <amount> [name]` | reply to an image → log + message the user + post to channel |
+| `/setdone <template>` | message sent to the **user** in the private chat |
+| `/setchannelpostofpayment <template>` | caption for the **channel** post |
 | `.setchannel` | type it **in a channel** → posts go there |
 | `/stats` | today's total (₹), payment count, and Rio/Marco split |
 | `.help` | show every command and template parameter |
 
-**Caption template parameters** (use inside `/setdone`):
+`/setdone` and `/setchannelpostofpayment` also accept the template as a **reply**
+to an existing post. **Template parameters** (work in both):
 
 | Parameter | Value |
 |---|---|

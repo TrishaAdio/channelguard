@@ -9,15 +9,17 @@ Jobs:
      any post with /set. (Falls back to the Business away message if no greeting
      is set.)
   3. Payment logger: reply to an image with /add <amount> [name] to record a
-     payment (INR), auto-post that image + a templated caption to your post
-     channel, and track a daily total/count.
+     payment (INR). It messages the user in the private chat (/setdone) AND
+     auto-posts the image + a caption to your channel (/setchannelpostofpayment),
+     while tracking a daily total/count.
 
 Commands (send them yourself — outgoing):
   /set              reply to a post -> use it as the greeting  (Saved Messages)
   /unset            clear the greeting                          (Saved Messages)
   /show             whether a greeting is set                   (Saved Messages)
-  /add <amt> [name] reply to an image -> log payment + post it  (any chat)
-  /setdone <tpl>    set the post caption template (or reply to a post)
+  /add <amt> [name] reply to an image -> log, message user, post to channel
+  /setdone <tpl>    message sent to the user in the private chat
+  /setchannelpostofpayment <tpl>   caption for the channel post
   .setchannel       type it in a channel -> post media there
   /stats            today's total (INR) + payment count + split
   .help             show every command and template parameter
@@ -68,11 +70,19 @@ client: TelegramClient | None = None
 _state = {"source_id": None, "last": None, "self_id": 0}
 _greeted: set[int] = set()
 
-# Payment logger state: {"post_channel": int|None, "done_template": str, "payments": [...]}
+# Payment logger state:
+#   {"post_channel": int|None, "done_template": str, "channel_template": str,
+#    "payments": [...]}
+#   done_template    -> message sent to the USER in the private chat (/setdone)
+#   channel_template -> caption for the CHANNEL post (/setchannelpostofpayment)
 _pay: dict = {}
 _TZ = ZoneInfo(config.TZ_NAME) if ZoneInfo else None
 
-DEFAULT_TEMPLATE = (
+# Message the user gets in the private chat after /add.
+DEFAULT_DONE = "Payment of {amount} received - thank you, {name}!"
+
+# Caption for the auto-post in the payment channel.
+DEFAULT_CHANNEL = (
     "New payment received\n"
     "{name} paid {amount}\n\n"
     "Rio {rioshare} - Marco {marco}\n"
@@ -126,12 +136,18 @@ def _load_pay() -> dict:
         try:
             data = json.loads(config.PAY_FILE.read_text())
             data.setdefault("post_channel", None)
-            data.setdefault("done_template", DEFAULT_TEMPLATE)
+            data.setdefault("done_template", DEFAULT_DONE)
+            data.setdefault("channel_template", DEFAULT_CHANNEL)
             data.setdefault("payments", [])
             return data
         except (ValueError, OSError):
             pass
-    return {"post_channel": None, "done_template": DEFAULT_TEMPLATE, "payments": []}
+    return {
+        "post_channel": None,
+        "done_template": DEFAULT_DONE,
+        "channel_template": DEFAULT_CHANNEL,
+        "payments": [],
+    }
 
 
 def _save_pay() -> None:
@@ -206,11 +222,12 @@ def render_template(tpl: str, amount: float, name: str) -> str:
 
 HELP_TEXT = (
     "<b>Payment logger</b>\n"
-    "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log the payment and post it\n"
-    "<code>/setdone &lt;template&gt;</code> - set the caption (or reply to a post with /setdone)\n"
+    "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log it, message the user, post to the channel\n"
+    "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
+    "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
     "<code>/stats</code> - today's total, count, and split\n\n"
-    "<b>Caption parameters</b> (use inside /setdone)\n"
+    "<b>Parameters</b> (work in both templates)\n"
     "<code>{amount}</code> - this payment, in INR\n"
     "<code>{name}</code> - the name from /add\n"
     "<code>{rioshare}</code> - Rio's share, in INR\n"
@@ -247,21 +264,30 @@ async def cmd_add(event) -> None:
     _pay["payments"].append({"amount": amount, "name": name, "ts": _now_ts()})
     _save_pay()
 
-    caption = render_template(_pay["done_template"], amount, name)
     parse_mode = None if config.PAY_PARSE_MODE in ("", "none", "plain") else config.PAY_PARSE_MODE
+
+    # 1. Post the media + channel caption to the payment channel.
+    channel_caption = render_template(_pay["channel_template"], amount, name)
     try:
         await client.send_file(_pay["post_channel"], file=reply.media,
-                               caption=caption, parse_mode=parse_mode)
+                               caption=channel_caption, parse_mode=parse_mode)
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"Recorded, but posting failed: {type(e).__name__}: {e}")
+        await event.edit(f"Recorded, but posting to the channel failed: {type(e).__name__}: {e}")
         return
 
+    # 2. Send the user the private-chat message (edit the /add command into it).
+    user_message = render_template(_pay["done_template"], amount, name)
+    try:
+        await event.edit(user_message, parse_mode=parse_mode)
+    except Exception:  # noqa: BLE001 - fall back to a fresh message
+        await event.respond(user_message, parse_mode=parse_mode)
+
     count = len(_todays_payments())
-    await event.edit(f"Recorded {fmt_inr(amount)} - {name or '-'} - #{count} today")
     print(ui.green("[pay] ") + f"{fmt_inr(amount)} {name} -> posted (#{count} today)", flush=True)
 
 
 async def cmd_setdone(event) -> None:
+    """Set the message the user gets in the private chat after /add."""
     reply = await event.get_reply_message()
     if reply and (reply.raw_text or ""):
         template = reply.raw_text
@@ -269,11 +295,27 @@ async def cmd_setdone(event) -> None:
         m = re.match(r"^/setdone(?:\s+([\s\S]+))?$", event.raw_text or "")
         template = (m.group(1).strip() if m and m.group(1) else "")
     if not template:
-        await event.edit("Send the template after /setdone, or reply to a post with /setdone.")
+        await event.edit("Send the message after /setdone, or reply to a post with /setdone.")
         return
     _pay["done_template"] = template
     _save_pay()
-    await event.edit(f"Caption template saved ({len(template)} chars).")
+    await event.edit(f"Private-chat message saved ({len(template)} chars).")
+
+
+async def cmd_setchannelpost(event) -> None:
+    """Set the caption used for the channel post after /add."""
+    reply = await event.get_reply_message()
+    if reply and (reply.raw_text or ""):
+        template = reply.raw_text
+    else:
+        m = re.match(r"^/setchannelpostofpayment(?:\s+([\s\S]+))?$", event.raw_text or "")
+        template = (m.group(1).strip() if m and m.group(1) else "")
+    if not template:
+        await event.edit("Send the caption after /setchannelpostofpayment, or reply to a post with it.")
+        return
+    _pay["channel_template"] = template
+    _save_pay()
+    await event.edit(f"Channel post caption saved ({len(template)} chars).")
 
 
 async def cmd_setchannel(event) -> None:
@@ -523,6 +565,9 @@ async def on_command(event):
     # --- payment logger (work in any chat) ---
     if low.startswith("/add"):
         await cmd_add(event)
+        return
+    if low.startswith("/setchannelpostofpayment"):
+        await cmd_setchannelpost(event)
         return
     if low.startswith("/setdone"):
         await cmd_setdone(event)
