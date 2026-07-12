@@ -83,6 +83,56 @@ falls back to the Business away message (`business_away_message.shortcut_id`).
 
 > Business quick replies require **Telegram Premium** on that account.
 
+### Payment logger
+
+`quickreply.py` also logs payments and auto-posts the proof image. **Reply to an
+image** with `/add <amount> [name]` and it:
+
+1. records the payment (amount in **INR**, with the name),
+2. **messages the user** in that private chat using the `/setdone` template,
+3. **posts** that image + the `/setchannelpostofpayment` caption to your channel, and
+4. updates today's running total and payment count.
+
+There are **two separate templates** — one for the private-chat message to the
+user (`/setdone`), one for the channel post (`/setchannelpostofpayment`). Both
+accept the same parameters.
+
+No Premium needed for this part. Commands (send them yourself — they only react
+to **your own** messages):
+
+| Command | Effect |
+|---|---|
+| `/add <amount> [name]` | reply to an image → log + message the user + post to channel |
+| `/setdone <template>` | message sent to the **user** in the private chat |
+| `/setchannelpostofpayment <template>` | caption for the **channel** post |
+| `.setchannel` | type it **in a channel** → posts go there |
+| `/stats` | today's total (₹), payment count, and Rio/Marco split |
+| `/clear` | reset today's stats to zero (removes today's payments) |
+| `.help` | show every command and template parameter |
+
+`/setdone` and `/setchannelpostofpayment` also accept the template as a **reply**
+to an existing post. **Template parameters** (work in both):
+
+| Parameter | Value |
+|---|---|
+| `{amount}` | this payment's amount, INR-formatted (e.g. `₹1,00,000`) |
+| `{name}` | the name passed to `/add` |
+| `{rioshare}` | Rio's share (`RIO_PCT`, default 55%), INR |
+| `{marco}` | Marco's share (`MARCO_PCT`, default 45%), INR |
+| `{total}` | number of payments received today |
+| `{todaytotal}` | total amount collected today, INR |
+
+**Formatting & premium emoji:** set a template by **replying** to a formatted
+post with `/setdone` or `/setchannelpostofpayment` — bold/italic, links and
+**premium (custom) emoji are kept exactly**. The `{...}` parameters are filled
+in without disturbing the styling (entity offsets are re-aligned). Passing the
+template inline as text stores it as plain text instead.
+
+`{rioshare}`/`{marco}` are a percentage of **today's total** by default
+(`SHARE_BASE=today`); set `SHARE_BASE=transaction` to split each single payment
+instead. "Today" is bounded by `TZ` (default `Asia/Kolkata`). State lives in
+`data/pay.json`.
+
 ## Files
 
 | File            | Role                                                          |
@@ -91,7 +141,7 @@ falls back to the Business away message (`business_away_message.shortcut_id`).
 | `config.py`     | Loads `.env`, helpers                                         |
 | `resolve.py`    | Channel resolver + interactive picker                         |
 | `guard.py`      | Link rotation (DM owner) + auto-kick joiners                  |
-| `quickreply.py` | 2nd userbot: keep `/demo` quick reply = the latest link       |
+| `quickreply.py` | 2nd userbot: keep `/demo` link current + payment logger        |
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`
@@ -107,6 +157,10 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 | `LINK_SOURCE`    | (quickreply) account that sends the link; blank = any |
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
 | `GREET_NEW`      | (quickreply) send away msg to first-time DMs (default 1) |
+| `RIO_PCT` / `MARCO_PCT` | (payment) revenue split % (default 55 / 45)   |
+| `SHARE_BASE`     | (payment) `today` or `transaction` split base (default today) |
+| `TZ`             | (payment) timezone for "today" (default Asia/Kolkata) |
+| `PAY_PARSE_MODE` | (payment) caption parse mode: `html` or `none`      |
 
 ## Notes
 

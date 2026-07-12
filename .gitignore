@@ -5,6 +5,9 @@
 *.session
 *.session-journal
 
+# Runtime state (greeted/greeting/payment data)
+data/
+
 # Python
 __pycache__/
 *.pyc
