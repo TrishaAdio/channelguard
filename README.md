@@ -64,22 +64,33 @@ On each new link it swaps the link inside the shortcut's messages in place
 (`getQuickReplies` -> `getQuickReplyMessages` -> `editMessage` with
 `quick_reply_shortcut_id`), preserving all other text and entities.
 
-With `GREET_NEW=1` it also acts as a **first-contact auto-responder**: when
+With `GREET_NEW=1` it also acts as a **first-contact away responder**: when
 someone starts a **brand-new** DM conversation (their first-ever message), it
-sends them your **greeting post**. Existing chats are never greeted, and each
-user is greeted at most once (`data/greeted.json`).
+sends the greeting only while your account is offline. Live Telegram presence
+is checked, and any manual outgoing message from any logged-in session keeps the
+account active for `ONLINE_MINUTES` (default 2). Existing chats are never greeted,
+and each user is handled at most once (`data/greeted.json`).
+
+Away replies can be enabled or disabled live from Saved Messages and the choice
+is saved to `.env`; no restart is required.
 
 Set the greeting from your own **Saved Messages** — no Premium needed:
 
 | Saved Messages command | Effect                                  |
 |------------------------|-----------------------------------------|
 | reply to a post + `/set` | use that post as the greeting         |
-| `/unset`               | clear the greeting                      |
-| `/show`                | whether a greeting is set               |
+| `/unset`               | clear the custom greeting               |
+| `/show`                | show greeting and away-message status   |
+| `/away on`             | enable first-contact away replies       |
+| `/away off`            | disable first-contact away replies      |
+| `/away status`         | show whether away replies are enabled   |
 
-The greeting post can be anything (text, media, markdown, premium emoji) and its
-invite link is kept current on each rotation too. If no greeting is set, it
-falls back to the Business away message (`business_away_message.shortcut_id`).
+The greeting post can be anything (text, media, markdown, premium emoji), and
+its invite link is kept current on each rotation. If no custom greeting is set,
+it falls back to the Business away message
+(`business_away_message.shortcut_id`). Sending exactly uppercase `L` in any
+private chat clears the full conversation for both sides and blocks that user.
+`L` in Saved Messages does nothing.
 
 > Business quick replies require **Telegram Premium** on that account.
 
@@ -106,7 +117,8 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 | `ROTATE_MINUTES` | How often to revoke + reissue the link (default 5)  |
 | `LINK_SOURCE`    | (quickreply) account that sends the link; blank = any |
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
-| `GREET_NEW`      | (quickreply) send away msg to first-time DMs (default 1) |
+| `GREET_NEW`      | (quickreply) first-contact away replies (`1`/`0`)    |
+| `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
 
 ## Notes
 

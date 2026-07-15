@@ -4,15 +4,20 @@ Two jobs:
   1. When it receives a t.me invite link from LINK_SOURCE (the guard account),
      it swaps ONLY the link inside your "/SHORTCUT" post AND inside the greeting
      post — text, markdown, and premium (custom) emoji stay exactly as they were.
-  2. When someone DMs this account for the FIRST time, it sends them the greeting
-     post (GREET_NEW=1). Set the greeting from your own Saved Messages: reply to
-     any post with /set. (Falls back to the Business away message if no greeting
-     is set.)
+  2. When someone DMs this account for the FIRST time while the owner is offline,
+     it sends the greeting post (when away replies are enabled). Set the greeting
+     from your own Saved Messages: reply to any post with /set. It falls back to
+     the Business away message if no greeting is set.
+  3. Sending exactly uppercase L in a private chat clears that conversation for
+     both sides and blocks the other user.
 
 Saved Messages commands (send to yourself):
-  /set    reply to a post -> use it as the greeting
-  /unset  clear the greeting
-  /show   whether a greeting is set
+  /set          reply to a post -> use it as the greeting
+  /unset        clear the greeting
+  /show         show greeting + away status
+  /away on      enable first-contact away replies
+  /away off     disable first-contact away replies
+  /away status  show whether away replies are enabled
 
 Business quick replies require Telegram Premium.
 
@@ -24,10 +29,13 @@ import asyncio
 import json
 import random
 import re
+import time
 
 from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
+from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
+    DeleteHistoryRequest,
     EditMessageRequest,
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
@@ -40,6 +48,8 @@ from telethon.tl.types import (
     InputQuickReplyShortcut,
     InputUserSelf,
     MessageMediaWebPage,
+    UserStatusOffline,
+    UserStatusOnline,
 )
 
 import config
@@ -51,8 +61,17 @@ LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 
 client: TelegramClient | None = None
-_state = {"source_id": None, "last": None, "self_id": 0}
+_state = {
+    "source_id": None,
+    "last": None,
+    "self_id": 0,
+    "away_enabled": config.GREET_NEW,
+    "owner_active_until": 0.0,
+    "activity_generation": 0,
+}
 _greeted: set[int] = set()
+_automatic_outgoing: dict[int, dict] = {}
+_automatic_message_ids: set[tuple[int, int]] = set()
 
 
 def _load_greeted() -> set[int]:
@@ -91,6 +110,117 @@ def _clear_greeting() -> bool:
         config.GREETING_FILE.unlink()
         return True
     return False
+
+
+def _mark_owner_active() -> None:
+    """Suppress away replies after a manual outgoing message from any session."""
+    _state["owner_active_until"] = (
+        time.monotonic() + (config.ONLINE_MINUTES * 60)
+    )
+    _state["activity_generation"] += 1
+
+
+def _expect_automatic_outgoing(user_id: int, texts: list[str]) -> dict:
+    """Create an identity marker before the userbot sends to one peer."""
+    marker = {
+        "until": time.monotonic() + 30,
+        "texts": set(texts),
+        "ready": asyncio.Event(),
+    }
+    _automatic_outgoing[user_id] = marker
+    return marker
+
+
+def _sent_message_ids(result) -> set[int]:
+    """Extract message ids from Telethon Message/list/Updates send results."""
+    ids = set()
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            ids.update(_sent_message_ids(item))
+        return ids
+    message_id = getattr(result, "id", None)
+    if isinstance(message_id, int):
+        ids.add(message_id)
+    for update in getattr(result, "updates", []) or []:
+        message = getattr(update, "message", None)
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, int):
+            ids.add(message_id)
+    return ids
+
+
+def _finish_automatic_outgoing(user_id: int, marker: dict, result) -> None:
+    ids = _sent_message_ids(result)
+    _automatic_message_ids.update((user_id, message_id) for message_id in ids)
+    marker["ready"].set()
+    if _automatic_outgoing.get(user_id) is marker:
+        _automatic_outgoing.pop(user_id, None)
+
+
+def _cancel_automatic_outgoing(user_id: int, marker: dict) -> None:
+    marker["ready"].set()
+    if _automatic_outgoing.get(user_id) is marker:
+        _automatic_outgoing.pop(user_id, None)
+
+
+async def _consume_automatic_outgoing(event) -> bool:
+    """Match generated outgoing updates by peer and Telegram message id."""
+    user_id = event.chat_id
+    key = (user_id, event.id)
+    if key in _automatic_message_ids:
+        _automatic_message_ids.discard(key)
+        return True
+
+    marker = _automatic_outgoing.get(user_id)
+    if marker is None or (event.raw_text or "") not in marker["texts"]:
+        return False
+    if marker["until"] <= time.monotonic():
+        _cancel_automatic_outgoing(user_id, marker)
+        return False
+    try:
+        await asyncio.wait_for(marker["ready"].wait(), timeout=2)
+    except asyncio.TimeoutError:
+        return False
+    if key not in _automatic_message_ids:
+        return False
+    _automatic_message_ids.discard(key)
+    return True
+
+
+async def _owner_is_online() -> bool:
+    """Use live Telegram presence plus recent manual activity from any session."""
+    if time.monotonic() < _state["owner_active_until"]:
+        return True
+    try:
+        me = await client.get_me()
+        status = getattr(me, "status", None)
+        if isinstance(status, UserStatusOnline):
+            return status.expires.timestamp() > time.time()
+        # Unknown/approximate presence must fail closed. Only Telegram's
+        # explicit offline status authorizes an away reply.
+        return not isinstance(status, UserStatusOffline)
+    except Exception as e:  # noqa: BLE001
+        ui.warn(f"Couldn't verify owner presence; suppressing away reply: {type(e).__name__}")
+        return True
+
+
+async def _away_still_allowed(generation: int) -> bool:
+    """Re-authorize an away send after its message/template lookups finish."""
+    if not _state["away_enabled"] or generation != _state["activity_generation"]:
+        return False
+    if await _owner_is_online():
+        return False
+    return (
+        _state["away_enabled"]
+        and generation == _state["activity_generation"]
+        and time.monotonic() >= _state["owner_active_until"]
+    )
+
+
+def _set_away_enabled(enabled: bool) -> None:
+    config.save_env({"GREET_NEW": "1" if enabled else "0"})
+    _state["away_enabled"] = enabled
+    _state["activity_generation"] += 1
 
 
 def _u16(s: str) -> int:
@@ -193,25 +323,34 @@ async def _away_shortcut_id():
     return getattr(away, "shortcut_id", None) if away else None
 
 
-async def _copy_to(peer, src) -> None:
+async def _copy_to(peer, src):
     """Send a copy of `src` (text/media + entities, incl. premium emoji)."""
     text = src.message or ""
     ents = src.entities or None
     media = getattr(src, "media", None)
     if media and not isinstance(media, MessageMediaWebPage):
-        await client.send_file(peer, file=media, caption=text, formatting_entities=ents)
-    else:
-        await client.send_message(peer, text, formatting_entities=ents,
-                                  link_preview=isinstance(media, MessageMediaWebPage))
+        return await client.send_file(
+            peer,
+            file=media,
+            caption=text,
+            formatting_entities=ents,
+        )
+    return await client.send_message(
+        peer,
+        text,
+        formatting_entities=ents,
+        link_preview=isinstance(media, MessageMediaWebPage),
+    )
 
 
-async def send_greeting(event) -> str:
-    """Send the greeting to the DM sender.
+async def send_greeting(event, generation: int) -> str:
+    """Send the greeting if the owner is still away.
 
     Prefers the /set greeting post; falls back to the Business away message.
-    Returns 'greeting', 'away', or 'none'.
+    Returns 'greeting', 'away', 'suppressed', or 'none'.
     """
     peer = await event.get_input_sender()
+    user_id = event.sender_id
 
     g = _load_greeting()
     if g:
@@ -220,18 +359,38 @@ async def send_greeting(event) -> str:
         except Exception:
             src = None
         if src is not None:
-            await _copy_to(peer, src)
+            if not await _away_still_allowed(generation):
+                return "suppressed"
+            marker = _expect_automatic_outgoing(user_id, [src.message or ""])
+            try:
+                result = await _copy_to(peer, src)
+            except Exception:
+                _cancel_automatic_outgoing(user_id, marker)
+                raise
+            _finish_automatic_outgoing(user_id, marker, result)
             return "greeting"
 
     sid = await _away_shortcut_id()
     if sid:
         msgs = await client(GetQuickReplyMessagesRequest(shortcut_id=sid, hash=0, id=None))
-        ids = [m.id for m in getattr(msgs, "messages", []) or []]
+        shortcut_msgs = list(getattr(msgs, "messages", []) or [])
+        ids = [m.id for m in shortcut_msgs]
         if ids:
-            await client(SendQuickReplyMessagesRequest(
-                peer=peer, shortcut_id=sid, id=ids,
-                random_id=[random.randrange(-(2 ** 63), 2 ** 63) for _ in ids],
-            ))
+            if not await _away_still_allowed(generation):
+                return "suppressed"
+            marker = _expect_automatic_outgoing(
+                user_id,
+                [getattr(m, "message", "") or "" for m in shortcut_msgs],
+            )
+            try:
+                result = await client(SendQuickReplyMessagesRequest(
+                    peer=peer, shortcut_id=sid, id=ids,
+                    random_id=[random.randrange(-(2 ** 63), 2 ** 63) for _ in ids],
+                ))
+            except Exception:
+                _cancel_automatic_outgoing(user_id, marker)
+                raise
+            _finish_automatic_outgoing(user_id, marker, result)
             return "away"
     return "none"
 
@@ -306,11 +465,61 @@ async def _handle_link(event, link: str) -> None:
     _state["last"] = link
 
 
-async def on_command(event):
-    """Saved Messages commands: /set (reply), /unset, /show."""
-    if event.chat_id != _state["self_id"]:
+async def _clear_and_block(event) -> None:
+    """Delete a private conversation for both sides and block its other user."""
+    peer = await event.get_input_chat()
+    errors = []
+    try:
+        await client(DeleteHistoryRequest(
+            peer=peer,
+            max_id=0,
+            just_clear=False,
+            revoke=True,
+        ))
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"clear failed ({type(e).__name__}: {e})")
+    try:
+        await client(BlockRequest(id=peer))
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"block failed ({type(e).__name__}: {e})")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    print(ui.green("[blocked] ") + f"cleared private chat with {event.chat_id}", flush=True)
+
+
+async def on_outgoing(event):
+    """Track owner activity, handle Saved Messages controls, and process L."""
+    chat_id = event.chat_id
+    raw_text = event.raw_text or ""
+
+    # Programmatic greeting sends arrive as outgoing updates too. Consume only
+    # the exact message body we registered, not every send in that chat.
+    if chat_id != _state["self_id"] and await _consume_automatic_outgoing(event):
         return
-    low = (event.raw_text or "").strip().lower()
+
+    _mark_owner_active()
+
+    # Only a plain, unforwarded, text-only uppercase L triggers this destructive
+    # action. Whitespace, captions, forwarded messages, and Saved Messages do not.
+    if (
+        event.is_private
+        and chat_id != _state["self_id"]
+        and raw_text == "L"
+        and event.message.media is None
+        and event.message.fwd_from is None
+        and not event.message.entities
+    ):
+        try:
+            await _clear_and_block(event)
+        except Exception as e:  # noqa: BLE001
+            ui.error(f"clear/block failed for {chat_id}: {type(e).__name__}: {e}")
+        return
+
+    if chat_id != _state["self_id"]:
+        return
+
+    text = raw_text.strip()
+    low = text.lower()
     if low.startswith("/set"):
         reply = await event.get_reply_message()
         if reply is None:
@@ -327,9 +536,27 @@ async def on_command(event):
         await event.reply("Greeting saved. New users who DM you first get this." + note)
     elif low == "/unset":
         await event.reply("Greeting cleared." if _clear_greeting() else "No greeting was set.")
+    elif low == "/away on":
+        try:
+            _set_away_enabled(True)
+        except OSError as e:
+            await event.reply(f"Could not enable away messages: {e}")
+        else:
+            await event.reply("Away messages enabled.")
+    elif low == "/away off":
+        try:
+            _set_away_enabled(False)
+        except OSError as e:
+            await event.reply(f"Could not disable away messages: {e}")
+        else:
+            await event.reply("Away messages disabled.")
+    elif low in ("/away", "/away status"):
+        state = "enabled" if _state["away_enabled"] else "disabled"
+        await event.reply(f"Away messages are {state}.")
     elif low == "/show":
-        await event.reply("Greeting is set." if _load_greeting()
-                          else "No greeting set. Reply to a post with /set.")
+        greeting = "set" if _load_greeting() else "not set"
+        away = "enabled" if _state["away_enabled"] else "disabled"
+        await event.reply(f"Greeting is {greeting}. Away messages are {away}.")
 
 
 async def on_msg(event):
@@ -349,8 +576,9 @@ async def on_msg(event):
                 ui.warn("Business quick replies require Telegram Premium.")
         return
 
-    # 2) A brand-new DM conversation -> send the greeting (once per user).
-    if not config.GREET_NEW:
+    # 2) A brand-new DM conversation -> send the greeting (once per user), but
+    # never while the owner is currently online/recently active.
+    if not _state["away_enabled"]:
         return
     if not sender or sender in (_state["self_id"], src) or sender in _greeted:
         return
@@ -358,12 +586,21 @@ async def on_msg(event):
         _greeted.add(sender)          # existing contact -> remember, don't greet
         _save_greeted()
         return
+    generation = _state["activity_generation"]
+    if await _owner_is_online():
+        _greeted.add(sender)
+        _save_greeted()
+        print(ui.dim(f"[greet] owner online; skipped {sender}"), flush=True)
+        return
     try:
-        status = await send_greeting(event)
+        status = await send_greeting(event, generation)
         _greeted.add(sender)
         _save_greeted()
         if status == "none":
             ui.warn(f"No greeting set (reply to a post with /set). Skipped {sender}.")
+        elif status == "suppressed":
+            print(ui.dim(f"[greet] owner became active or away was disabled; skipped {sender}"),
+                  flush=True)
         else:
             print(ui.green("[greet] ") + f"sent {status} to {sender}", flush=True)
     except Exception as e:  # noqa: BLE001
@@ -397,19 +634,22 @@ async def main() -> None:
         except Exception:
             ui.warn("Couldn't resolve LINK_SOURCE — accepting links from any private chat.")
 
-    # Incoming DMs -> link update / greet.  Outgoing (Saved Messages) -> commands.
+    # Incoming DMs -> link update / greet. All outgoing messages -> presence,
+    # Saved Messages controls, and the private-chat L action.
     client.add_event_handler(on_msg, events.NewMessage(incoming=True))
-    client.add_event_handler(on_command, events.NewMessage(outgoing=True))
+    client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
 
     where = f"from {src_raw}" if _state["source_id"] else "from any private chat"
     ui.banner("Quick-reply updater - running")
     ui.success(f"As {ui.bold(me.first_name)} (id {me.id}).")
     ui.info(f"Keeping /{ui.bold(config.SHORTCUT)} link current ({where}).")
-    if config.GREET_NEW:
+    if _state["away_enabled"]:
         has_greeting = _load_greeting() is not None
         state = "set" if has_greeting else ui.yellow("not set - reply to a post with /set")
-        ui.info(f"First-time DMs get the greeting post [{state}]. "
+        ui.info(f"First-time DMs get the greeting post only while you are offline [{state}]. "
                 + ui.dim(f"({len(_greeted)} already greeted)"))
+    else:
+        ui.info("Away messages are disabled.")
     print(ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 

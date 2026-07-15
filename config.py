@@ -23,8 +23,12 @@ SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")
-# Send the current Business AWAY message to anyone who DMs us the first time.
+# Send the current greeting/Business away message to first-time DMs.
+# This can also be changed live with /away on|off in Saved Messages.
 GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "no", "")
+# A manual outgoing message means the owner is active for this long. Telegram's
+# live UserStatusOnline is checked too; this window covers delayed status updates.
+ONLINE_MINUTES = max(0.0, float(os.getenv("ONLINE_MINUTES", "2")))
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
