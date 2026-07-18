@@ -30,6 +30,19 @@ GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "n
 # live UserStatusOnline is checked too; this window covers delayed status updates.
 ONLINE_MINUTES = max(0.0, float(os.getenv("ONLINE_MINUTES", "2")))
 
+# --- Payment logger (quickreply.py extension) -----------------------------
+# Revenue split for the {rioshare}/{marco} caption parameters.
+RIO_PCT = float(os.getenv("RIO_PCT", "55"))
+MARCO_PCT = float(os.getenv("MARCO_PCT", "45"))
+# What {rioshare}/{marco} are computed from:
+#   today       -> that % of the TOTAL amount received so far today
+#   transaction -> that % of THIS single payment's amount
+SHARE_BASE = os.getenv("SHARE_BASE", "today").strip().lower()
+# Caption parse mode for the auto-post: html or none.
+PAY_PARSE_MODE = os.getenv("PAY_PARSE_MODE", "html").strip().lower()
+# Timezone used to decide what counts as "today" (INR default = India).
+TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
+
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
 QR_SESSION = str(BASE_DIR / "quickreply")    # quick-reply account session
@@ -38,6 +51,7 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 GREETED_FILE = DATA_DIR / "greeted.json"     # user ids already auto-replied to
 GREETING_FILE = DATA_DIR / "greeting.json"   # the /set greeting post reference
+PAY_FILE = DATA_DIR / "pay.json"             # post channel + caption templates + payments log
 
 
 def coerce(s: str):

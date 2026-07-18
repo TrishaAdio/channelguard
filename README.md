@@ -105,6 +105,29 @@ private chat clears the full conversation for both sides and blocks that user.
 
 > Business quick replies require **Telegram Premium** on that account.
 
+### Payment logger (`quickreply.py`)
+
+Send these yourself (outgoing). Unlike the greeting commands, the payment
+commands work in **any** chat, not only Saved Messages. The payment logger does
+**not** require Premium.
+
+| Command | Effect |
+|---------|--------|
+| reply to an image + `/add <amount> [name]` | record the payment (INR), message the user in that private chat, and auto-post the image + caption to your channel |
+| `/setdone <template>` | the message the paying user receives in the private chat |
+| `/setchannelpostofpayment <template>` | the caption used for the channel post |
+| `.setchannel` (typed in a channel) | set that channel as the post target |
+| `/stats` | today's total (INR), payment count, and Rio/Marco split |
+| `/clear` | reset today's stats to zero |
+| `.help` | show every command and template parameter |
+
+Template parameters (usable in both `/setdone` and `/setchannelpostofpayment`):
+`{amount}` (this payment), `{name}`, `{rioshare}`, `{marco}`, `{total}`
+(payments today), `{todaytotal}` (collected today). Reply to a formatted post
+with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
+emoji verbatim. The revenue split, timezone, and share basis are configured via
+`RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
+
 ## Files
 
 | File            | Role                                                          |
@@ -130,6 +153,10 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
 | `GREET_NEW`      | (quickreply) first-contact away replies (`1`/`0`)    |
 | `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
+| `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
+| `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
+| `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
+| `TZ`             | (payment logger) timezone for the "today" boundary (default `Asia/Kolkata`) |
 
 ## Notes
 
