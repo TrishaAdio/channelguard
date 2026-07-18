@@ -84,6 +84,16 @@ Set the greeting from your own **Saved Messages** — no Premium needed:
 | `/away on`             | enable first-contact away replies       |
 | `/away off`            | disable first-contact away replies      |
 | `/away status`         | show whether away replies are enabled   |
+| reply + `/broadcast 9:30 AM 18 JUL THANKS FOR` | copy the replied post to every chat where you sent `THANKS FOR` from that IST time through the command time |
+
+The `/broadcast` search uses Telegram history directly, so no local message
+archive is needed. Matching is case-insensitive, only messages sent by your
+account count, and each matching chat receives one copy. The start time is
+always IST. Add a year when needed, for example
+`/broadcast 9:30 AM 18 JUL 2026 THANKS FOR`; without a year, the current IST
+calendar year is used. Future start times are rejected to prevent an accidental
+wide broadcast. The command only works in your own Saved Messages and must
+reply to the text/media post you want to broadcast.
 
 The greeting post can be anything (text, media, markdown, premium emoji), and
 its invite link is kept current on each rotation. If no custom greeting is set,
