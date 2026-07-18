@@ -18,6 +18,12 @@ Saved Messages commands (send to yourself):
   /away on      enable first-contact away replies
   /away off     disable first-contact away replies
   /away status  show whether away replies are enabled
+  /broadcast TIME DATE [YEAR] KEYWORD
+                reply to a post -> copy it to every chat where you sent the
+                keyword between that IST start time and now
+
+Example:
+  reply to a post with /broadcast 9:30 AM 18 JUL THANKS FOR
 
 Business quick replies require Telegram Premium.
 
@@ -30,9 +36,10 @@ import json
 import random
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
     DeleteHistoryRequest,
@@ -60,6 +67,35 @@ LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 # The link inside the saved post (may or may not include the scheme).
 FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 
+# Owner-only Saved Messages broadcast:
+#   /broadcast 9:30 AM 18 JUL THANKS FOR
+# Reply to the post to copy. Every chat containing an owner-authored message
+# with the keyword between that IST start time and the command time is targeted.
+BROADCAST_RE = re.compile(
+    r"^/broadcast\s+(\d{1,2}):(\d{2})\s*(AM|PM)\s+"
+    r"(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+MONTHS = {
+    "JAN": 1, "JANUARY": 1,
+    "FEB": 2, "FEBRUARY": 2,
+    "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12,
+}
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except (ImportError, KeyError):
+    IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+
 client: TelegramClient | None = None
 _state = {
     "source_id": None,
@@ -72,6 +108,7 @@ _state = {
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
 _automatic_message_ids: set[tuple[int, int]] = set()
+_broadcast_lock = asyncio.Lock()
 
 
 def _load_greeted() -> set[int]:
@@ -343,6 +380,174 @@ async def _copy_to(peer, src):
     )
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Return an aware UTC datetime (Telethon dates are normally UTC-aware)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_broadcast_command(text: str, command_date: datetime):
+    """Parse `/broadcast TIME DATE [YEAR] KEYWORD` using IST."""
+    match = BROADCAST_RE.match(text.strip())
+    if not match:
+        raise ValueError(
+            "Format: /broadcast 9:30 AM 18 JUL THANKS FOR\n"
+            "Optional year: /broadcast 9:30 AM 18 JUL 2026 THANKS FOR"
+        )
+
+    hour, minute = int(match.group(1)), int(match.group(2))
+    am_pm = match.group(3).upper()
+    day = int(match.group(4))
+    month_name = match.group(5).upper()
+    explicit_year = match.group(6)
+    keyword = match.group(7).strip()
+
+    if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+        raise ValueError("Invalid time. Use 12-hour IST time, for example 9:30 AM.")
+    month = MONTHS.get(month_name)
+    if month is None:
+        raise ValueError(f"Invalid month: {match.group(5)}")
+
+    end_utc = _as_utc(command_date)
+    end_ist = end_utc.astimezone(IST)
+    year = int(explicit_year) if explicit_year else end_ist.year
+    hour_24 = hour % 12 + (12 if am_pm == "PM" else 0)
+    try:
+        start_ist = datetime(year, month, day, hour_24, minute, tzinfo=IST)
+    except ValueError as e:
+        raise ValueError(f"Invalid date: {e}") from e
+
+    # With no year, use the current IST calendar year. A future start is
+    # rejected instead of silently scanning a previous year and broadcasting
+    # to a much wider set of chats than the owner intended.
+    if start_ist > end_ist:
+        raise ValueError(
+            "Start time is in the future (IST). Add the intended year if needed."
+        )
+
+    return start_ist.astimezone(timezone.utc), end_utc, keyword
+
+
+async def _find_broadcast_targets(start_utc: datetime, end_utc: datetime, keyword: str):
+    """Find unique chats where this account sent `keyword` during the window."""
+    targets = {}
+    needle = keyword.casefold()
+
+    # entity=None performs Telegram global search. The pinned Telethon 1.36
+    # cannot combine global search with from_user="me" (InputPeerEmpty raises
+    # during request construction), so authorship is enforced locally below.
+    # Search one second past the command because Telegram's offset_date is
+    # exclusive and message timestamps have one-second precision; the local
+    # end-date check keeps the requested interval inclusive and exact.
+    async for message in client.iter_messages(
+        None,
+        search=keyword,
+        offset_date=end_utc + timedelta(seconds=1),
+    ):
+        message_date = getattr(message, "date", None)
+        if message_date is None:
+            continue
+        message_date = _as_utc(message_date)
+        if message_date < start_utc:
+            break  # global search is newest-first
+        if message_date > end_utc:
+            continue
+        if not getattr(message, "out", False):
+            continue
+        if getattr(message, "sender_id", None) != _state["self_id"]:
+            continue
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None or chat_id == _state["self_id"]:
+            continue  # never target Saved Messages
+        body = getattr(message, "raw_text", "") or ""
+        if needle not in body.casefold():
+            continue  # Telegram search can be fuzzy/token-based; require exact phrase
+        if chat_id in targets:
+            continue
+        try:
+            peer = await message.get_input_chat()
+            if peer is None:
+                peer = await client.get_input_entity(message.peer_id)
+        except Exception as e:  # noqa: BLE001
+            ui.warn(f"Couldn't resolve matching chat {chat_id}: {type(e).__name__}")
+            continue
+        targets[chat_id] = peer
+    return targets
+
+
+async def _send_broadcast_copy(chat_id: int, peer, src):
+    """Copy once, waiting and retrying one time if Telegram imposes a flood wait."""
+    for attempt in (1, 2):
+        marker = _expect_automatic_outgoing(chat_id, [src.message or ""])
+        try:
+            result = await _copy_to(peer, src)
+        except FloodWaitError as e:
+            _cancel_automatic_outgoing(chat_id, marker)
+            if attempt == 2:
+                raise
+            wait = max(1, int(e.seconds) + 1)
+            ui.warn(f"Broadcast flood wait: sleeping {wait}s, then retrying.")
+            await asyncio.sleep(wait)
+            continue
+        except Exception:
+            _cancel_automatic_outgoing(chat_id, marker)
+            raise
+        _finish_automatic_outgoing(chat_id, marker, result)
+        return
+
+
+async def _run_broadcast(event, src, start_utc: datetime, end_utc: datetime,
+                         keyword: str) -> None:
+    """Discover matching chats, then copy the replied post to each one."""
+    start_ist = start_utc.astimezone(IST)
+    end_ist = end_utc.astimezone(IST)
+    progress = await event.reply(
+        f'Scanning for "{keyword}" from '
+        f'{start_ist.strftime("%d %b %Y, %I:%M %p")} IST to '
+        f'{end_ist.strftime("%d %b %Y, %I:%M %p")} IST...'
+    )
+
+    try:
+        targets = await _find_broadcast_targets(start_utc, end_utc, keyword)
+    except Exception as e:  # noqa: BLE001
+        await progress.edit(f"Broadcast search failed: {type(e).__name__}: {e}")
+        return
+
+    if not targets:
+        await progress.edit(
+            f'No chats found where you sent "{keyword}" in that IST time window.'
+        )
+        return
+
+    sent = 0
+    failures = []
+    await progress.edit(f"Found {len(targets)} matching chat(s). Broadcasting...")
+    for chat_id, peer in targets.items():
+        try:
+            await _send_broadcast_copy(chat_id, peer, src)
+            sent += 1
+            print(ui.green("[broadcast] ") + f"sent to {chat_id}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            failures.append((chat_id, type(e).__name__))
+            ui.error(f"broadcast failed for {chat_id}: {type(e).__name__}: {e}")
+        await asyncio.sleep(0.35)
+
+    result = (
+        "Broadcast complete.\n"
+        f"Keyword: {keyword}\n"
+        f"Matched chats: {len(targets)}\n"
+        f"Sent: {sent}\n"
+        f"Failed: {len(failures)}"
+    )
+    if failures:
+        preview = ", ".join(f"{chat_id} ({name})" for chat_id, name in failures[:8])
+        result += f"\nFailures: {preview}"
+        if len(failures) > 8:
+            result += f" +{len(failures) - 8} more"
+    await progress.edit(result)
+
+
 async def send_greeting(event, generation: int) -> str:
     """Send the greeting if the owner is still away.
 
@@ -520,7 +725,25 @@ async def on_outgoing(event):
 
     text = raw_text.strip()
     low = text.lower()
-    if low.startswith("/set"):
+    if low.startswith("/broadcast"):
+        reply = await event.get_reply_message()
+        if reply is None:
+            await event.reply(
+                "Reply to the message you want to send, then use:\n"
+                "/broadcast 9:30 AM 18 JUL THANKS FOR"
+            )
+            return
+        try:
+            start_utc, end_utc, keyword = _parse_broadcast_command(text, event.date)
+        except ValueError as e:
+            await event.reply(str(e))
+            return
+        if _broadcast_lock.locked():
+            await event.reply("A broadcast is already running. Wait for it to finish.")
+            return
+        async with _broadcast_lock:
+            await _run_broadcast(event, reply, start_utc, end_utc, keyword)
+    elif low.startswith("/set"):
         reply = await event.get_reply_message()
         if reply is None:
             await event.reply("Reply to a post with /set to use it as the greeting.")
