@@ -84,6 +84,7 @@ Set the greeting from your own **Saved Messages** — no Premium needed:
 | `/away on`             | enable first-contact away replies       |
 | `/away off`            | disable first-contact away replies      |
 | `/away status`         | show whether away replies are enabled   |
+| `/help`                | list all Saved Messages commands        |
 | reply + `/broadcast 9:30 AM 18 JUL THANKS FOR` | copy the replied post to every chat where you sent `THANKS FOR` from that IST time through the command time |
 
 The `/broadcast` search uses Telegram history directly, so no local message
