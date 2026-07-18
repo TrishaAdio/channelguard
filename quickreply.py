@@ -55,7 +55,6 @@ from telethon.tl.types import (
     InputQuickReplyShortcut,
     InputUserSelf,
     MessageMediaWebPage,
-    UserStatusOffline,
     UserStatusOnline,
 )
 
@@ -225,7 +224,15 @@ async def _consume_automatic_outgoing(event) -> bool:
 
 
 async def _owner_is_online() -> bool:
-    """Use live Telegram presence plus recent manual activity from any session."""
+    """Report the owner online ONLY on strong evidence: a recent manual send
+    from any session, or Telegram explicitly reporting `UserStatusOnline`.
+
+    This fails OPEN (returns False = offline) for every approximate/hidden
+    status — `UserStatusRecently`, `LastWeek`, `LastMonth`, `Empty`, or a
+    hidden last-seen (`status is None`). The previous fail-closed logic
+    permanently suppressed away replies for the very common case of a hidden
+    last-seen, because that status is not `UserStatusOffline`.
+    """
     if time.monotonic() < _state["owner_active_until"]:
         return True
     try:
@@ -233,12 +240,12 @@ async def _owner_is_online() -> bool:
         status = getattr(me, "status", None)
         if isinstance(status, UserStatusOnline):
             return status.expires.timestamp() > time.time()
-        # Unknown/approximate presence must fail closed. Only Telegram's
-        # explicit offline status authorizes an away reply.
-        return not isinstance(status, UserStatusOffline)
+        # Anything that is not an explicit, live "online" is treated as offline
+        # so greetings actually fire.
+        return False
     except Exception as e:  # noqa: BLE001
-        ui.warn(f"Couldn't verify owner presence; suppressing away reply: {type(e).__name__}")
-        return True
+        ui.warn(f"Couldn't verify owner presence; treating as offline: {type(e).__name__}")
+        return False
 
 
 async def _away_still_allowed(generation: int) -> bool:
@@ -780,6 +787,17 @@ async def on_outgoing(event):
         greeting = "set" if _load_greeting() else "not set"
         away = "enabled" if _state["away_enabled"] else "disabled"
         await event.reply(f"Greeting is {greeting}. Away messages are {away}.")
+    elif low in ("/help", "/start", "/commands"):
+        await event.reply(
+            "Saved Messages commands:\n"
+            "/set - reply to a post to use it as the greeting\n"
+            "/unset - clear the greeting\n"
+            "/show - show greeting + away status\n"
+            "/away on | off | status - control first-contact away replies\n"
+            "/broadcast 9:30 AM 18 JUL THANKS FOR - reply to a post to copy it "
+            "to every chat where you sent the keyword from that IST time until now\n"
+            "L (in a private chat) - clear the conversation for both sides and block"
+        )
 
 
 async def on_msg(event):
@@ -811,9 +829,9 @@ async def on_msg(event):
         return
     generation = _state["activity_generation"]
     if await _owner_is_online():
-        _greeted.add(sender)
-        _save_greeted()
-        print(ui.dim(f"[greet] owner online; skipped {sender}"), flush=True)
+        # Do NOT mark greeted: once the owner is offline again, a later message
+        # from this user should still get the away reply.
+        print(ui.dim(f"[greet] owner online; will retry when offline: {sender}"), flush=True)
         return
     try:
         status = await send_greeting(event, generation)
