@@ -120,13 +120,16 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT** and exclude that payment from today's count, total, and split |
 | `/clear` | reset today's stats to zero |
+| `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
 | `.help` | show every command and template parameter |
 
 Template parameters (usable in both `/setdone` and `/setchannelpostofpayment`):
 `{amount}` (this payment), `{name}`, `{rioshare}`, `{marco}`, `{total}`
 (payments today), `{todaytotal}` (collected today). Reply to a formatted post
 with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
-emoji verbatim. Every new `/add` upload is linked to its payment record; replying
+emoji verbatim. `pay.json` is validated and repaired at startup; malformed manual
+edits are backed up as `data/pay.recovery-*.json` instead of preventing every
+command from loading. Every new `/add` upload is linked to its payment record; replying
 `/cancel` to that generated post marks it **FAKE PAYMENT** while retaining an
 audit record, and excludes it from `/stats` and all later daily-total template
 values. Posts generated before `/cancel` support cannot be matched retroactively.

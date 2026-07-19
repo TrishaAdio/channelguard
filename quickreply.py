@@ -35,6 +35,7 @@ Payment logger (send these yourself in ANY chat):
   /cancel                        in the upload channel, reply to a payment post
                                  -> mark it fake and remove it from today's stats
   /clear                         reset today's stats to zero
+  .ping                          verify the quick-reply userbot is running
   .help                          show every command and template parameter
 
 Business quick replies require Telegram Premium (the payment logger does not).
@@ -46,9 +47,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
+import os
 import random
 import re
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
@@ -424,23 +428,7 @@ async def _copy_to(peer, src):
 # --------------------------------------------------------------------------
 # Payment logger
 # --------------------------------------------------------------------------
-def _load_pay() -> dict:
-    if config.PAY_FILE.exists():
-        try:
-            data = json.loads(config.PAY_FILE.read_text())
-            data.setdefault("post_channel", None)
-            data.setdefault("done_template", DEFAULT_DONE)
-            data.setdefault("channel_template", DEFAULT_CHANNEL)
-            data.setdefault("payments", [])
-            # Records written before /cancel support have no status or post IDs.
-            # They remain valid for stats, but cannot be matched to a channel
-            # post retroactively.
-            for payment in data["payments"]:
-                if isinstance(payment, dict):
-                    payment.setdefault("status", "valid")
-            return data
-        except (ValueError, OSError):
-            pass
+def _default_pay() -> dict:
     return {
         "post_channel": None,
         "done_template": DEFAULT_DONE,
@@ -449,8 +437,157 @@ def _load_pay() -> dict:
     }
 
 
+def _optional_int(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_pay_data(value) -> tuple[dict, list[str]]:
+    """Return a safe payment-store shape and a list of repairs performed.
+
+    Manual JSON edits commonly turn numbers into strings or accidentally change
+    `payments` from a list into an object. Payment state must never prevent the
+    Telethon handlers from starting, so salvage valid records and skip only
+    irrecoverable entries.
+    """
+    repairs = []
+    if isinstance(value, list):
+        repairs.append("top-level payment list wrapped into an object")
+        value = {"payments": value}
+    elif not isinstance(value, dict):
+        repairs.append("top-level value replaced (expected an object)")
+        value = {}
+
+    data = dict(value)
+    post_channel = _optional_int(data.get("post_channel"))
+    if data.get("post_channel") not in (None, "") and post_channel is None:
+        repairs.append("invalid post_channel removed")
+    data["post_channel"] = post_channel
+
+    for key, default in (
+        ("done_template", DEFAULT_DONE),
+        ("channel_template", DEFAULT_CHANNEL),
+    ):
+        if not isinstance(data.get(key), str):
+            if key in data:
+                repairs.append(f"invalid {key} replaced")
+            data[key] = default
+
+    raw_payments = data.get("payments", [])
+    if isinstance(raw_payments, dict):
+        if "amount" in raw_payments and "ts" in raw_payments:
+            repairs.append("single payment object wrapped into a list")
+            raw_payments = [raw_payments]
+        else:
+            repairs.append("payments object converted to a list")
+            raw_payments = list(raw_payments.values())
+    elif not isinstance(raw_payments, list):
+        repairs.append("invalid payments value replaced with an empty list")
+        raw_payments = []
+
+    payments = []
+    allowed_statuses = {
+        "valid", "pending", "failed", "untracked", "cancel_pending",
+        "fake", "cleared", "quarantined",
+    }
+    for index, raw in enumerate(raw_payments):
+        if not isinstance(raw, dict):
+            repairs.append(f"payment #{index + 1} skipped (expected an object)")
+            continue
+        payment = dict(raw)
+        try:
+            amount = float(payment.get("amount"))
+            ts = float(payment.get("ts"))
+            if (
+                not math.isfinite(amount)
+                or amount <= 0
+                or amount > 1_000_000_000_000_000
+                or not math.isfinite(ts)
+            ):
+                raise ValueError
+            # Finite floats can still be outside the platform datetime range.
+            datetime.fromtimestamp(ts, _TZ)
+        except (TypeError, ValueError, OverflowError, OSError):
+            repairs.append(f"payment #{index + 1} skipped (invalid amount/time)")
+            continue
+        payment["amount"] = amount
+        payment["ts"] = ts
+        payment["name"] = str(payment.get("name") or "")
+        status = str(payment.get("status") or "valid").lower()
+        if status not in allowed_statuses:
+            repairs.append(f"payment #{index + 1} status quarantined")
+            payment["original_status"] = status
+            status = "quarantined"
+        payment["status"] = status
+        for key in (
+            "post_chat_id", "post_message_id", "cancel_command_message_id"
+        ):
+            if key in payment:
+                converted = _optional_int(payment.get(key))
+                if payment.get(key) not in (None, "") and converted is None:
+                    repairs.append(f"payment #{index + 1} invalid {key} removed")
+                payment[key] = converted
+        payments.append(payment)
+    data["payments"] = payments
+    return data, repairs
+
+
+def _write_pay_data(data: dict) -> None:
+    """Durably and atomically replace pay.json."""
+    config.PAY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = config.PAY_FILE.with_name(config.PAY_FILE.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(config.PAY_FILE)
+    # Persist the directory entry when the platform supports directory fsync.
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(str(config.PAY_FILE.parent), os.O_RDONLY | directory_flag)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _load_pay() -> dict:
+    if not config.PAY_FILE.exists():
+        return _default_pay()
+
+    raw_bytes = b""
+    repairs = []
+    try:
+        raw_bytes = config.PAY_FILE.read_bytes()
+        raw = raw_bytes.decode("utf-8")
+        value = json.loads(raw)
+        data, repairs = _normalize_pay_data(value)
+    except (UnicodeError, ValueError, OSError) as e:
+        data = _default_pay()
+        repairs = [f"pay.json could not be read ({type(e).__name__})"]
+
+    if repairs:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = config.PAY_FILE.with_name(f"pay.recovery-{stamp}.json")
+        try:
+            if raw_bytes:
+                backup.write_bytes(raw_bytes)
+            _write_pay_data(data)
+            backup_note = f" Original saved as {backup.name}." if raw_bytes else ""
+            ui.warn(f"Repaired payment data ({'; '.join(repairs)}).{backup_note}")
+        except OSError as e:
+            ui.warn(f"Payment data was repaired in memory but could not be saved: {e}")
+    return data
+
+
 def _save_pay() -> None:
-    config.PAY_FILE.write_text(json.dumps(_pay, ensure_ascii=False, indent=2))
+    _write_pay_data(_pay)
 
 
 def _now_ts() -> float:
@@ -902,6 +1039,7 @@ async def cmd_clear(event) -> None:
 
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
+    "<code>.ping</code> - verify the quick-reply userbot is running\n"
     "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log it, message the user, post to the channel\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
@@ -1238,8 +1376,8 @@ async def _clear_and_block(event) -> None:
     print(ui.green("[blocked] ") + f"cleared private chat with {event.chat_id}", flush=True)
 
 
-async def on_outgoing(event):
-    """Track owner activity, handle Saved Messages controls, and process L."""
+async def _handle_outgoing(event):
+    """Track owner activity, handle commands, and process L."""
     chat_id = event.chat_id
     raw_text = event.raw_text or ""
 
@@ -1255,6 +1393,9 @@ async def on_outgoing(event):
     # /setdone and /setchannelpostofpayment are matched before /set (Saved
     # Messages) so the longer commands win.
     low_cmd = raw_text.strip().lower()
+    if low_cmd in (".ping", "/ping"):
+        await event.edit("Quick-reply userbot is running.")
+        return
     if low_cmd in (".help", "/help", "/commands", "/start"):
         await event.edit(HELP_TEXT, parse_mode="html")
         return
@@ -1363,6 +1504,21 @@ async def on_outgoing(event):
         greeting = "set" if _load_greeting() else "not set"
         away = "enabled" if _state["away_enabled"] else "disabled"
         await event.reply(f"Greeting is {greeting}. Away messages are {away}.")
+
+
+async def on_outgoing(event):
+    """Keep one bad payment record or command from disabling all commands."""
+    try:
+        await _handle_outgoing(event)
+    except Exception as e:  # noqa: BLE001
+        text = (getattr(event, "raw_text", "") or "").strip()
+        ui.error(f"outgoing handler failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        if text.startswith(("/", ".")) or text == "L":
+            try:
+                await event.edit("Command failed. Check the quickreply terminal for details.")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def on_msg(event):
