@@ -32,6 +32,8 @@ Payment logger (send these yourself in ANY chat):
   /setchannelpostofpayment <t>   caption for the channel post
   .setchannel                    type it in a channel -> post media there
   /stats                         today's total (INR) + count + split
+  /cancel                        in the upload channel, reply to a payment post
+                                 -> mark it fake and remove it from today's stats
   /clear                         reset today's stats to zero
   .help                          show every command and template parameter
 
@@ -65,6 +67,7 @@ from telethon.tl.types import (
     InputPeerSelf,
     InputQuickReplyShortcut,
     InputUserSelf,
+    MessageEntityBold,
     MessageMediaWebPage,
     UserStatusOnline,
 )
@@ -134,6 +137,7 @@ _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
 _automatic_message_ids: set[tuple[int, int]] = set()
 _broadcast_lock = asyncio.Lock()
+_payment_lock = asyncio.Lock()
 
 # Payment logger state (loaded in main): post_channel, done/channel templates
 # (+ optional *_ref message references), and the payments log.
@@ -428,6 +432,12 @@ def _load_pay() -> dict:
             data.setdefault("done_template", DEFAULT_DONE)
             data.setdefault("channel_template", DEFAULT_CHANNEL)
             data.setdefault("payments", [])
+            # Records written before /cancel support have no status or post IDs.
+            # They remain valid for stats, but cannot be matched to a channel
+            # post retroactively.
+            for payment in data["payments"]:
+                if isinstance(payment, dict):
+                    payment.setdefault("status", "valid")
             return data
         except (ValueError, OSError):
             pass
@@ -454,7 +464,10 @@ def _today_key(ts: float | None = None) -> str:
 
 def _todays_payments() -> list:
     key = _today_key()
-    return [p for p in _pay.get("payments", []) if _today_key(p["ts"]) == key]
+    return [
+        p for p in _pay.get("payments", [])
+        if p.get("status", "valid") == "valid" and _today_key(p["ts"]) == key
+    ]
 
 
 def fmt_inr(value) -> str:
@@ -488,10 +501,13 @@ def parse_amount(raw: str) -> float:
     return float(str(raw).replace(",", "").replace("\u20b9", "").strip())
 
 
-def _pay_mapping(amount: float, name: str) -> dict:
+def _pay_mapping(amount: float, name: str, include_current: bool = False) -> dict:
     day = _todays_payments()
     today_total = sum(p["amount"] for p in day)
     today_count = len(day)
+    if include_current:
+        today_total += amount
+        today_count += 1
 
     base = today_total if config.SHARE_BASE == "today" else amount
     rio = base * config.RIO_PCT / 100.0
@@ -566,9 +582,14 @@ async def _resolve_template(kind: str):
     return _pay.get(f"{kind}_template", ""), []
 
 
-async def _render(kind: str, amount: float, name: str):
+async def _render(kind: str, amount: float, name: str,
+                  include_current: bool = False):
     text, ents = await _resolve_template(kind)
-    return _substitute(text, ents, _pay_mapping(amount, name))
+    return _substitute(
+        text,
+        ents,
+        _pay_mapping(amount, name, include_current=include_current),
+    )
 
 
 async def cmd_add(event) -> None:
@@ -593,18 +614,66 @@ async def cmd_add(event) -> None:
         await event.edit("No post channel set. Type .setchannel in the target channel first.")
         return
 
-    # Record first so today's totals include this payment when rendering.
-    _pay["payments"].append({"amount": amount, "name": name, "ts": _now_ts()})
+    # Snapshot the configured target once. .setchannel cannot move this upload
+    # to a different chat while template resolution or Telegram I/O is pending.
+    target_channel = int(_pay["post_channel"])
+    payment = {
+        "amount": amount,
+        "name": name,
+        "ts": _now_ts(),
+        "status": "pending",
+        "post_chat_id": target_channel,
+        "post_message_id": None,
+    }
+    _pay["payments"].append(payment)
     _save_pay()
 
-    # 1. Post the media + channel caption to the payment channel.
-    ch_text, ch_ents = await _render("channel", amount, name)
+    # Pending records are excluded from public stats. Render this post with the
+    # current payment explicitly included, then finalize it only after Telegram
+    # returns the durable message association.
     try:
-        await client.send_file(_pay["post_channel"], file=reply.media,
-                               caption=ch_text, formatting_entities=ch_ents or None)
+        ch_text, ch_ents = await _render(
+            "channel", amount, name, include_current=True
+        )
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"Recorded, but posting to the channel failed: {type(e).__name__}: {e}")
+        payment["status"] = "failed"
+        payment["error"] = f"render: {type(e).__name__}: {e}"
+        _save_pay()
+        await event.edit(f"Could not render payment post: {type(e).__name__}: {e}")
         return
+
+    marker = _expect_automatic_outgoing(target_channel, [ch_text])
+    try:
+        post_result = await client.send_file(
+            target_channel,
+            file=reply.media,
+            caption=ch_text,
+            formatting_entities=ch_ents or None,
+        )
+    except Exception as e:  # noqa: BLE001
+        _cancel_automatic_outgoing(target_channel, marker)
+        payment["status"] = "failed"
+        payment["error"] = f"upload: {type(e).__name__}: {e}"
+        _save_pay()
+        await event.edit(f"Posting to the channel failed: {type(e).__name__}: {e}")
+        return
+    _finish_automatic_outgoing(target_channel, marker, post_result)
+
+    post_ids = sorted(_sent_message_ids(post_result))
+    if not post_ids:
+        payment["status"] = "untracked"
+        payment["error"] = "Telegram returned no posted message ID"
+        _save_pay()
+        await event.edit(
+            "Payment posted, but Telegram returned no message ID. "
+            "It was not added to stats because /cancel could not track it."
+        )
+        return
+
+    payment["post_message_id"] = post_ids[0]
+    payment["status"] = "valid"
+    payment.pop("error", None)
+    _save_pay()
 
     # 2. Message the user in the private chat (edit the /add command into it).
     us_text, us_ents = await _render("done", amount, name)
@@ -615,6 +684,147 @@ async def cmd_add(event) -> None:
 
     count = len(_todays_payments())
     print(ui.green("[pay] ") + f"{fmt_inr(amount)} {name} -> posted (#{count} today)", flush=True)
+
+
+def _payment_for_post(chat_id: int, message_id: int):
+    """Return the payment linked to a generated channel post, newest first."""
+    for payment in reversed(_pay.get("payments", [])):
+        if (
+            payment.get("post_chat_id") == int(chat_id)
+            and payment.get("post_message_id") == int(message_id)
+        ):
+            return payment
+    return None
+
+
+def _fake_caption(message):
+    """Prefix a channel payment post with a bold FAKE PAYMENT marker.
+
+    Existing caption entities are cloned and shifted in Telegram's UTF-16
+    coordinates, preserving links, formatting, and premium emoji.
+    """
+    label = "FAKE PAYMENT"
+    prefix = f"{label}\n\n"
+    text = message.message or ""
+    if text.startswith(prefix) or text == label:
+        return text, list(message.entities or [])
+
+    shift = _u16(prefix)
+    entities = [copy.copy(entity) for entity in (message.entities or [])]
+    for entity in entities:
+        entity.offset += shift
+    entities.insert(0, MessageEntityBold(offset=0, length=_u16(label)))
+
+    # Media captions are limited to 1024 Telegram text units. Preserve as much
+    # of the original caption as possible while guaranteeing the fake marker
+    # can always be applied, even when the original caption was at the limit.
+    new_text = prefix + text
+    caption_limit = 1024
+    while _u16(new_text) > caption_limit:
+        new_text = new_text[:-1]
+    final_length = _u16(new_text)
+    kept_entities = []
+    for entity in entities:
+        if entity.offset >= final_length:
+            continue
+        entity.length = min(entity.length, final_length - entity.offset)
+        if entity.length > 0:
+            kept_entities.append(entity)
+    return new_text, kept_entities
+
+
+async def cmd_cancel(event) -> None:
+    """Mark a replied payment-channel post fake and exclude it from stats."""
+    reply = await event.get_reply_message()
+    if reply is None:
+        await event.edit("Reply to a payment post with /cancel.")
+        return
+
+    payment = _payment_for_post(event.chat_id, reply.id)
+    if payment is None:
+        await event.edit(
+            "That post is not linked to a recorded payment in this channel. "
+            "Only payment posts created after /cancel support can be matched."
+        )
+        return
+    if payment.get("status") == "fake":
+        await event.edit("Payment is already marked fake.")
+        return
+
+    fake_text, fake_entities = _fake_caption(reply)
+    if payment.get("status") != "cancel_pending":
+        payment["cancel_previous_status"] = payment.get("status", "valid")
+    payment["status"] = "cancel_pending"
+    payment["cancel_command_message_id"] = int(event.id)
+    _save_pay()
+
+    peer = await event.get_input_chat()
+    edit_succeeded = False
+    try:
+        await client.edit_message(
+            peer,
+            reply.id,
+            fake_text,
+            formatting_entities=fake_entities or None,
+        )
+        edit_succeeded = True
+    except MessageNotModifiedError:
+        # A previous attempt may have edited Telegram before its response was
+        # lost. Treat the already-applied marker as success.
+        edit_succeeded = True
+    except Exception as e:  # noqa: BLE001
+        # Resolve ambiguous network failures by fetching the actual post. Never
+        # restore stats unless a successful fetch proves the marker is absent.
+        current = None
+        fetch_succeeded = False
+        try:
+            current = await client.get_messages(peer, ids=reply.id)
+            fetch_succeeded = True
+        except Exception:  # noqa: BLE001
+            pass
+        current_text = (getattr(current, "message", "") or "") if current else ""
+        if current_text.startswith("FAKE PAYMENT\n\n") or current_text == "FAKE PAYMENT":
+            edit_succeeded = True
+        elif fetch_succeeded:
+            payment["status"] = payment.pop("cancel_previous_status", "valid")
+            payment.pop("cancel_command_message_id", None)
+            _save_pay()
+            await event.edit(f"Could not mark payment fake: {type(e).__name__}: {e}")
+            return
+        else:
+            # Telegram may have applied the edit before the response was lost.
+            # Keep this record excluded from stats until /cancel is retried and
+            # the post can be reconciled; restoring it could count a visible fake.
+            payment["cancel_error"] = f"{type(e).__name__}: {e}"
+            _save_pay()
+            await event.edit(
+                "Cancellation could not be verified. Payment is excluded from "
+                "stats; reply /cancel to the payment post again."
+            )
+            return
+
+    if edit_succeeded:
+        payment["status"] = "fake"
+        payment["canceled_ts"] = _now_ts()
+        payment.pop("cancel_previous_status", None)
+        payment.pop("cancel_error", None)
+        payment.pop("error", None)
+        _save_pay()
+
+    day = _todays_payments()
+    total = sum(p["amount"] for p in day)
+    try:
+        await event.delete()
+    except Exception:  # noqa: BLE001
+        await event.edit(
+            f"Payment marked fake. Today: {fmt_inr(total)} / {len(day)} payment(s)."
+        )
+    print(
+        ui.yellow("[pay fake] ")
+        + f"{fmt_inr(payment['amount'])} {payment.get('name', '')} -> "
+        + f"today {fmt_inr(total)} / {len(day)} payment(s)",
+        flush=True,
+    )
 
 
 async def _set_template(event, kind: str, cmd: str, label: str) -> None:
@@ -671,13 +881,23 @@ async def cmd_stats(event) -> None:
 
 
 async def cmd_clear(event) -> None:
-    """Remove all of today's payments so today's stats reset to zero."""
+    """Exclude today's valid payments from stats without deleting audit links."""
     key = _today_key()
-    before = len(_pay.get("payments", []))
-    _pay["payments"] = [p for p in _pay.get("payments", []) if _today_key(p["ts"]) != key]
-    removed = before - len(_pay["payments"])
+    cleared = 0
+    cleared_ts = _now_ts()
+    for payment in _pay.get("payments", []):
+        if (
+            payment.get("status", "valid") == "valid"
+            and _today_key(payment["ts"]) == key
+        ):
+            payment["status"] = "cleared"
+            payment["cleared_ts"] = cleared_ts
+            cleared += 1
     _save_pay()
-    await event.edit(f"Today cleared - {removed} payment(s) removed.\nToday - {fmt_inr(0)} - 0 payments")
+    await event.edit(
+        f"Today cleared - {cleared} payment(s) removed from stats.\n"
+        f"Today - {fmt_inr(0)} - 0 payments"
+    )
 
 
 HELP_TEXT = (
@@ -687,6 +907,7 @@ HELP_TEXT = (
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
     "<code>/stats</code> - today's total, count, and split\n"
+    "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake and remove it from stats\n"
     "<code>/clear</code> - reset today's stats to zero\n\n"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
@@ -1038,22 +1259,32 @@ async def on_outgoing(event):
         await event.edit(HELP_TEXT, parse_mode="html")
         return
     if low_cmd.startswith("/add"):
-        await cmd_add(event)
+        async with _payment_lock:
+            await cmd_add(event)
+        return
+    if low_cmd == "/cancel":
+        async with _payment_lock:
+            await cmd_cancel(event)
         return
     if low_cmd.startswith("/setchannelpostofpayment"):
-        await cmd_setchannelpost(event)
+        async with _payment_lock:
+            await cmd_setchannelpost(event)
         return
     if low_cmd.startswith("/setdone"):
-        await cmd_setdone(event)
+        async with _payment_lock:
+            await cmd_setdone(event)
         return
     if low_cmd == ".setchannel":
-        await cmd_setchannel(event)
+        async with _payment_lock:
+            await cmd_setchannel(event)
         return
     if low_cmd == "/stats":
-        await cmd_stats(event)
+        async with _payment_lock:
+            await cmd_stats(event)
         return
     if low_cmd == "/clear":
-        await cmd_clear(event)
+        async with _payment_lock:
+            await cmd_clear(event)
         return
 
     # Only a plain, unforwarded, text-only uppercase L triggers this destructive
