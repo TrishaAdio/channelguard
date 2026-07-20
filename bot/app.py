@@ -26,6 +26,21 @@ from aiogram.types import (
 from . import config, db
 from .utils import render_template, truncate, unique_short_code
 
+# Shared link store (repo root). The bot writes every link it generates here so
+# the userbot can paste it into the payment "Thanks for paying" message.
+try:
+    import linkstore  # available because both run from the repo root
+except Exception:  # noqa: BLE001
+    linkstore = None
+
+
+def _remember(link: str | None, title: str = "", short: str = "") -> None:
+    if link and linkstore is not None:
+        try:
+            linkstore.save_link(link, title, short)
+        except Exception:  # noqa: BLE001
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -195,6 +210,7 @@ async def onboard_group(chat) -> None:
         link, is_admin=True,
     )
     await db.log_event("added", chat.id, detail=code)
+    _remember(link, title, code)
 
     count = await member_count(chat.id)
     lines = [
@@ -467,6 +483,7 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
             )
             continue
         await db.add_order_link(order_id, g["chat_id"], link)
+        _remember(link, g["title"], g["short_code"])
         rendered = render_template(
             body,
             {
@@ -755,6 +772,7 @@ async def distribute(message: Message, query: str) -> None:
                 "there.</blockquote>"
             )
             continue
+        _remember(link, g["title"], g["short_code"])
         rendered = render_template(
             body,
             {

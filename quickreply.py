@@ -86,6 +86,13 @@ from telethon.utils import get_peer_id
 import config
 import ui
 
+# Shared link store (repo root): the BOT writes links here; this userbot only
+# reads them to fill {link} in the payment message. It never searches groups.
+try:
+    import linkstore
+except Exception:  # noqa: BLE001
+    linkstore = None
+
 # The link the guard sends us (full https invite link).
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 # The link inside the saved post (may or may not include the scheme).
@@ -874,16 +881,31 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
         pass
 
 
+def _lookup_link(keyword: str) -> str:
+    """Get the invite link the BOT generated for `keyword` (fancy fonts folded).
+    Empty keyword -> the bot's most recent link. Never searches groups."""
+    if linkstore is None:
+        return ""
+    try:
+        return linkstore.find_link(keyword) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def cmd_add(event) -> None:
-    """/add <amount> [name] — reply to an image to log a payment: post the image
-    to the channel and message the payer with the done template. Group access
-    links are the BOT's job (bot/), not this userbot."""
-    m = re.match(r"^/add(?:\s+(\S+)(?:\s+([\s\S]+))?)?$", event.raw_text or "")
+    """/add <amount> <name> <keyword> — reply to a payment image.
+
+    Posts the image to the channel and messages the payer with the done
+    template. {link} is filled with the invite link the BOT already generated
+    for <keyword> (search that group in the bot first). This userbot never
+    searches groups itself — it only pastes the bot's link."""
+    m = re.match(r"^/add(?:\s+(\S+)(?:\s+(\S+)(?:\s+([\s\S]+))?)?)?$", event.raw_text or "")
     amount_raw = m.group(1) if m else None
     accname = (m.group(2).strip() if m and m.group(2) else "")
+    keyword = (m.group(3).strip() if m and m.group(3) else "")
 
     if not amount_raw:
-        await _ack(event, "Usage: reply to an image with  /add <amount> [name]")
+        await _ack(event, "Usage: reply to an image with  /add <amount> <name> <keyword>")
         return
     try:
         amount = parse_amount(amount_raw)
@@ -899,6 +921,14 @@ async def cmd_add(event) -> None:
         await _ack(event, "No post channel set. Type .setchannel in the target channel first.")
         return
 
+    # The bot already made this link (you searched the group in the bot). We
+    # only paste it — no group search happens here.
+    link = _lookup_link(keyword)
+    if keyword and not link:
+        await _ack(event, f'No link stored for "{keyword}". Search that group in '
+                          "the bot first so it generates the link, then run /add again.")
+        return
+
     target_channel = int(_pay["post_channel"])
     order_id = _generate_order_id()
     payment = {
@@ -911,7 +941,8 @@ async def cmd_add(event) -> None:
 
     try:
         ch_text, ch_ents = await _render(
-            "channel", amount, accname, order_id=order_id, include_current=True
+            "channel", amount, accname, order_id=order_id, include_current=True,
+            link=link,
         )
     except Exception as e:  # noqa: BLE001
         payment["status"] = "failed"
@@ -949,7 +980,7 @@ async def cmd_add(event) -> None:
     payment.pop("error", None)
     _save_pay()
 
-    us_text, us_ents = await _render("done", amount, accname, order_id=order_id)
+    us_text, us_ents = await _render("done", amount, accname, order_id=order_id, link=link)
     try:
         await event.edit(us_text, formatting_entities=us_ents or None)
     except Exception:  # noqa: BLE001 - fall back to a fresh message
@@ -1376,7 +1407,7 @@ async def on_raw_update(update) -> None:
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
-    "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log it, message the user, post to the channel\n"
+    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;keyword&gt;</code> - reply to a payment image; posts it and messages the payer, filling {link} with the link the BOT made for that group\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
