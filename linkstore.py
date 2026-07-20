@@ -18,11 +18,17 @@ from __future__ import annotations
 import json
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import Optional
 
 STORE = Path(__file__).resolve().parent / "data" / "links.json"
+# Reservation bridge: the userbot writes requests, the bot writes results.
+# Single writer per file (userbot -> REQUESTS, bot -> RESULTS) avoids races.
+REQUESTS = STORE.parent / "link_requests.json"
+RESULTS = STORE.parent / "link_results.json"
 _MAX_ENTRIES = 500
+_TTL = 3600  # seconds a request/result stays relevant
 
 # Small-caps letters NFKD does not decompose (titles are often styled).
 _SMALL_CAPS = {
@@ -124,3 +130,66 @@ def find_entry(query: str) -> Optional[dict]:
             if best is None or e.get("ts", 0) > best.get("ts", 0):
                 best = e
     return best or data.get("last")
+
+
+# --- reservation bridge ---------------------------------------------------
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    tmp.replace(path)
+
+
+def request_link(query: str, user_id: int) -> str:
+    """USERBOT: ask the BOT to reserve a link for `query`, bound to `user_id`.
+    Returns a request id to poll with get_result/has_result."""
+    rid = uuid.uuid4().hex
+    now = time.time()
+    reqs = _read_json(REQUESTS, [])
+    if not isinstance(reqs, list):
+        reqs = []
+    reqs = [r for r in reqs if now - r.get("ts", 0) < _TTL]  # prune old
+    reqs.append({"id": rid, "query": query, "user_id": int(user_id), "ts": now})
+    _write_json(REQUESTS, reqs[-_MAX_ENTRIES:])
+    return rid
+
+
+def pending_requests() -> list:
+    """BOT: read reservation requests (read-only; never clears the file)."""
+    reqs = _read_json(REQUESTS, [])
+    return reqs if isinstance(reqs, list) else []
+
+
+def has_result(rid: str) -> bool:
+    res = _read_json(RESULTS, {})
+    return isinstance(res, dict) and rid in res
+
+
+def put_result(rid: str, link: str, title: str = "") -> None:
+    """BOT: publish the reserved link (or "" on failure) for a request id."""
+    now = time.time()
+    res = _read_json(RESULTS, {})
+    if not isinstance(res, dict):
+        res = {}
+    res[rid] = {"link": link or "", "title": title or "", "ts": now}
+    res = {k: v for k, v in res.items() if now - v.get("ts", 0) < _TTL}
+    _write_json(RESULTS, res)
+
+
+def get_result(rid: str) -> Optional[str]:
+    """USERBOT: the reserved link for a request id, or None if not published or
+    the bot couldn't make one (empty)."""
+    res = _read_json(RESULTS, {})
+    if not isinstance(res, dict):
+        return None
+    entry = res.get(rid)
+    if not entry:
+        return None
+    return entry.get("link") or None

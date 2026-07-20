@@ -881,24 +881,34 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
         pass
 
 
-def _lookup_link(keyword: str) -> str:
-    """Get the invite link the BOT generated for `keyword` (fancy fonts folded).
-    Empty keyword -> the bot's most recent link. Never searches groups."""
+async def _reserve_link(keyword: str, user_id: int, timeout: float = 12.0) -> str:
+    """Ask the BOT (via the shared file) to reserve an approval link for
+    `keyword` bound to `user_id`, then wait for the bot to publish it.
+    Returns the link, or "" if the bot didn't answer in time."""
     if linkstore is None:
         return ""
     try:
-        return linkstore.find_link(keyword) or ""
+        rid = linkstore.request_link(keyword, int(user_id))
     except Exception:  # noqa: BLE001
         return ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if linkstore.has_result(rid):
+                return linkstore.get_result(rid) or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        await asyncio.sleep(0.4)
+    return ""
 
 
 async def cmd_add(event) -> None:
-    """/add <amount> <name> <keyword> — reply to a payment image.
+    """/add <amount> <name> <keyword> — reply to the payer's payment image.
 
-    Posts the image to the channel and messages the payer with the done
-    template. {link} is filled with the invite link the BOT already generated
-    for <keyword> (search that group in the bot first). This userbot never
-    searches groups itself — it only pastes the bot's link."""
+    Asks the BOT to reserve an approval link for <keyword> bound to the payer's
+    user id (the person you replied to). Fills {link} with that link, posts the
+    image to the channel, and messages the payer. When they join, the bot
+    approves only them and revokes the link. No group search happens here."""
     m = re.match(r"^/add(?:\s+(\S+)(?:\s+(\S+)(?:\s+([\s\S]+))?)?)?$", event.raw_text or "")
     amount_raw = m.group(1) if m else None
     accname = (m.group(2).strip() if m and m.group(2) else "")
@@ -921,13 +931,23 @@ async def cmd_add(event) -> None:
         await _ack(event, "No post channel set. Type .setchannel in the target channel first.")
         return
 
-    # The bot already made this link (you searched the group in the bot). We
-    # only paste it — no group search happens here.
-    link = _lookup_link(keyword)
-    if keyword and not link:
-        await _ack(event, f'No link stored for "{keyword}". Search that group in '
-                          "the bot first so it generates the link, then run /add again.")
-        return
+    # Who paid = the user whose message we replied to (their payment proof),
+    # else the DM peer. The BOT reserves the link for THIS user id.
+    link = ""
+    payer_id = None
+    if keyword:
+        if getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
+            payer_id = reply.sender_id
+        elif event.is_private:
+            payer_id = event.chat_id
+        if not payer_id:
+            await _ack(event, "Can't tell who paid - reply to the customer's message with /add.")
+            return
+        link = await _reserve_link(keyword, int(payer_id))
+        if not link:
+            await _ack(event, f'The bot did not return a link for "{keyword}". '
+                              "Make sure the bot is running and is admin in that group.")
+            return
 
     target_channel = int(_pay["post_channel"])
     order_id = _generate_order_id()
@@ -936,6 +956,8 @@ async def cmd_add(event) -> None:
         "ts": _now_ts(), "status": "pending",
         "post_chat_id": target_channel, "post_message_id": None,
     }
+    if link:
+        payment.update({"invite_link": link, "payer_id": payer_id, "keyword": keyword})
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
@@ -1407,7 +1429,7 @@ async def on_raw_update(update) -> None:
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
-    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;keyword&gt;</code> - reply to a payment image; posts it and messages the payer, filling {link} with the link the BOT made for that group\n"
+    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;keyword&gt;</code> - reply to the payer's image; the BOT reserves that group's link for that user and I fill {link}\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"

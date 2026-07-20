@@ -897,6 +897,65 @@ async def on_startup() -> None:
         "<blockquote>Add me as admin to a group to begin. "
         "Send <code>/help</code> for commands.</blockquote>"
     )
+    if linkstore is not None:
+        asyncio.create_task(reservation_poller())
+        log.info("Reservation poller started (userbot /add bridge).")
+
+
+async def _fulfill_reservation(rid: str, query: str, user_id: int) -> None:
+    """Turn a userbot reservation request into a real reserved link."""
+    if not query or not user_id:
+        linkstore.put_result(rid, "", "")
+        return
+    groups = (await db.all_groups(admin_only=True)) if query.lower() == "all" \
+        else await db.find_groups(query)
+    if not groups:
+        linkstore.put_result(rid, "", "")
+        await tell_owner(
+            f"Reservation from userbot: no group matches <code>{esc(query)}</code> "
+            f"for <code>{user_id}</code>."
+        )
+        return
+    g = groups[0]
+    link = await create_join_link(g["chat_id"])
+    if not link:
+        linkstore.put_result(rid, "", g["title"])
+        await tell_owner(
+            f"Reservation: <b>{esc(g['title'])}</b> — no link (I need the Invite "
+            "Users right there)."
+        )
+        return
+    await db.set_group_link(g["chat_id"], link)
+    await db.add_binding(g["chat_id"], user_id, link)
+    _remember(link, g["title"], g["short_code"])
+    linkstore.put_result(rid, link, g["title"])
+    await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
+    await tell_owner(
+        f"Reserved <b>{esc(g['title'])}</b> for <code>{user_id}</code> "
+        "(from userbot /add).\n"
+        f"<blockquote>Only they are approved on join, then the link is "
+        f"revoked</blockquote>\n{esc(link)}"
+    )
+
+
+async def reservation_poller() -> None:
+    """Watch the shared file for userbot reservation requests and fulfill them."""
+    seen: set[str] = set()
+    while True:
+        try:
+            for req in linkstore.pending_requests():
+                rid = req.get("id")
+                if not rid or rid in seen or linkstore.has_result(rid):
+                    if rid:
+                        seen.add(rid)
+                    continue
+                seen.add(rid)
+                await _fulfill_reservation(
+                    rid, str(req.get("query", "")), int(req.get("user_id", 0) or 0)
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("reservation poller error: %s: %s", type(e).__name__, e)
+        await asyncio.sleep(1.5)
 
 
 async def on_shutdown() -> None:
