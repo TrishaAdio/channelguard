@@ -419,6 +419,7 @@ HELP = (
     "<code>/tpl &lt;keyword&gt; [body]</code> set the order post format\n\n"
     "<b>Groups &amp; users</b>\n"
     "<code>/groups</code> registered groups + short codes\n"
+    "<code>/doctor</code> diagnose token, admin rights, link creation, shared store\n"
     "<code>/list</code> saved templates\n"
     "<code>/pending</code> pending join requests\n"
     "<code>/remove &lt;keyword | @user | id&gt;</code> delete a template, or remove a user everywhere\n\n"
@@ -473,6 +474,61 @@ async def cmd_groups(message: Message) -> None:
             f"{link}{flag}</blockquote>"
         )
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("doctor"), F.chat.type == ChatType.PRIVATE)
+async def cmd_doctor(message: Message) -> None:
+    """Self-diagnosis: proves (or disproves) each thing that usually breaks —
+    owner match, the shared file bridge, and — per group — the bot's admin
+    status and whether it can actually create the approval link."""
+    if not owner_only(message):
+        return await deny(message)
+    me = await bot.get_me()
+    out = [
+        "<b>Doctor</b>",
+        f"<blockquote>Bot @{esc(me.username)} <code>{me.id}</code>\n"
+        f"OWNER_ID <code>{config.OWNER_ID}</code> "
+        f"(you: <code>{message.from_user.id}</code>)</blockquote>",
+    ]
+
+    # Shared link store (the userbot bridge).
+    if linkstore is None:
+        out.append("Shared store: <b>MISSING</b> — start the bot from the repo "
+                   "root (<code>python -m bot</code>) so it can import linkstore.")
+    else:
+        try:
+            linkstore.request_link("__doctor__", 1)
+            out.append(f"Shared store: <b>OK</b> <code>{esc(str(linkstore.STORE))}</code>")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"Shared store: <b>WRITE FAILED</b> {esc(type(e).__name__)}: {esc(e)}")
+
+    groups = await db.all_groups()
+    if not groups:
+        out.append("No groups known yet. Add me to a group as admin (while I'm "
+                   "running) so I receive the event.")
+    for g in groups[:15]:
+        label = f"<code>{esc(g['short_code'] or '-')}</code> {esc(truncate(g['title'], 24))}"
+        try:
+            mem = await bot.get_chat_member(g["chat_id"], me.id)
+            status = str(mem.status)
+            can_invite = getattr(mem, "can_invite_users", None)
+        except Exception as e:  # noqa: BLE001
+            out.append(f"{label} — can't read my membership: {esc(type(e).__name__)}: {esc(e)}")
+            continue
+        # The real test: can I actually mint an approval link here?
+        try:
+            inv = await bot.create_chat_invite_link(
+                g["chat_id"], name="doctor", creates_join_request=True
+            )
+            await revoke_link(g["chat_id"], inv.invite_link)
+            link_note = "<b>link OK</b>"
+        except Exception as e:  # noqa: BLE001
+            link_note = f"<b>link FAIL</b> {esc(type(e).__name__)}: {esc(e)}"
+        invite_flag = "" if can_invite is None else (
+            " can_invite" if can_invite else " <b>NO invite right</b>")
+        out.append(f"{label} — {esc(status)}{invite_flag} — {link_note}")
+
+    await message.answer("\n".join(out)[:4000])
 
 
 @dp.message(Command("add"), F.chat.type == ChatType.PRIVATE)
