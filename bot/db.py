@@ -194,24 +194,27 @@ async def all_groups(admin_only: bool = False) -> list[aiosqlite.Row]:
 
 
 async def find_groups(query: str) -> list[aiosqlite.Row]:
-    """Match a query against short code (exact, case-insensitive) or title/
-    username (substring). Ordered so exact short-code hits come first."""
-    q = query.strip().lower()
-    like = f"%{q}%"
-    return await _all(
-        """
-        SELECT *,
-               (LOWER(short_code)=? ) AS exact_short
-        FROM groups
-        WHERE is_admin=1 AND (
-              LOWER(short_code)=?
-           OR LOWER(title) LIKE ?
-           OR LOWER(COALESCE(username,'')) LIKE ?
-        )
-        ORDER BY exact_short DESC, title COLLATE NOCASE
-        """,
-        (q, q, like, like),
+    """Match a query against short code (exact) or title/username (substring),
+    folding fancy Unicode fonts on BOTH sides so typing "nice bro" matches a
+    title like "ɴɪᴄᴇ ʙʀᴏ". Exact short-code hits come first."""
+    from .utils import fold_fonts
+
+    q = fold_fonts(query.strip()).lower()
+    if not q:
+        return []
+    rows = await _all(
+        "SELECT * FROM groups WHERE is_admin=1 ORDER BY title COLLATE NOCASE"
     )
+    exact, subs = [], []
+    for r in rows:
+        short = fold_fonts(r["short_code"] or "").lower()
+        title = fold_fonts(r["title"] or "").lower()
+        uname = fold_fonts(r["username"] or "").lower()
+        if short == q:
+            exact.append(r)
+        elif q in title or q in short or (uname and q in uname):
+            subs.append(r)
+    return exact + subs
 
 
 async def remove_group(chat_id: int) -> None:

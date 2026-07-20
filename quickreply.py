@@ -53,6 +53,7 @@ import random
 import re
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
@@ -61,6 +62,7 @@ from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
     DeleteHistoryRequest,
     EditMessageRequest,
+    ExportChatInviteRequest,
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
     SendMessageRequest,
@@ -83,6 +85,27 @@ import ui
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 # The link inside the saved post (may or may not include the scheme).
 FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
+
+# Unicode small-caps letters NFKD does NOT decompose. Group titles are often
+# styled (e.g. "ɴɪᴄᴇ ʙʀᴏ"); fold them so a normal typed query still matches.
+_SMALL_CAPS = {
+    "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ꜰ": "f", "ғ": "f",
+    "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l", "ᴍ": "m",
+    "ɴ": "n", "ᴏ": "o", "ᴘ": "p", "ǫ": "q", "ꞯ": "q", "ʀ": "r", "ꜱ": "s",
+    "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
+}
+
+
+def _fold_fonts(text: str) -> str:
+    """Fold fancy Unicode fonts back to plain letters so a normal typed query
+    matches a styled title, e.g. "ɴɪᴄᴇ ʙʀᴏ" / "𝐍𝐢𝐜𝐞 𝐁𝐫𝐨" -> "nice bro".
+    NFKD covers bold/italic/script/fraktur/double-struck/mono/sans/fullwidth/
+    circled; the small-caps table covers what NFKD leaves untouched."""
+    if not text:
+        return ""
+    folded = "".join(_SMALL_CAPS.get(ch, ch) for ch in text)
+    folded = unicodedata.normalize("NFKD", folded)
+    return "".join(c for c in folded if not unicodedata.combining(c))
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -136,6 +159,10 @@ _state = {
     "away_enabled": config.GREET_NEW,
     "owner_active_until": 0.0,
     "activity_generation": 0,
+    # Link of the group last matched by /link <name>. When set, {link} in
+    # payment templates uses it instead of the rotating /SHORTCUT link.
+    "selected_link": None,
+    "selected_title": None,
 }
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
@@ -700,7 +727,7 @@ def _generate_order_id() -> str:
 
 
 def _pay_mapping(amount: float, name: str, order_id: str = "",
-                 include_current: bool = False) -> dict:
+                 include_current: bool = False, link: str = "") -> dict:
     day = _todays_payments()
     today_total = sum(p["amount"] for p in day)
     today_count = len(day)
@@ -716,6 +743,7 @@ def _pay_mapping(amount: float, name: str, order_id: str = "",
         "{amount}": fmt_inr(amount),
         "{name}": name or "",
         "{orderid}": order_id or "",          # per-payment id, e.g. ANI7F3K9Q
+        "{link}": link or "",                 # current invite link (rotates)
         "{rioshare}": fmt_inr(rio),
         "{marco}": fmt_inr(marco),
         "{total}": str(today_count),          # count of payments today
@@ -785,10 +813,19 @@ async def _resolve_template(kind: str):
 async def _render(kind: str, amount: float, name: str, order_id: str = "",
                   include_current: bool = False):
     text, ents = await _resolve_template(kind)
+    # {link} = the group last matched by /link <name>, else the current rotating
+    # invite link (what the guard relayed, else the link in the /SHORTCUT post).
+    link = _state.get("selected_link") or ""
+    if not link:
+        try:
+            link = await _current_link() or ""
+        except Exception:  # noqa: BLE001
+            link = ""
     return _substitute(
         text,
         ents,
-        _pay_mapping(amount, name, order_id=order_id, include_current=include_current),
+        _pay_mapping(amount, name, order_id=order_id,
+                     include_current=include_current, link=link),
     )
 
 
@@ -1116,10 +1153,77 @@ async def cmd_clear(event) -> None:
     )
 
 
+async def _export_invite(entity) -> str | None:
+    """Create an approval-required invite link for a chat this account admins."""
+    try:
+        res = await client(ExportChatInviteRequest(
+            peer=entity, request_needed=True, title="access",
+        ))
+        return getattr(res, "link", None)
+    except Exception as e:  # noqa: BLE001
+        ui.warn(f"Couldn't create link for a matched group: {type(e).__name__}: {e}")
+        return None
+
+
+async def _find_admin_groups(query: str) -> list[tuple[object, str]]:
+    """Return (entity, title) for groups/channels this account can invite to
+    whose (font-folded) title contains the (font-folded) query."""
+    q = _fold_fonts(query).casefold()
+    matches: list[tuple[object, str]] = []
+    async for dialog in client.iter_dialogs():
+        if not (getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False)):
+            continue
+        name = dialog.name or ""
+        if q and q not in _fold_fonts(name).casefold():
+            continue
+        entity = dialog.entity
+        rights = getattr(entity, "admin_rights", None)
+        can_invite = bool(getattr(entity, "creator", False)) or bool(
+            rights and getattr(rights, "invite_users", False)
+        )
+        if not can_invite:
+            continue
+        matches.append((entity, name))
+    return matches
+
+
+async def cmd_group_link(event) -> None:
+    """/link <name>: search groups this account admins (fancy fonts folded to
+    plain text), create an approval-required invite link, and reply with the
+    match(es). The first match becomes {link} for later /add posts."""
+    m = re.match(r"^/link(?:\s+([\s\S]+))?$", event.raw_text or "")
+    query = (m.group(1).strip() if m and m.group(1) else "")
+    if not query:
+        await _ack(event, "Usage: /link <group name> - searches groups you admin.")
+        return
+    try:
+        matches = await _find_admin_groups(query)
+    except Exception as e:  # noqa: BLE001
+        await _ack(event, f"Group search failed: {type(e).__name__}: {e}")
+        return
+    if not matches:
+        await _ack(event, f'No admin group matches "{query}".')
+        return
+
+    lines = []
+    selected_link = selected_title = None
+    for entity, name in matches[:10]:
+        link = await _export_invite(entity)
+        if link and selected_link is None:
+            selected_link, selected_title = link, name
+        lines.append(f"{name}\n{link or 'could not create a link'}")
+    if selected_link:
+        _state["selected_link"] = selected_link
+        _state["selected_title"] = selected_title
+        print(ui.green("[link] ") + f"{selected_title}: {ui.bold(selected_link)}", flush=True)
+    await _ack(event, "\n\n".join(lines))
+
+
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
     "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log it, message the user, post to the channel\n"
+    "<code>/link &lt;name&gt;</code> - search groups you admin (fancy fonts ok), get an approval link, set it as {link}\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
@@ -1129,6 +1233,7 @@ HELP_TEXT = (
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
+    "<code>{link}</code> current invite link - "
     "<code>{rioshare}</code> Rio's share - <code>{marco}</code> Marco's share - "
     "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today\n"
     "<blockquote>Reply to a formatted post with /setdone or "
@@ -1497,6 +1602,10 @@ async def _handle_outgoing(event):
     if low_cmd.startswith("/setdone"):
         async with _payment_lock:
             await cmd_setdone(event)
+        return
+    if low_cmd.startswith("/link"):
+        async with _payment_lock:
+            await cmd_group_link(event)
         return
     if low_cmd == ".setchannel":
         async with _payment_lock:

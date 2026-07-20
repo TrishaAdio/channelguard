@@ -6,10 +6,34 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from typing import Iterable, Mapping
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _VOWELS_RE = re.compile(r"[aeiou]", re.IGNORECASE)
+
+# Unicode small-caps letters that NFKD does NOT decompose to ASCII. Titles like
+# "ɴɪᴄᴇ ʙʀᴏ" are common; fold them so a normal typed query still matches.
+_SMALL_CAPS = {
+    "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ꜰ": "f", "ғ": "f",
+    "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l", "ᴍ": "m",
+    "ɴ": "n", "ᴏ": "o", "ᴘ": "p", "ǫ": "q", "ꞯ": "q", "ʀ": "r", "ꜱ": "s",
+    "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
+}
+
+
+def fold_fonts(text: str) -> str:
+    """Fold fancy Unicode "fonts" back to plain letters so a normal typed query
+    matches a styled title, e.g. "ɴɪᴄᴇ ʙʀᴏ" or "𝐍𝐢𝐜𝐞 𝐁𝐫𝐨" -> "nice bro".
+
+    NFKD handles bold/italic/script/fraktur/double-struck/mono/sans/fullwidth/
+    circled variants; a small-caps table covers what NFKD leaves untouched.
+    """
+    if not text:
+        return ""
+    folded = "".join(_SMALL_CAPS.get(ch, ch) for ch in text)
+    folded = unicodedata.normalize("NFKD", folded)
+    return "".join(c for c in folded if not unicodedata.combining(c))
 
 
 def short_code(title: str) -> str:
@@ -19,7 +43,7 @@ def short_code(title: str) -> str:
     vowels while always keeping the leading letter, e.g. ``"Lom And Som Op"``
     -> ``"Lm"``. Falls back gracefully for vowel-only or symbol-only titles.
     """
-    words = _WORD_RE.findall(title or "")
+    words = _WORD_RE.findall(fold_fonts(title or ""))
     if not words:
         return "grp"
     word = words[0]
