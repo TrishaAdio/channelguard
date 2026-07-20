@@ -45,9 +45,11 @@ OWNER_ID = _int("OWNER_ID", 0)
 # --- Behaviour -------------------------------------------------------------
 # Delete "X joined" / "X left" / other member service messages in groups.
 CLEAN_SERVICE = _bool("CLEAN_SERVICE", True)
-# When an approved user consumes a join-request link, revoke it and mint a
-# fresh one so a leaked link can't be reused.
-ROTATE_ON_JOIN = _bool("ROTATE_ON_JOIN", True)
+# Rotate (revoke + remint) the general approval link after each approval.
+# Default OFF: an approval-required link is safe to reuse forever (every joiner
+# is gated), and rotating it invalidates a link you may have already shared.
+# Single-use /add order links are always one-time regardless of this setting.
+ROTATE_ON_JOIN = _bool("ROTATE_ON_JOIN", False)
 # Optional friendly title for the invite links the bot creates.
 LINK_TITLE = (os.getenv("LINK_TITLE", "ChannelGuard") or "ChannelGuard").strip()
 

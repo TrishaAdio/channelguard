@@ -69,6 +69,19 @@ def esc(value) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
+async def deny(message: Message) -> None:
+    """Tell a non-owner (or a mis-set OWNER_ID) exactly what's wrong, instead
+    of silently ignoring them — the usual cause of 'commands don't work'."""
+    uid = message.from_user.id if message.from_user else "?"
+    await message.answer(
+        "Not authorized.\n"
+        f"<blockquote>Your id <code>{uid}</code>\n"
+        f"Configured owner <code>{config.OWNER_ID}</code></blockquote>\n"
+        "If these differ, set <code>OWNER_ID</code> in <code>bot/.env</code> "
+        "to your id and restart."
+    )
+
+
 async def create_join_link(chat_id: int) -> Optional[str]:
     """Mint a fresh join-request (admin-approval) invite link."""
     try:
@@ -170,11 +183,13 @@ async def on_my_chat_member(update: ChatMemberUpdated) -> None:
 async def onboard_group(chat) -> None:
     """Register a group the bot was just made admin of and DM the owner."""
     title = chat.title or chat.full_name or str(chat.id)
+    prev = await db.get_group(chat.id)
     existing = await db.all_groups()
     taken = [g["short_code"] for g in existing if g["chat_id"] != chat.id and g["short_code"]]
-    code = unique_short_code(title, taken)
-
-    link = await create_join_link(chat.id)
+    # Keep a previously assigned short code AND link stable across re-adds /
+    # re-promotions — don't churn a link the owner may have already shared.
+    code = prev["short_code"] if prev and prev["short_code"] else unique_short_code(title, taken)
+    link = prev["invite_link"] if prev and prev["invite_link"] else await create_join_link(chat.id)
     await db.upsert_group(
         chat.id, title, code, chat.type, getattr(chat, "username", None),
         link, is_admin=True,
@@ -364,18 +379,30 @@ HELP = (
 )
 
 
+@dp.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    """Works for anyone, anywhere — used to find/verify your OWNER_ID."""
+    uid = message.from_user.id if message.from_user else "?"
+    match = "yes" if uid == config.OWNER_ID else "NO"
+    await message.answer(
+        f"<blockquote>Your id <code>{uid}</code>\n"
+        f"Owner id <code>{config.OWNER_ID}</code>\n"
+        f"Owner match: <b>{match}</b></blockquote>"
+    )
+
+
 @dp.message(Command("start", "help"), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message) -> None:
     if message.from_user and message.from_user.id == config.OWNER_ID:
         await message.answer(HELP)
     else:
-        await message.answer("This is a private admin bot.")
+        await deny(message)
 
 
 @dp.message(Command("groups"), F.chat.type == ChatType.PRIVATE)
 async def cmd_groups(message: Message) -> None:
     if not owner_only(message):
-        return
+        return await deny(message)
     groups = await db.all_groups()
     if not groups:
         await message.answer("No groups yet. Add me as admin to one.")
@@ -398,7 +425,7 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
     """Create a paid order: mint a single-use link per matched group, post it
     (with an ANI order id) here and to the payment channel."""
     if not owner_only(message):
-        return
+        return await deny(message)
     args = (command.args or "").strip()
     parts = args.split(maxsplit=2)
     if len(parts) < 3:
@@ -473,7 +500,7 @@ async def cmd_tpl(message: Message, command: CommandObject) -> None:
     Usage: /tpl <keyword> [body...]  — or reply to a formatted message.
     """
     if not owner_only(message):
-        return
+        return await deny(message)
     args = (command.args or "").strip()
     if not args:
         await message.answer(
@@ -507,7 +534,7 @@ async def cmd_tpl(message: Message, command: CommandObject) -> None:
 @dp.message(Command("list"), F.chat.type == ChatType.PRIVATE)
 async def cmd_list(message: Message) -> None:
     if not owner_only(message):
-        return
+        return await deny(message)
     rows = await db.all_templates()
     if not rows:
         await message.answer("No templates saved.")
@@ -525,7 +552,7 @@ async def cmd_list(message: Message) -> None:
 @dp.message(Command("pending"), F.chat.type == ChatType.PRIVATE)
 async def cmd_pending(message: Message) -> None:
     if not owner_only(message):
-        return
+        return await deny(message)
     rows = await db.pending_requests()
     if not rows:
         await message.answer("No pending join requests.")
@@ -557,7 +584,7 @@ async def cmd_pending(message: Message) -> None:
 @dp.message(Command("remove"), F.chat.type == ChatType.PRIVATE)
 async def cmd_remove(message: Message, command: CommandObject) -> None:
     if not owner_only(message):
-        return
+        return await deny(message)
     arg = (command.args or "").strip()
     if not arg:
         await message.answer("Usage: <code>/remove &lt;keyword | @user | id&gt;</code>")
@@ -619,7 +646,7 @@ async def _remove_user(message: Message, ident: str) -> None:
 async def cmd_revoke(message: Message, command: CommandObject) -> None:
     """Revoke an order's link(s) and ban whoever joined through them."""
     if not owner_only(message):
-        return
+        return await deny(message)
     oid = (command.args or "").strip()
     if not oid:
         await message.answer("Usage: <code>/revoke &lt;orderid&gt;</code>")
@@ -656,7 +683,7 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
 @dp.message(Command("orders"), F.chat.type == ChatType.PRIVATE)
 async def cmd_orders(message: Message) -> None:
     if not owner_only(message):
-        return
+        return await deny(message)
     rows = await db.all_orders(limit=20)
     if not rows:
         await message.answer("No orders yet.")
@@ -677,8 +704,21 @@ async def cmd_orders(message: Message) -> None:
 async def on_lookup(message: Message) -> None:
     """Bare text from the owner = a group name / short code / keyword lookup."""
     if not owner_only(message):
-        return
+        return await deny(message)
     await distribute(message, message.text.strip())
+
+
+# Registered LAST: any /command that no specific handler above matched. This
+# is why an unknown command (e.g. /setdone) now gets a reply instead of silence.
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text.startswith("/"))
+async def unknown_command(message: Message) -> None:
+    if not owner_only(message):
+        return await deny(message)
+    cmd = message.text.split()[0]
+    await message.answer(
+        f"Unknown command <code>{esc(cmd)}</code>. Send <code>/help</code> "
+        "for the list."
+    )
 
 
 async def distribute(message: Message, query: str) -> None:
@@ -745,8 +785,15 @@ async def on_error(event) -> bool:
 # --------------------------------------------------------------------------
 async def on_startup() -> None:
     await db.init()
+    # Drop any leftover webhook so long-polling actually receives updates.
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("delete_webhook: %s", e)
     me = await bot.get_me()
-    log.info("Started as @%s (id %s). Owner=%s", me.username, me.id, config.OWNER_ID)
+    log.info("Started as @%s (id %s). OWNER_ID=%s", me.username, me.id, config.OWNER_ID)
+    log.info("Commands are DM-only. If yours are ignored, DM the bot /id and "
+             "check the owner match.")
     await tell_owner(
         f"<b>ChannelGuard online</b> as @{esc(me.username)}.\n"
         "<blockquote>Add me as admin to a group to begin. "
