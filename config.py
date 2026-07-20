@@ -23,6 +23,10 @@ SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")
+# Whether THIS userbot rewrites the /SHORTCUT (demo) link when the guard relays
+# one. Default 0 = FROZEN: the userbot never changes the demo link. Group/link
+# management is the BOT's (bot/) job. Set 1 to restore the old relay behaviour.
+USERBOT_RELAY_LINK = os.getenv("USERBOT_RELAY_LINK", "0").strip().lower() not in ("0", "false", "no", "")
 # Also rewrite the /set greeting post's invite link on every rotation.
 # Default 0 = FREEZE the greeting link (e.g. a fixed "Join for demo" group) so
 # only the /SHORTCUT quick reply follows the live rotating link. Set to 1 to
