@@ -902,6 +902,38 @@ async def _reserve_link(keyword: str, user_id: int, timeout: float = 12.0) -> st
     return ""
 
 
+def _entity_fallbacks(ents):
+    """Progressively-degrading entity sets: full -> drop premium/custom emoji
+    (which a non-premium account can't send, and which make Telegram reject the
+    WHOLE set, killing bold/blockquote too) -> plain."""
+    ents = list(ents or [])
+    tries = [ents]
+    no_custom = [e for e in ents if type(e).__name__ != "MessageEntityCustomEmoji"]
+    if len(no_custom) != len(ents):
+        tries.append(no_custom)
+    if ents:
+        tries.append([])
+    return tries
+
+
+async def _edit_rich(event, text, ents):
+    """Edit the command into `text`, keeping as much formatting as the account
+    is allowed to send. Returns how many entities were dropped (0 = all kept)."""
+    for attempt in _entity_fallbacks(ents):
+        try:
+            await event.edit(text, formatting_entities=attempt or None)
+            return len(ents or []) - len(attempt)
+        except MessageNotModifiedError:
+            return len(ents or []) - len(attempt)
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        await event.respond(text)
+    except Exception:  # noqa: BLE001
+        pass
+    return len(ents or [])
+
+
 async def cmd_add(event) -> None:
     """/add <amount> <name> <keyword> — run in the payer's DM (or reply to them).
 
@@ -985,17 +1017,24 @@ async def cmd_add(event) -> None:
             await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
             return
         marker = _expect_automatic_outgoing(target_channel, [ch_text])
-        try:
-            post_result = await client.send_file(
-                target_channel, file=reply.media, caption=ch_text,
-                formatting_entities=ch_ents or None,
-            )
-        except Exception as e:  # noqa: BLE001
+        post_result = None
+        last_err = None
+        for attempt in _entity_fallbacks(ch_ents):
+            try:
+                post_result = await client.send_file(
+                    target_channel, file=reply.media, caption=ch_text,
+                    formatting_entities=attempt or None,
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        if post_result is None:
             _cancel_automatic_outgoing(target_channel, marker)
             payment["status"] = "failed"
-            payment["error"] = f"upload: {type(e).__name__}: {e}"
+            payment["error"] = f"upload: {type(last_err).__name__}: {last_err}"
             _save_pay()
-            await _ack(event, f"Posting to the channel failed: {type(e).__name__}: {e}")
+            await _ack(event, f"Posting to the channel failed: {type(last_err).__name__}: {last_err}")
             return
         _finish_automatic_outgoing(target_channel, marker, post_result)
         post_ids = sorted(_sent_message_ids(post_result))
@@ -1009,12 +1048,14 @@ async def cmd_add(event) -> None:
         payment.pop("error", None)
     _save_pay()
 
-    # 3) Message the payer with {link} (edit the /add command into the reply).
+    # 3) Message the payer with {link} (edit the /add command into the reply),
+    #    keeping as much formatting/premium emoji as this account may send.
     us_text, us_ents = await _render("done", amount, accname, order_id=order_id, link=link)
-    try:
-        await event.edit(us_text, formatting_entities=us_ents or None)
-    except Exception:  # noqa: BLE001 - fall back to a fresh message
-        await event.respond(us_text, formatting_entities=us_ents or None)
+    dropped = await _edit_rich(event, us_text, us_ents)
+    if dropped:
+        ui.warn(f"Done message: dropped {dropped} premium-emoji entity(ies) — this "
+                "account isn't Telegram Premium, so custom emoji can't be sent "
+                "(bold/blockquote kept).")
 
     count = len(_todays_payments())
     print(ui.green("[pay] ")
