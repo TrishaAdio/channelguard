@@ -1,3 +1,63 @@
+# Channel Guard
+
+This repo now ships **two** independent tools:
+
+- **ChannelGuard admin bot** (`bot/`) — a BotFather **bot-token** bot
+  (aiogram + SQLite). Add it as an admin to any group/channel and it onboards
+  itself: derives a short code from the title, mints an approval-required
+  invite link, stores everything, and DMs the owner. The owner drives link
+  distribution, join-request approval, templates, and member removal from the
+  bot's DM. **Start here if you want a bot you add as admin.** See
+  [`bot/README`](#channelguard-admin-bot-bot) below.
+- **Channel Guard userbot** (repo root) — the original Telethon **userbot**
+  (logs in as your account). Documented directly after.
+
+---
+
+## ChannelGuard admin bot (`bot/`)
+
+A single-owner Telegram **bot** (bot token, not a login). What it does:
+
+1. **Auto-onboard.** The moment you promote it to admin in a group/channel it
+   derives a **short code** from the title (`Lom And Som Op` -> `Lm`), mints an
+   **approval-required** ("join request") invite link, saves it to SQLite, and
+   **DMs the owner** a compact card (title, short code, id, type, member count,
+   link).
+2. **Join requests -> owner.** Every join request is stored and forwarded to
+   the owner with inline **Approve / Decline** buttons. On approve the user is
+   let in and (by default) the link is **rotated** so the old one is dead.
+3. **Owner control from DM** (owner id only):
+
+   | Command | Effect |
+   |---------|--------|
+   | `/groups` | list registered groups + short codes + admin/link status |
+   | `/add <amount> <account> <keyword> [body]` | save a link template; reply to a formatted message to keep its HTML |
+   | `/list` | list saved templates |
+   | `/pending` | list pending join requests with Approve/Decline |
+   | `/remove <keyword \| @user \| id>` | delete a template, **or** decline that user's requests and remove them from every group |
+   | send a short code / name / keyword | reply with the approval-required link(s) for the matching group(s) |
+   | send `all` | do that for **every** group the bot admins |
+
+   Template tokens: `{link} {title} {short} {amount} {name} {keyword}`.
+4. **Clean service.** Join/leave system messages in groups are deleted so the
+   chat stays clean (needs the Delete Messages right).
+
+### Run
+
+```bash
+cd bot
+pip install -r requirements.txt
+cp .env.example .env      # fill in BOT_TOKEN + OWNER_ID
+cd ..
+python -m bot
+```
+
+The owner must press **Start** in the bot's DM once so it can message them. The
+bot needs the **Invite Users**, **Delete Messages**, and **Ban Users** admin
+rights in each group. `bot/.env` and `bot/data/` are gitignored.
+
+---
+
 # Channel Guard (Telethon userbot)
 
 Locks down a channel's access:
