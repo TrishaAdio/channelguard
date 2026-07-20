@@ -1,5 +1,13 @@
 # Secrets
 .env
+bot/.env
+
+# Bot database + data
+bot/data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Telethon session files (contain your login — NEVER commit)
 *.session

@@ -1,3 +1,74 @@
+# Channel Guard
+
+This repo now ships **two** independent tools:
+
+- **ChannelGuard admin bot** (`bot/`) — a BotFather **bot-token** bot
+  (aiogram + SQLite). Add it as an admin to any group/channel and it onboards
+  itself: derives a short code from the title, mints an approval-required
+  invite link, stores everything, and DMs the owner. The owner drives link
+  distribution, join-request approval, templates, and member removal from the
+  bot's DM. **Start here if you want a bot you add as admin.** See
+  [`bot/README`](#channelguard-admin-bot-bot) below.
+- **Channel Guard userbot** (repo root) — the original Telethon **userbot**
+  (logs in as your account). Documented directly after.
+
+---
+
+## ChannelGuard admin bot (`bot/`)
+
+A single-owner Telegram **bot** (bot token, not a login). What it does:
+
+1. **Auto-onboard.** The moment you promote it to admin in a group/channel it
+   derives a **short code** from the title (`Lom And Som Op` -> `Lm`), mints an
+   **approval-required** ("join request") invite link, saves it to SQLite, and
+   **DMs the owner** a compact card (title, short code, id, type, member count,
+   link).
+2. **Paid orders (single-use links).** `/add <amount> <account> <keyword>`
+   mints a **single-use** invite link (`member_limit=1`) for each matched group
+   — only one buyer can use it. Each `/add` gets an **order id** (`ANI0001`,
+   `ANI0002`, ...) and the post is sent to you and (optionally) to a
+   **payment channel**. When the buyer joins, the bot ties them to the order
+   and **revokes the spent link** automatically. Need another seat for the same
+   group? Just run `/add` again — each order is an independent link.
+3. **`/revoke <orderid>`** kills every link in that order **and bans** the buyer
+   who joined through it.
+4. **Join requests -> owner.** Every join request (on the general approval
+   link) is stored and forwarded with inline **Approve / Decline** buttons. On
+   approve the link is **rotated** so the old one is dead.
+5. **Owner control from DM** (owner id only):
+
+   | Command | Effect |
+   |---------|--------|
+   | `/add <amount> <account> <keyword>` | mint a single-use link per matched group + an order id, posted here and to the payment channel |
+   | `/revoke <orderid>` | revoke the order's link(s) and ban the buyer(s) |
+   | `/orders` | list recent orders and their status |
+   | `/tpl <keyword> [body]` | set the post format for a keyword (reply to a formatted message to keep its HTML) |
+   | `/groups` | list registered groups + short codes + admin/link status |
+   | `/list` | list saved templates |
+   | `/pending` | list pending join requests with Approve/Decline |
+   | `/remove <keyword \| @user \| id>` | delete a template, **or** decline that user's requests and remove them from every group |
+   | send a short code / name / `all` | reply with the approval-required link(s) |
+
+   Template tokens: `{link} {title} {short} {amount} {name} {keyword} {orderid}`.
+6. **Clean service.** Join/leave system messages in groups are deleted so the
+   chat stays clean (needs the Delete Messages right).
+
+### Run
+
+```bash
+cd bot
+pip install -r requirements.txt
+cp .env.example .env      # fill in BOT_TOKEN + OWNER_ID
+cd ..
+python -m bot
+```
+
+The owner must press **Start** in the bot's DM once so it can message them. The
+bot needs the **Invite Users**, **Delete Messages**, and **Ban Users** admin
+rights in each group. `bot/.env` and `bot/data/` are gitignored.
+
+---
+
 # Channel Guard (Telethon userbot)
 
 Locks down a channel's access:
