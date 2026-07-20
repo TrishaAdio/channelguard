@@ -555,6 +555,12 @@ def _write_pay_data(data: dict) -> None:
         return
     try:
         os.fsync(descriptor)
+    except OSError:
+        # Directory fsync is a best-effort durability step and raises EINVAL on
+        # several filesystems (overlayfs, some network/container mounts). The
+        # data is already safely written via the atomic replace above, so this
+        # must never propagate and fail the command that triggered the save.
+        pass
     finally:
         os.close(descriptor)
 
@@ -992,6 +998,20 @@ async def cmd_cancel(event) -> None:
     )
 
 
+async def _ack(event, text: str) -> None:
+    """Report a result, falling back to a fresh message if editing the command
+    fails — so a completed action is never mis-reported as 'Command failed'."""
+    try:
+        await event.edit(text)
+    except MessageNotModifiedError:
+        pass
+    except Exception:  # noqa: BLE001
+        try:
+            await event.respond(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _set_template(event, kind: str, cmd: str, label: str) -> None:
     """Store a template. Replying to a post keeps its formatting + premium emoji
     (stored as a message reference); inline text is stored as plain text."""
@@ -1000,18 +1020,18 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
         _pay[f"{kind}_ref"] = {"chat_id": int(reply.chat_id), "message_id": int(reply.id)}
         _pay[f"{kind}_template"] = reply.raw_text  # plain fallback if the post is deleted
         _save_pay()
-        await event.edit(f"{label} saved from that post - formatting and premium emoji kept.")
+        await _ack(event, f"{label} saved from that post - formatting and premium emoji kept.")
         return
 
     m = re.match(rf"^{re.escape(cmd)}(?:\s+([\s\S]+))?$", event.raw_text or "")
     template = (m.group(1).strip() if m and m.group(1) else "")
     if not template:
-        await event.edit(f"Send the text after {cmd}, or reply to a formatted post with {cmd}.")
+        await _ack(event, f"Send the text after {cmd}, or reply to a formatted post with {cmd}.")
         return
     _pay[f"{kind}_template"] = template
     _pay.pop(f"{kind}_ref", None)
     _save_pay()
-    await event.edit(f"{label} saved ({len(template)} chars, plain text).")
+    await _ack(event, f"{label} saved ({len(template)} chars, plain text).")
 
 
 async def cmd_setdone(event) -> None:
@@ -1378,8 +1398,11 @@ async def _handle_link(event, link: str) -> None:
         return
     status = await update_link(config.SHORTCUT, link)
     print(ui.green(f"[/{config.SHORTCUT}] ") + f"{ui.bold(link)} ({status})", flush=True)
-    g_status = await _swap_in_greeting(link)
-    print(ui.green("[greeting] ") + f"{ui.bold(link)} ({g_status})", flush=True)
+    if config.SWAP_GREETING:
+        g_status = await _swap_in_greeting(link)
+        print(ui.green("[greeting] ") + f"{ui.bold(link)} ({g_status})", flush=True)
+    else:
+        print(ui.dim("[greeting] link frozen (SWAP_GREETING=0)"), flush=True)
     _state["last"] = link
 
 
@@ -1506,7 +1529,7 @@ async def _handle_outgoing(event):
         # next rotation.
         link = await _current_link()
         note = ""
-        if link:
+        if link and config.SWAP_GREETING:
             result = await _swap_in_greeting(link)
             note = f"\nLink -> {link} ({result})"
         await event.reply("Greeting saved. New users who DM you first get this." + note)
@@ -1544,8 +1567,11 @@ async def on_outgoing(event):
         ui.error(f"outgoing handler failed: {type(e).__name__}: {e}")
         traceback.print_exc()
         if text.startswith(("/", ".")) or text == "L":
+            detail = f"{type(e).__name__}: {e}".strip()
+            if len(detail) > 350:
+                detail = detail[:349] + "\u2026"
             try:
-                await event.edit("Command failed. Check the quickreply terminal for details.")
+                await event.edit(f"Command failed - {detail}")
             except Exception:  # noqa: BLE001
                 pass
 

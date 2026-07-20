@@ -23,6 +23,11 @@ SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")
+# Also rewrite the /set greeting post's invite link on every rotation.
+# Default 0 = FREEZE the greeting link (e.g. a fixed "Join for demo" group) so
+# only the /SHORTCUT quick reply follows the live rotating link. Set to 1 to
+# restore the old behaviour where the greeting link is swapped too.
+SWAP_GREETING = os.getenv("SWAP_GREETING", "0").strip().lower() not in ("0", "false", "no", "")
 # Send the current greeting/Business away message to first-time DMs.
 # This can also be changed live with /away on|off in Saved Messages.
 GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "no", "")
