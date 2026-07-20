@@ -42,6 +42,10 @@ SHARE_BASE = os.getenv("SHARE_BASE", "today").strip().lower()
 PAY_PARSE_MODE = os.getenv("PAY_PARSE_MODE", "html").strip().lower()
 # Timezone used to decide what counts as "today" (INR default = India).
 TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
+# {orderid} template parameter: a prefix followed by a random suffix, generated
+# once per payment (e.g. ANI7F3K9Q). Configure the prefix and suffix length.
+ORDER_PREFIX = os.getenv("ORDER_PREFIX", "ANI")
+ORDER_ID_LENGTH = max(3, int(os.getenv("ORDER_ID_LENGTH", "6")))
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
