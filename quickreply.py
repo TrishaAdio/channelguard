@@ -147,6 +147,37 @@ _payment_lock = asyncio.Lock()
 # (+ optional *_ref message references), and the payments log.
 _pay: dict = {}
 
+# Kept open for the whole process so a second copy can't grab the same lock.
+_instance_lock = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Take an exclusive lock so only ONE quickreply.py runs per machine.
+
+    Running two copies on the same account makes them fight over every command:
+    one edits the message to its result while the other overwrites it with
+    'Command failed', and each error lands in a different terminal. Returns
+    True if this process owns the lock, False if another instance already does.
+    """
+    global _instance_lock
+    try:
+        import fcntl
+    except ImportError:
+        return True  # non-POSIX platform: skip the guard rather than block
+    try:
+        config.PAY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(config.PAY_FILE.parent / "quickreply.lock", "w")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        return False
+    _instance_lock = handle  # hold the fd open; the OS frees it when we exit
+    try:
+        handle.write(str(os.getpid()))
+        handle.flush()
+    except OSError:
+        pass
+    return True
+
 
 def _load_greeted() -> set[int]:
     if config.GREETED_FILE.exists():
@@ -1627,6 +1658,14 @@ async def on_msg(event):
 async def main() -> None:
     global client
     config.require("API_ID", "API_HASH")
+
+    if not _acquire_single_instance_lock():
+        ui.error(
+            "Another quickreply.py is already running on this machine. Stop it "
+            "first, e.g.  pkill -f quickreply.py  (check screen/tmux/systemd "
+            "too). Two copies make commands randomly show 'saved' then 'failed'."
+        )
+        return
 
     client = TelegramClient(config.QR_SESSION, config.API_ID, config.API_HASH)
     await client.start()  # prompts phone + OTP for THIS account on first run
