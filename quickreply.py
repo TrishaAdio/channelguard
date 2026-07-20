@@ -903,19 +903,20 @@ async def _reserve_link(keyword: str, user_id: int, timeout: float = 12.0) -> st
 
 
 async def cmd_add(event) -> None:
-    """/add <amount> <name> <keyword> — reply to the payer's payment image.
+    """/add <amount> <name> <keyword> — run in the payer's DM (or reply to them).
 
-    Asks the BOT to reserve an approval link for <keyword> bound to the payer's
-    user id (the person you replied to). Fills {link} with that link, posts the
-    image to the channel, and messages the payer. When they join, the bot
-    approves only them and revokes the link. No group search happens here."""
+    Sends the BOT a reservation request for <keyword> bound to the payer's user
+    id; the bot makes the approval link and returns it. Fills {link} in the done
+    message. Replying to an image (with a post channel set) also posts the image
+    there — but that is optional and never blocks the link. When the payer joins,
+    the bot approves only them and revokes the link."""
     m = re.match(r"^/add(?:\s+(\S+)(?:\s+(\S+)(?:\s+([\s\S]+))?)?)?$", event.raw_text or "")
     amount_raw = m.group(1) if m else None
     accname = (m.group(2).strip() if m and m.group(2) else "")
     keyword = (m.group(3).strip() if m and m.group(3) else "")
 
     if not amount_raw:
-        await _ack(event, "Usage: reply to an image with  /add <amount> <name> <keyword>")
+        await _ack(event, "Usage: /add <amount> <name> <keyword>  (in the payer's DM)")
         return
     try:
         amount = parse_amount(amount_raw)
@@ -924,84 +925,91 @@ async def cmd_add(event) -> None:
         return
 
     reply = await event.get_reply_message()
-    if not reply or not reply.media:
-        await _ack(event, "Reply to an image/media message with /add.")
-        return
-    if not _pay.get("post_channel"):
-        await _ack(event, "No post channel set. Type .setchannel in the target channel first.")
-        return
+    has_media = bool(reply and reply.media)
 
-    # Who paid = the user whose message we replied to (their payment proof),
-    # else the DM peer. The BOT reserves the link for THIS user id.
+    # 1) Reserve the group link via the BOT — done FIRST so the optional
+    #    image/channel steps can never skip the hand-off (this was the bug).
     link = ""
     payer_id = None
     if keyword:
-        if getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
+        if reply and getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
             payer_id = reply.sender_id
         elif event.is_private:
             payer_id = event.chat_id
         if not payer_id:
-            await _ack(event, "Can't tell who paid - reply to the customer's message with /add.")
+            await _ack(event, "Can't tell who paid - run /add in the customer's DM "
+                              "or reply to their message.")
             return
+        if linkstore is None:
+            await _ack(event, "Bot bridge missing: start BOTH programs from the repo "
+                              "root so they share data/. Run /doctor on the bot.")
+            return
+        print(ui.green("[reserve] ") + f"asking bot: {keyword} -> {payer_id}", flush=True)
         link = await _reserve_link(keyword, int(payer_id))
         if not link:
-            await _ack(event, f'The bot did not return a link for "{keyword}". '
-                              "Make sure the bot is running and is admin in that group.")
+            await _ack(event, f'The bot did not answer for "{keyword}". Is the bot '
+                              "running (same folder) and admin in that group? Run "
+                              "/doctor on the bot.")
             return
+        print(ui.green("[reserve] ") + f"got {keyword}: {ui.bold(link)}", flush=True)
 
-    target_channel = int(_pay["post_channel"])
+    if not keyword and not has_media:
+        await _ack(event, "Give a keyword to send a link: /add <amount> <name> <keyword>, "
+                          "or reply to an image to just log a payment.")
+        return
+
     order_id = _generate_order_id()
     payment = {
         "amount": amount, "name": accname, "order_id": order_id,
         "ts": _now_ts(), "status": "pending",
-        "post_chat_id": target_channel, "post_message_id": None,
     }
     if link:
         payment.update({"invite_link": link, "payer_id": payer_id, "keyword": keyword})
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
-    try:
-        ch_text, ch_ents = await _render(
-            "channel", amount, accname, order_id=order_id, include_current=True,
-            link=link,
-        )
-    except Exception as e:  # noqa: BLE001
-        payment["status"] = "failed"
-        payment["error"] = f"render: {type(e).__name__}: {e}"
-        _save_pay()
-        await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
-        return
+    # 2) Optional: post the proof image to the channel (only if both present).
+    if has_media and _pay.get("post_channel"):
+        target_channel = int(_pay["post_channel"])
+        payment["post_chat_id"] = target_channel
+        payment["post_message_id"] = None
+        try:
+            ch_text, ch_ents = await _render(
+                "channel", amount, accname, order_id=order_id,
+                include_current=True, link=link,
+            )
+        except Exception as e:  # noqa: BLE001
+            payment["status"] = "failed"
+            payment["error"] = f"render: {type(e).__name__}: {e}"
+            _save_pay()
+            await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
+            return
+        marker = _expect_automatic_outgoing(target_channel, [ch_text])
+        try:
+            post_result = await client.send_file(
+                target_channel, file=reply.media, caption=ch_text,
+                formatting_entities=ch_ents or None,
+            )
+        except Exception as e:  # noqa: BLE001
+            _cancel_automatic_outgoing(target_channel, marker)
+            payment["status"] = "failed"
+            payment["error"] = f"upload: {type(e).__name__}: {e}"
+            _save_pay()
+            await _ack(event, f"Posting to the channel failed: {type(e).__name__}: {e}")
+            return
+        _finish_automatic_outgoing(target_channel, marker, post_result)
+        post_ids = sorted(_sent_message_ids(post_result))
+        payment["post_message_id"] = post_ids[0] if post_ids else None
+        if not post_ids:
+            payment["status"] = "untracked"
+            payment["error"] = "Telegram returned no posted message ID"
 
-    marker = _expect_automatic_outgoing(target_channel, [ch_text])
-    try:
-        post_result = await client.send_file(
-            target_channel, file=reply.media, caption=ch_text,
-            formatting_entities=ch_ents or None,
-        )
-    except Exception as e:  # noqa: BLE001
-        _cancel_automatic_outgoing(target_channel, marker)
-        payment["status"] = "failed"
-        payment["error"] = f"upload: {type(e).__name__}: {e}"
-        _save_pay()
-        await _ack(event, f"Posting to the channel failed: {type(e).__name__}: {e}")
-        return
-    _finish_automatic_outgoing(target_channel, marker, post_result)
-
-    post_ids = sorted(_sent_message_ids(post_result))
-    if not post_ids:
-        payment["status"] = "untracked"
-        payment["error"] = "Telegram returned no posted message ID"
-        _save_pay()
-        await _ack(event, "Payment posted, but Telegram returned no message ID. "
-                          "It was not added to stats because /cancel couldn't track it.")
-        return
-
-    payment["post_message_id"] = post_ids[0]
-    payment["status"] = "valid"
-    payment.pop("error", None)
+    if payment.get("status") == "pending":
+        payment["status"] = "valid"
+        payment.pop("error", None)
     _save_pay()
 
+    # 3) Message the payer with {link} (edit the /add command into the reply).
     us_text, us_ents = await _render("done", amount, accname, order_id=order_id, link=link)
     try:
         await event.edit(us_text, formatting_entities=us_ents or None)
@@ -2030,6 +2038,12 @@ async def main() -> None:
     pc_state = str(pc) if pc else ui.yellow("not set - type .setchannel in a channel")
     ui.info(f"Payment logger: post channel [{pc_state}]. "
             + ui.dim(f"today {fmt_inr(total)} / {len(day)} payment(s). '.help' for commands."))
+    if linkstore is not None:
+        ui.info("Bot link bridge: " + ui.bold("ready")
+                + ui.dim(f" ({linkstore.REQUESTS}) — the bot must run from the same folder."))
+    else:
+        ui.warn("Bot link bridge: NOT loaded — run this from the repo root so "
+                "'import linkstore' works, or /add <keyword> can't reach the bot.")
     print(ui.dim("Ctrl+C to stop."))
     await client.run_until_disconnected()
 
