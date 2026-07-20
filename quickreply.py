@@ -517,6 +517,8 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
         payment["amount"] = amount
         payment["ts"] = ts
         payment["name"] = str(payment.get("name") or "")
+        if "order_id" in payment:
+            payment["order_id"] = str(payment.get("order_id") or "")
         status = str(payment.get("status") or "valid").lower()
         if status not in allowed_statuses:
             repairs.append(f"payment #{index + 1} status quarantined")
@@ -638,7 +640,30 @@ def parse_amount(raw: str) -> float:
     return float(str(raw).replace(",", "").replace("\u20b9", "").strip())
 
 
-def _pay_mapping(amount: float, name: str, include_current: bool = False) -> dict:
+# {orderid} suffix uses an unambiguous alphabet (no 0/O/1/I) so IDs are easy to
+# read back from a screenshot.
+_ORDER_ALPHABET = "ACDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _generate_order_id() -> str:
+    """A unique per-payment id: config prefix + random suffix (e.g. ANI7F3K9Q)."""
+    existing = {
+        p.get("order_id")
+        for p in _pay.get("payments", [])
+        if isinstance(p, dict) and p.get("order_id")
+    }
+    prefix = config.ORDER_PREFIX
+    length = config.ORDER_ID_LENGTH
+    for _ in range(50):
+        candidate = prefix + "".join(random.choices(_ORDER_ALPHABET, k=length))
+        if candidate not in existing:
+            return candidate
+    # Extremely unlikely; widen the suffix to guarantee uniqueness.
+    return prefix + "".join(random.choices(_ORDER_ALPHABET, k=length + 4))
+
+
+def _pay_mapping(amount: float, name: str, order_id: str = "",
+                 include_current: bool = False) -> dict:
     day = _todays_payments()
     today_total = sum(p["amount"] for p in day)
     today_count = len(day)
@@ -653,6 +678,7 @@ def _pay_mapping(amount: float, name: str, include_current: bool = False) -> dic
     return {
         "{amount}": fmt_inr(amount),
         "{name}": name or "",
+        "{orderid}": order_id or "",          # per-payment id, e.g. ANI7F3K9Q
         "{rioshare}": fmt_inr(rio),
         "{marco}": fmt_inr(marco),
         "{total}": str(today_count),          # count of payments today
@@ -719,13 +745,13 @@ async def _resolve_template(kind: str):
     return _pay.get(f"{kind}_template", ""), []
 
 
-async def _render(kind: str, amount: float, name: str,
+async def _render(kind: str, amount: float, name: str, order_id: str = "",
                   include_current: bool = False):
     text, ents = await _resolve_template(kind)
     return _substitute(
         text,
         ents,
-        _pay_mapping(amount, name, include_current=include_current),
+        _pay_mapping(amount, name, order_id=order_id, include_current=include_current),
     )
 
 
@@ -754,9 +780,11 @@ async def cmd_add(event) -> None:
     # Snapshot the configured target once. .setchannel cannot move this upload
     # to a different chat while template resolution or Telegram I/O is pending.
     target_channel = int(_pay["post_channel"])
+    order_id = _generate_order_id()
     payment = {
         "amount": amount,
         "name": name,
+        "order_id": order_id,
         "ts": _now_ts(),
         "status": "pending",
         "post_chat_id": target_channel,
@@ -770,7 +798,7 @@ async def cmd_add(event) -> None:
     # returns the durable message association.
     try:
         ch_text, ch_ents = await _render(
-            "channel", amount, name, include_current=True
+            "channel", amount, name, order_id=order_id, include_current=True
         )
     except Exception as e:  # noqa: BLE001
         payment["status"] = "failed"
@@ -813,7 +841,7 @@ async def cmd_add(event) -> None:
     _save_pay()
 
     # 2. Message the user in the private chat (edit the /add command into it).
-    us_text, us_ents = await _render("done", amount, name)
+    us_text, us_ents = await _render("done", amount, name, order_id=order_id)
     try:
         await event.edit(us_text, formatting_entities=us_ents or None)
     except Exception:  # noqa: BLE001 - fall back to a fresh message
@@ -1049,6 +1077,7 @@ HELP_TEXT = (
     "<code>/clear</code> - reset today's stats to zero\n\n"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
+    "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
     "<code>{rioshare}</code> Rio's share - <code>{marco}</code> Marco's share - "
     "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today\n"
     "<blockquote>Reply to a formatted post with /setdone or "

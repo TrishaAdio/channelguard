@@ -124,8 +124,11 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `.help` | show every command and template parameter |
 
 Template parameters (usable in both `/setdone` and `/setchannelpostofpayment`):
-`{amount}` (this payment), `{name}`, `{rioshare}`, `{marco}`, `{total}`
-(payments today), `{todaytotal}` (collected today). Reply to a formatted post
+`{amount}` (this payment), `{name}`, `{orderid}` (a unique per-payment id like
+`ANI7F3K9Q`, generated once and shared by the user message and channel post),
+`{rioshare}`, `{marco}`, `{total}` (payments today), `{todaytotal}` (collected
+today). The `{orderid}` prefix and suffix length are set by `ORDER_PREFIX` and
+`ORDER_ID_LENGTH` in `.env`. Reply to a formatted post
 with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
 emoji verbatim. `pay.json` is validated and repaired at startup; malformed manual
 edits are backed up as `data/pay.recovery-*.json` instead of preventing every
@@ -161,6 +164,8 @@ The setup, channel picker, and runtime output are **colorized** via `colorama`
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
 | `GREET_NEW`      | (quickreply) first-contact away replies (`1`/`0`)    |
 | `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
+| `ORDER_PREFIX`   | (payment logger) `{orderid}` prefix (default `ANI`) |
+| `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |
 | `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
 | `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
