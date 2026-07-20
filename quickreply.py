@@ -82,6 +82,7 @@ from telethon.tl.types import (
     UserStatusOnline,
 )
 from telethon.utils import get_peer_id
+from telethon.tl import types as tl_types
 
 import config
 import ui
@@ -818,21 +819,62 @@ def _substitute(text: str, entities, mapping: dict):
     return new_text, entities
 
 
+def _serialize_entities(entities) -> list[dict]:
+    """Store entities as plain dicts so formatting + premium emoji survive even
+    if the original template post is later deleted (no re-fetch needed)."""
+    out = []
+    for e in entities or []:
+        d = {k: v for k, v in e.to_dict().items() if k != "_"}
+        d["_type"] = type(e).__name__
+        out.append(d)
+    return out
+
+
+def _deserialize_entities(dicts) -> list:
+    """Rebuild Telethon entity objects from _serialize_entities output."""
+    out = []
+    for d in dicts or []:
+        cls = getattr(tl_types, d.get("_type", ""), None)
+        if cls is None:
+            continue
+        try:
+            out.append(cls(**{k: v for k, v in d.items() if k != "_type"}))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 async def _resolve_template(kind: str):
     """Return (text, entities) for kind in {'done', 'channel'}.
 
-    A message reference (set by replying to a post) is preferred so formatting
-    and premium emoji are kept verbatim; otherwise the plain-text template.
+    Prefers the entities stored at /set time (verbatim, no re-fetch — this is
+    what keeps bold/blockquote/premium emoji even if the source post is gone),
+    then a message reference (older templates), then plain text.
     """
+    text = _pay.get(f"{kind}_template", "")
+    stored = _deserialize_entities(_pay.get(f"{kind}_entities"))
+    if stored:
+        return text, stored
+
     ref = _pay.get(f"{kind}_ref")
     if ref:
         try:
             src = await client.get_messages(ref["chat_id"], ids=ref["message_id"])
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            ui.warn(f"{kind} template: couldn't re-fetch the source post "
+                    f"({type(e).__name__}); re-run /set{kind if kind!='done' else 'done'} "
+                    "so formatting is stored.")
             src = None
         if src is not None:
-            return src.message or "", list(src.entities or [])
-    return _pay.get(f"{kind}_template", ""), []
+            ents = list(src.entities or [])
+            if not ents:
+                ui.warn(f"{kind} template: source post has no formatting/entities.")
+            return src.message or text, ents
+    if not text:
+        return "", []
+    ui.warn(f"{kind} template has no stored formatting — reply to your formatted "
+            f"post with /set{'done' if kind=='done' else 'channelpostofpayment'} again.")
+    return text, []
 
 
 async def _render(kind: str, amount: float, name: str, order_id: str = "",
@@ -1228,9 +1270,13 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
     reply = await event.get_reply_message()
     if reply is not None and (reply.raw_text or ""):
         _pay[f"{kind}_ref"] = {"chat_id": int(reply.chat_id), "message_id": int(reply.id)}
-        _pay[f"{kind}_template"] = reply.raw_text  # plain fallback if the post is deleted
+        _pay[f"{kind}_template"] = reply.raw_text  # plain text the entities map onto
+        # Store the formatting verbatim so it survives even if the post is gone.
+        _pay[f"{kind}_entities"] = _serialize_entities(reply.entities)
         _save_pay()
-        await _ack(event, f"{label} saved from that post - formatting and premium emoji kept.")
+        n = len(_pay[f"{kind}_entities"])
+        await _ack(event, f"{label} saved from that post - {n} formatting/emoji "
+                          "entity(ies) stored.")
         return
 
     m = re.match(rf"^{re.escape(cmd)}(?:\s+([\s\S]+))?$", event.raw_text or "")
@@ -1240,6 +1286,7 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
         return
     _pay[f"{kind}_template"] = template
     _pay.pop(f"{kind}_ref", None)
+    _pay.pop(f"{kind}_entities", None)
     _save_pay()
     await _ack(event, f"{label} saved ({len(template)} chars, plain text).")
 
