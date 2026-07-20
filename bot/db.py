@@ -1,9 +1,11 @@
 """SQLite persistence for the ChannelGuard admin bot (aiosqlite).
 
-Four tables:
+Tables:
   groups        every chat the bot has been added to (+ its short code + link)
-  templates     owner-defined /add entries keyed by keyword
+  templates     owner-defined post bodies keyed by keyword
   join_requests one row per pending/handled join request
+  orders        one paid /add order (ANI####) with amount/account/keyword
+  order_links   single-use invite link(s) minted for an order, per group
   events        lightweight audit log (added/approved/declined/removed/...)
 
 Every write is committed immediately; the module is safe to import before the
@@ -51,6 +53,26 @@ CREATE TABLE IF NOT EXISTS join_requests (
     PRIMARY KEY (chat_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS orders (
+    order_id     TEXT PRIMARY KEY,
+    amount       TEXT NOT NULL DEFAULT '',
+    account_name TEXT NOT NULL DEFAULT '',
+    keyword      TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',
+    created_at   REAL NOT NULL DEFAULT 0,
+    updated_at   REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS order_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    TEXT NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    invite_link TEXT NOT NULL,
+    joined_user INTEGER,
+    revoked     INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     kind     TEXT NOT NULL,
@@ -62,6 +84,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_groups_short ON groups(short_code);
 CREATE INDEX IF NOT EXISTS idx_jr_status ON join_requests(status);
+CREATE INDEX IF NOT EXISTS idx_ol_order ON order_links(order_id);
+CREATE INDEX IF NOT EXISTS idx_ol_link ON order_links(invite_link);
 """
 
 _conn: Optional[aiosqlite.Connection] = None
@@ -280,6 +304,91 @@ async def find_pending_by_username(username: str) -> list[aiosqlite.Row]:
         "SELECT * FROM join_requests WHERE status='pending' "
         "AND LOWER(COALESCE(username,''))=?",
         (uname,),
+    )
+
+
+# --- orders ---------------------------------------------------------------
+async def next_order_id(prefix: str) -> str:
+    """Return the next sequential id for ``prefix`` (e.g. ANI0001)."""
+    rows = await _all(
+        "SELECT order_id FROM orders WHERE order_id LIKE ?", (prefix + "%",)
+    )
+    plen = len(prefix)
+    mx = 0
+    for r in rows:
+        suffix = r["order_id"][plen:]
+        if suffix.isdigit():
+            mx = max(mx, int(suffix))
+    return f"{prefix}{mx + 1:04d}"
+
+
+async def create_order(
+    order_id: str, amount: str, account_name: str, keyword: str
+) -> None:
+    now = time.time()
+    await _run(
+        """
+        INSERT INTO orders (order_id, amount, account_name, keyword, status,
+                            created_at, updated_at)
+        VALUES (?,?,?,?, 'open', ?, ?)
+        """,
+        (order_id, amount, account_name, keyword, now, now),
+    )
+
+
+async def add_order_link(order_id: str, chat_id: int, invite_link: str) -> int:
+    cur = await _db().execute(
+        """
+        INSERT INTO order_links (order_id, chat_id, invite_link, created_at)
+        VALUES (?,?,?,?)
+        """,
+        (order_id, chat_id, invite_link, time.time()),
+    )
+    await _db().commit()
+    return cur.lastrowid
+
+
+async def get_order(order_id: str) -> Optional[aiosqlite.Row]:
+    row = await _one("SELECT * FROM orders WHERE order_id=?", (order_id,))
+    if row is None:
+        row = await _one(
+            "SELECT * FROM orders WHERE UPPER(order_id)=?", (order_id.upper(),)
+        )
+    return row
+
+
+async def order_links(order_id: str) -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM order_links WHERE order_id=? ORDER BY id", (order_id,)
+    )
+
+
+async def set_order_status(order_id: str, status: str) -> None:
+    await _run(
+        "UPDATE orders SET status=?, updated_at=? WHERE order_id=?",
+        (status, time.time(), order_id),
+    )
+
+
+async def find_order_link_by_invite(invite_link: str) -> Optional[aiosqlite.Row]:
+    return await _one(
+        "SELECT * FROM order_links WHERE invite_link=?", (invite_link,)
+    )
+
+
+async def set_order_link_joined(link_id: int, user_id: int) -> None:
+    await _run(
+        "UPDATE order_links SET joined_user=? WHERE id=?", (user_id, link_id)
+    )
+
+
+async def set_order_link_revoked(link_id: int) -> None:
+    await _run("UPDATE order_links SET revoked=1 WHERE id=?", (link_id,))
+
+
+async def all_orders(limit: int = 20) -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
     )
 
 

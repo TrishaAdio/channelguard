@@ -81,6 +81,19 @@ async def create_join_link(chat_id: int) -> Optional[str]:
         return None
 
 
+async def create_single_use_link(chat_id: int) -> Optional[str]:
+    """Mint a fresh single-use (member_limit=1) invite link — only one user
+    can join through it, no approval step."""
+    try:
+        inv = await bot.create_chat_invite_link(
+            chat_id, name=config.LINK_TITLE, member_limit=1
+        )
+        return inv.invite_link
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        log.warning("create single-use link failed for %s: %s", chat_id, e)
+        return None
+
+
 async def revoke_link(chat_id: int, link: Optional[str]) -> None:
     if not link:
         return
@@ -270,6 +283,46 @@ async def _finish_callback(cb: CallbackQuery, note: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# member joins — tie a buyer to their order link and burn the link
+# --------------------------------------------------------------------------
+_JOINED_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}
+
+
+@dp.chat_member()
+async def on_chat_member(update: ChatMemberUpdated) -> None:
+    old_status = update.old_chat_member.status
+    new_status = update.new_chat_member.status
+    # Only care about a real join (was outside -> now inside) via a link.
+    if new_status not in _JOINED_STATUSES:
+        return
+    if old_status in _JOINED_STATUSES:
+        return
+    if not update.invite_link:
+        return
+
+    link_row = await db.find_order_link_by_invite(update.invite_link.invite_link)
+    if not link_row:
+        return
+
+    user = update.new_chat_member.user
+    order_id = link_row["order_id"]
+    await db.set_order_link_joined(link_row["id"], user.id)
+    await db.set_order_status(order_id, "joined")
+    # Single-use link is spent — revoke it so it can never be reused.
+    await revoke_link(update.chat.id, update.invite_link.invite_link)
+    await db.set_order_link_revoked(link_row["id"])
+    await db.log_event("order_joined", update.chat.id, user.id, order_id)
+
+    uname = f"@{user.username}" if user.username else "no username"
+    await tell_owner(
+        f"Order <code>{esc(order_id)}</code> joined — "
+        f"<b>{esc(update.chat.title or update.chat.id)}</b>\n"
+        f"<blockquote>{esc(user.full_name)}   {esc(uname)}   "
+        f"<code>{user.id}</code></blockquote>"
+    )
+
+
+# --------------------------------------------------------------------------
 # clean service — delete join/left system messages in groups
 # --------------------------------------------------------------------------
 @dp.message(
@@ -293,18 +346,21 @@ HELP = (
     "<blockquote>Add me as admin to a group with Invite Users, Delete "
     "Messages and Ban Users rights. I onboard it, mint an approval-required "
     "link, and report here.</blockquote>\n"
-    "<b>Commands</b>\n"
+    "<b>Orders</b>\n"
+    "<code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt;</code> mint a single-use link (one buyer) with an order id\n"
+    "<code>/revoke &lt;orderid&gt;</code> kill the order's link(s) and ban the buyer\n"
+    "<code>/orders</code> recent orders\n"
+    "<code>/tpl &lt;keyword&gt; [body]</code> set the order post format\n\n"
+    "<b>Groups &amp; users</b>\n"
     "<code>/groups</code> registered groups + short codes\n"
-    "<code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt; [body]</code> save a link template\n"
     "<code>/list</code> saved templates\n"
     "<code>/pending</code> pending join requests\n"
     "<code>/remove &lt;keyword | @user | id&gt;</code> delete a template, or remove a user everywhere\n\n"
-    "<b>Get links</b>\n"
-    "<blockquote>Send a short code or name (e.g. <code>Lm</code>), a saved "
-    "keyword, or <code>all</code> for every group. I reply with the "
+    "<b>Quick link</b>\n"
+    "<blockquote>Send a short code / name / <code>all</code> to get the "
     "approval-required link(s).</blockquote>\n"
-    "<b>Template tokens</b>\n"
-    "<code>{link} {title} {short} {amount} {name} {keyword}</code>"
+    "<b>Tokens</b>\n"
+    "<code>{link} {title} {short} {amount} {name} {keyword} {orderid}</code>"
 )
 
 
@@ -339,41 +395,112 @@ async def cmd_groups(message: Message) -> None:
 
 @dp.message(Command("add"), F.chat.type == ChatType.PRIVATE)
 async def cmd_add(message: Message, command: CommandObject) -> None:
+    """Create a paid order: mint a single-use link per matched group, post it
+    (with an ANI order id) here and to the payment channel."""
+    if not owner_only(message):
+        return
+    args = (command.args or "").strip()
+    parts = args.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Usage: <code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt;</code>\n"
+            "<blockquote>keyword = a group short code / name, or <code>all</code>. "
+            "Mints a single-use link only that buyer can use and posts it with "
+            "an order id. Set the post format with "
+            "<code>/tpl &lt;keyword&gt;</code>.</blockquote>"
+        )
+        return
+    amount, account, keyword = parts[0], parts[1], parts[2]
+
+    if keyword.strip().lower() == "all":
+        groups = await db.all_groups(admin_only=True)
+    else:
+        groups = await db.find_groups(keyword)
+    if not groups:
+        await message.answer(
+            f"Nothing matches <code>{esc(keyword)}</code>. "
+            "Try <code>/groups</code> or <code>all</code>."
+        )
+        return
+
+    tpl = await db.get_template(keyword.lower())
+    body = tpl["body"] if tpl and tpl["body"] else config.ORDER_TEMPLATE
+
+    order_id = await db.next_order_id(config.ORDER_PREFIX)
+    await db.create_order(order_id, amount, account, keyword.lower())
+
+    made = 0
+    for g in groups:
+        link = await create_single_use_link(g["chat_id"])
+        if not link:
+            await message.answer(
+                f"<b>{esc(g['title'])}</b>\n"
+                "<blockquote>No link — I need the Invite Users right "
+                "there.</blockquote>"
+            )
+            continue
+        await db.add_order_link(order_id, g["chat_id"], link)
+        rendered = render_template(
+            body,
+            {
+                "link": link,
+                "title": g["title"],
+                "short": g["short_code"],
+                "amount": amount,
+                "name": account,
+                "keyword": keyword.lower(),
+                "orderid": order_id,
+            },
+        )
+        await message.answer(rendered)
+        if config.PAYMENT_CHANNEL:
+            try:
+                await bot.send_message(config.PAYMENT_CHANNEL, rendered)
+            except Exception as e:  # noqa: BLE001
+                log.warning("payment channel post failed: %s", e)
+        made += 1
+
+    await db.log_event("order_add", detail=f"{order_id} keyword={keyword} links={made}")
+    await message.answer(
+        f"Order <code>{esc(order_id)}</code> — {made} single-use link(s)."
+    )
+
+
+@dp.message(Command("tpl"), F.chat.type == ChatType.PRIVATE)
+async def cmd_tpl(message: Message, command: CommandObject) -> None:
+    """Set the post body used for a keyword's order links.
+
+    Usage: /tpl <keyword> [body...]  — or reply to a formatted message.
+    """
     if not owner_only(message):
         return
     args = (command.args or "").strip()
     if not args:
         await message.answer(
-            "Usage: <code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt; [body]</code>\n"
-            "<blockquote>Reply to a formatted message to use it as the body, "
-            "or type the body inline. Body may use "
-            "<code>{link} {amount} {name} {keyword}</code>.</blockquote>"
+            "Usage: <code>/tpl &lt;keyword&gt; [body]</code>\n"
+            "<blockquote>Reply to a formatted message to store it verbatim. "
+            "Tokens: <code>{link} {title} {short} {amount} {name} {keyword} "
+            "{orderid}</code>.</blockquote>"
         )
         return
+    parts = args.split(maxsplit=1)
+    keyword = parts[0]
+    inline_body = parts[1] if len(parts) > 1 else ""
 
-    parts = args.split(maxsplit=3)
-    if len(parts) < 3:
-        await message.answer("Need at least: amount, account, keyword.")
-        return
-    amount, account, keyword = parts[0], parts[1], parts[2]
-    inline_body = parts[3] if len(parts) > 3 else ""
-
-    # A reply supplies a rich (HTML) body verbatim; inline text is the fallback.
     reply = message.reply_to_message
     if reply and (reply.html_text or reply.caption):
         body = reply.html_text or reply.caption or ""
     elif inline_body:
         body = inline_body
     else:
-        body = config.DEFAULT_TEMPLATE
+        await message.answer("Give a body inline or reply to a message.")
+        return
 
-    await db.upsert_template(keyword, amount, account, body)
+    await db.upsert_template(keyword, "", "", body)
     await db.log_event("template_add", detail=keyword.lower())
     await message.answer(
-        f"Saved template <code>{esc(keyword.lower())}</code>\n"
-        f"<blockquote>amount <code>{esc(amount)}</code>   "
-        f"account <code>{esc(account)}</code></blockquote>\n"
-        f"Send <code>{esc(keyword.lower())}</code> to use it."
+        f"Template <code>{esc(keyword.lower())}</code> saved. "
+        f"Used by <code>/add &lt;amount&gt; &lt;account&gt; {esc(keyword.lower())}</code>."
     )
 
 
@@ -486,6 +613,64 @@ async def _remove_user(message: Message, ident: str) -> None:
         f"User <code>{user_id}</code>: declined {declined} request(s), "
         f"removed from {kicked} group(s)."
     )
+
+
+@dp.message(Command("revoke"), F.chat.type == ChatType.PRIVATE)
+async def cmd_revoke(message: Message, command: CommandObject) -> None:
+    """Revoke an order's link(s) and ban whoever joined through them."""
+    if not owner_only(message):
+        return
+    oid = (command.args or "").strip()
+    if not oid:
+        await message.answer("Usage: <code>/revoke &lt;orderid&gt;</code>")
+        return
+
+    order = await db.get_order(oid)
+    if not order:
+        await message.answer(f"No order <code>{esc(oid)}</code>.")
+        return
+    order_id = order["order_id"]
+
+    links = await db.order_links(order_id)
+    revoked = banned = 0
+    for l in links:
+        if not l["revoked"]:
+            await revoke_link(l["chat_id"], l["invite_link"])
+            await db.set_order_link_revoked(l["id"])
+        revoked += 1
+        if l["joined_user"]:
+            try:
+                await bot.ban_chat_member(l["chat_id"], l["joined_user"])
+                banned += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("ban failed for %s in %s: %s",
+                            l["joined_user"], l["chat_id"], e)
+    await db.set_order_status(order_id, "revoked")
+    await db.log_event("order_revoke", detail=f"{order_id} banned={banned}")
+    await message.answer(
+        f"Order <code>{esc(order_id)}</code> revoked — "
+        f"{revoked} link(s), {banned} user(s) banned."
+    )
+
+
+@dp.message(Command("orders"), F.chat.type == ChatType.PRIVATE)
+async def cmd_orders(message: Message) -> None:
+    if not owner_only(message):
+        return
+    rows = await db.all_orders(limit=20)
+    if not rows:
+        await message.answer("No orders yet.")
+        return
+    lines = ["<b>Orders</b>"]
+    for o in rows:
+        lines.append(
+            f"<code>{esc(o['order_id'])}</code> "
+            f"<blockquote>{esc(o['status'])}   "
+            f"amount <code>{esc(o['amount'])}</code>   "
+            f"account <code>{esc(o['account_name'])}</code>   "
+            f"key <code>{esc(o['keyword'])}</code></blockquote>"
+        )
+    await message.answer("\n".join(lines))
 
 
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text, ~F.text.startswith("/"))

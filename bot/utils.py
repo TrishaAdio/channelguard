@@ -43,7 +43,9 @@ def unique_short_code(title: str, taken: Iterable[str]) -> str:
 
 
 # Tokens the owner can use inside a template body.
-TEMPLATE_TOKENS = ("{link}", "{title}", "{short}", "{amount}", "{name}", "{keyword}")
+TEMPLATE_TOKENS = (
+    "{link}", "{title}", "{short}", "{amount}", "{name}", "{keyword}", "{orderid}",
+)
 
 
 def render_template(body: str, values: Mapping[str, str]) -> str:
@@ -54,7 +56,7 @@ def render_template(body: str, values: Mapping[str, str]) -> str:
     ``&`` or ``<`` cannot break Telegram's HTML parser.
     """
     out = body or ""
-    for key in ("link", "title", "short", "amount", "name", "keyword"):
+    for key in ("link", "title", "short", "amount", "name", "keyword", "orderid"):
         token = "{" + key + "}"
         if token in out:
             out = out.replace(token, html.escape(str(values.get(key, "") or "")))

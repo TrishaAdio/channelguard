@@ -51,17 +51,32 @@ ROTATE_ON_JOIN = _bool("ROTATE_ON_JOIN", True)
 # Optional friendly title for the invite links the bot creates.
 LINK_TITLE = (os.getenv("LINK_TITLE", "ChannelGuard") or "ChannelGuard").strip()
 
+# --- Orders ----------------------------------------------------------------
+# Prefix for the order ids minted by /add, e.g. ANI0001, ANI0002, ...
+ORDER_PREFIX = (os.getenv("ORDER_PREFIX", "ANI") or "ANI").strip()
+# Optional chat to also post each order to (numeric id like -100123... or a
+# public @username). Leave empty to disable channel posting.
+PAYMENT_CHANNEL = (os.getenv("PAYMENT_CHANNEL", "") or "").strip()
+
 # --- Storage ---------------------------------------------------------------
 DATA_DIR = BOT_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = Path(os.getenv("BOT_DB_PATH", str(DATA_DIR / "channelguard.db")))
 
-# Default template used by the owner link-distribution flow when no custom
-# template is registered for a keyword. Supports {link} {title} {short}
-# {amount} {name} {keyword}.
+# Template for the quick bare-text link lookup (general approval link). Tokens:
+# {link} {title} {short} {amount} {name} {keyword} {orderid}.
 DEFAULT_TEMPLATE = (
     "<b>{title}</b>\n"
-    "<blockquote>Join link (approval required)</blockquote>\n"
+    "<blockquote>Approval required</blockquote>\n"
+    "{link}"
+)
+
+# Template for a paid /add order post (single-use link). Used when no custom
+# per-keyword template is registered. Same tokens as above.
+ORDER_TEMPLATE = (
+    "<b>{title}</b>\n"
+    "<blockquote>Order <code>{orderid}</code>   "
+    "Amount <code>{amount}</code>   {name}</blockquote>\n"
     "{link}"
 )
 

@@ -23,23 +23,34 @@ A single-owner Telegram **bot** (bot token, not a login). What it does:
    **approval-required** ("join request") invite link, saves it to SQLite, and
    **DMs the owner** a compact card (title, short code, id, type, member count,
    link).
-2. **Join requests -> owner.** Every join request is stored and forwarded to
-   the owner with inline **Approve / Decline** buttons. On approve the user is
-   let in and (by default) the link is **rotated** so the old one is dead.
-3. **Owner control from DM** (owner id only):
+2. **Paid orders (single-use links).** `/add <amount> <account> <keyword>`
+   mints a **single-use** invite link (`member_limit=1`) for each matched group
+   — only one buyer can use it. Each `/add` gets an **order id** (`ANI0001`,
+   `ANI0002`, ...) and the post is sent to you and (optionally) to a
+   **payment channel**. When the buyer joins, the bot ties them to the order
+   and **revokes the spent link** automatically. Need another seat for the same
+   group? Just run `/add` again — each order is an independent link.
+3. **`/revoke <orderid>`** kills every link in that order **and bans** the buyer
+   who joined through it.
+4. **Join requests -> owner.** Every join request (on the general approval
+   link) is stored and forwarded with inline **Approve / Decline** buttons. On
+   approve the link is **rotated** so the old one is dead.
+5. **Owner control from DM** (owner id only):
 
    | Command | Effect |
    |---------|--------|
+   | `/add <amount> <account> <keyword>` | mint a single-use link per matched group + an order id, posted here and to the payment channel |
+   | `/revoke <orderid>` | revoke the order's link(s) and ban the buyer(s) |
+   | `/orders` | list recent orders and their status |
+   | `/tpl <keyword> [body]` | set the post format for a keyword (reply to a formatted message to keep its HTML) |
    | `/groups` | list registered groups + short codes + admin/link status |
-   | `/add <amount> <account> <keyword> [body]` | save a link template; reply to a formatted message to keep its HTML |
    | `/list` | list saved templates |
    | `/pending` | list pending join requests with Approve/Decline |
    | `/remove <keyword \| @user \| id>` | delete a template, **or** decline that user's requests and remove them from every group |
-   | send a short code / name / keyword | reply with the approval-required link(s) for the matching group(s) |
-   | send `all` | do that for **every** group the bot admins |
+   | send a short code / name / `all` | reply with the approval-required link(s) |
 
-   Template tokens: `{link} {title} {short} {amount} {name} {keyword}`.
-4. **Clean service.** Join/leave system messages in groups are deleted so the
+   Template tokens: `{link} {title} {short} {amount} {name} {keyword} {orderid}`.
+6. **Clean service.** Join/leave system messages in groups are deleted so the
    chat stays clean (needs the Delete Messages right).
 
 ### Run
