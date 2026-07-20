@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -246,8 +247,42 @@ async def on_join_request(req: ChatJoinRequest) -> None:
     await db.add_join_request(chat.id, user.id, username, full_name, used_link)
     await db.log_event("join_request", chat.id, user.id)
 
-    uname = f"@{username}" if username else "no username"
     title = chat.title or str(chat.id)
+
+    # (1) This user was reserved for this group (CP:USERID) -> approve ONLY them,
+    # then revoke the link so it can't be reused.
+    binding = await db.get_binding(chat.id, user.id)
+    if binding and binding["status"] == "pending":
+        try:
+            await bot.approve_chat_join_request(chat.id, user.id)
+            await db.set_binding_status(chat.id, user.id, "approved")
+            await db.set_join_status(chat.id, user.id, "approved")
+            await revoke_link(chat.id, binding["invite_link"])
+            await db.log_event("bind_approved", chat.id, user.id)
+            await tell_owner(
+                f"Approved reserved user for <b>{esc(title)}</b>\n"
+                f"<blockquote><code>{user.id}</code> — link revoked</blockquote>"
+            )
+        except Exception as e:  # noqa: BLE001
+            await tell_owner(f"Auto-approve failed for <code>{user.id}</code>: {esc(e)}")
+        return
+
+    # (2) Someone else tried a link reserved for a specific user -> decline them.
+    if used_link:
+        reserved = await db.binding_by_link(used_link)
+        if reserved and reserved["user_id"] != user.id:
+            try:
+                await bot.decline_chat_join_request(chat.id, user.id)
+                await db.set_join_status(chat.id, user.id, "declined")
+                await tell_owner(
+                    f"Declined <code>{user.id}</code> — that link is reserved for "
+                    f"<code>{reserved['user_id']}</code> in <b>{esc(title)}</b>."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+    uname = f"@{username}" if username else "no username"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(
@@ -390,6 +425,10 @@ HELP = (
     "<b>Quick link</b>\n"
     "<blockquote>Send a short code / name / <code>all</code> to get the "
     "approval-required link(s).</blockquote>\n"
+    "<b>Reserve for one buyer</b>\n"
+    "<blockquote>Send <code>&lt;group&gt;:&lt;userid&gt;</code> "
+    "(e.g. <code>cp:7406804576</code>): I make a link for that group and "
+    "approve ONLY that user on join, then revoke it.</blockquote>\n"
     "<b>Tokens</b>\n"
     "<code>{link} {title} {short} {amount} {name} {keyword} {orderid}</code>"
 )
@@ -719,10 +758,51 @@ async def cmd_orders(message: Message) -> None:
 
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text, ~F.text.startswith("/"))
 async def on_lookup(message: Message) -> None:
-    """Bare text from the owner = a group name / short code / keyword lookup."""
+    """Owner bare text:
+    - <group>:<userid>  -> make a link for that group reserved for that ONE
+      user (auto-approved on join, then revoked), e.g.  cp:7406804576
+    - <group>           -> just fetch/show the link(s)."""
     if not owner_only(message):
         return await deny(message)
-    await distribute(message, message.text.strip())
+    text = message.text.strip()
+    m = re.match(r"^(?P<q>.+?)\s*:\s*(?P<uid>\d{4,})$", text)
+    if m:
+        await bind_user_to_group(message, m.group("q").strip(), int(m.group("uid")))
+        return
+    await distribute(message, text)
+
+
+async def bind_user_to_group(message: Message, query: str, user_id: int) -> None:
+    """Mint an approval-required link for the matched group and reserve it for a
+    single user id: only that user is auto-approved (then the link is revoked)."""
+    if not query:
+        await message.answer("Usage: <code>&lt;group&gt;:&lt;userid&gt;</code>  e.g. <code>cp:7406804576</code>")
+        return
+    groups = (await db.all_groups(admin_only=True)) if query.lower() == "all" \
+        else await db.find_groups(query)
+    if not groups:
+        await message.answer(
+            f"No group matches <code>{esc(query)}</code>. Try <code>/groups</code>."
+        )
+        return
+    g = groups[0]
+    link = await create_join_link(g["chat_id"])
+    if not link:
+        await message.answer(
+            f"<b>{esc(g['title'])}</b>\n<blockquote>No link — I need the Invite "
+            "Users right there.</blockquote>"
+        )
+        return
+    await db.set_group_link(g["chat_id"], link)
+    await db.add_binding(g["chat_id"], user_id, link)
+    _remember(link, g["title"], g["short_code"])
+    await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
+    await message.answer(
+        f"<b>{esc(g['title'])}</b>\n"
+        f"<blockquote>Reserved for <code>{user_id}</code> — only they are "
+        f"approved on join, then the link is revoked</blockquote>\n"
+        f"{esc(link)}"
+    )
 
 
 # Registered LAST: any /command that no specific handler above matched. This

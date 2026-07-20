@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS order_links (
     created_at  REAL NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS bindings (
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    invite_link TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     kind     TEXT NOT NULL,
@@ -86,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_groups_short ON groups(short_code);
 CREATE INDEX IF NOT EXISTS idx_jr_status ON join_requests(status);
 CREATE INDEX IF NOT EXISTS idx_ol_order ON order_links(order_id);
 CREATE INDEX IF NOT EXISTS idx_ol_link ON order_links(invite_link);
+CREATE INDEX IF NOT EXISTS idx_bind_link ON bindings(invite_link);
 """
 
 _conn: Optional[aiosqlite.Connection] = None
@@ -392,6 +402,42 @@ async def set_order_link_revoked(link_id: int) -> None:
 async def all_orders(limit: int = 20) -> list[aiosqlite.Row]:
     return await _all(
         "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+    )
+
+
+# --- bindings (one paid user reserved for one group's link) ---------------
+async def add_binding(chat_id: int, user_id: int, invite_link: str) -> None:
+    await _run(
+        """
+        INSERT INTO bindings (chat_id, user_id, invite_link, status, created_at)
+        VALUES (?,?,?, 'pending', ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            invite_link=excluded.invite_link,
+            status='pending',
+            created_at=excluded.created_at
+        """,
+        (chat_id, user_id, invite_link, time.time()),
+    )
+
+
+async def get_binding(chat_id: int, user_id: int) -> Optional[aiosqlite.Row]:
+    return await _one(
+        "SELECT * FROM bindings WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+    )
+
+
+async def binding_by_link(invite_link: str) -> Optional[aiosqlite.Row]:
+    return await _one(
+        "SELECT * FROM bindings WHERE invite_link=? AND status='pending' "
+        "ORDER BY created_at DESC",
+        (invite_link,),
+    )
+
+
+async def set_binding_status(chat_id: int, user_id: int, status: str) -> None:
+    await _run(
+        "UPDATE bindings SET status=? WHERE chat_id=? AND user_id=?",
+        (status, chat_id, user_id),
     )
 
 
