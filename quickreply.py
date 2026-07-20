@@ -76,6 +76,7 @@ from telethon.tl.types import (
     InputPeerSelf,
     InputQuickReplyShortcut,
     InputUserSelf,
+    MessageEntityBlockquote,
     MessageEntityBold,
     MessageMediaWebPage,
     UpdatePendingJoinRequests,
@@ -923,25 +924,84 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
         pass
 
 
-async def _reserve_link(keyword: str, user_id: int, timeout: float = 12.0) -> str:
-    """Ask the BOT (via the shared file) to reserve an approval link for
-    `keyword` bound to `user_id`, then wait for the bot to publish it.
-    Returns the link, or "" if the bot didn't answer in time."""
+async def _reserve_links(keyword: str, user_id: int, timeout: float = 15.0) -> list:
+    """Ask the BOT (via the shared file) to reserve approval link(s) for
+    `keyword` bound to `user_id`, then wait for the bot to publish them.
+    Returns a list of {"link","title"} ('all' -> every group; else one)."""
     if linkstore is None:
-        return ""
+        return []
     try:
         rid = linkstore.request_link(keyword, int(user_id))
     except Exception:  # noqa: BLE001
-        return ""
+        return []
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             if linkstore.has_result(rid):
-                return linkstore.get_result(rid) or ""
+                return linkstore.get_result(rid) or []
         except Exception:  # noqa: BLE001
-            return ""
+            return []
         await asyncio.sleep(0.4)
-    return ""
+    return []
+
+
+def _build_link_block(entries: list):
+    """A numbered, bold-marked, blockquoted list of the reserved links.
+    Returns (text, entities) with entity offsets relative to the block start
+    (UTF-16 units, how Telegram counts them)."""
+    lines, ents, cursor = [], [], 0
+    total = len(entries)
+    for i, e in enumerate(entries, 1):
+        link = (e.get("link") if isinstance(e, dict) else str(e)) or ""
+        prefix = f"{i}. "
+        line = prefix + link
+        ents.append(MessageEntityBold(offset=cursor, length=_u16(prefix)))
+        cursor += _u16(line)
+        if i < total:
+            cursor += _u16("\n")
+        lines.append(line)
+    block = "\n".join(lines)
+    ents.insert(0, MessageEntityBlockquote(offset=0, length=_u16(block)))
+    return block, ents
+
+
+async def _render_multi(kind: str, amount: float, name: str, order_id: str,
+                        entries: list, include_current: bool = False):
+    """Render a template but put the numbered/bold/blockquoted link block where
+    {link} is (or append it if the template has no {link})."""
+    text, ents = await _resolve_template(kind)
+    ents = [copy.copy(e) for e in ents]
+    # Substitute every token EXCEPT {link}; we place the styled block by hand.
+    mapping = _pay_mapping(amount, name, order_id=order_id,
+                           include_current=include_current, link="")
+    mapping.pop("{link}", None)
+    text, ents = _substitute(text, ents, mapping)
+
+    block, block_ents = _build_link_block(entries)
+    token = "{link}"
+    idx = text.find(token)
+    if idx < 0:
+        sep = "" if (not text or text.endswith("\n")) else "\n"
+        pos = _u16(text) + _u16(sep)
+        text = text + sep + block
+    else:
+        pos = _u16(text[:idx])
+        delta = _u16(block) - _u16(token)
+        r_start, r_end = pos, pos + _u16(token)
+        for e in ents:
+            e_start, e_end = e.offset, e.offset + e.length
+            if e_end <= r_start:
+                pass
+            elif e_start >= r_end:
+                e.offset += delta
+            else:
+                e.length = max(0, e.length + delta)
+        text = text[:idx] + block + text[idx + len(token):]
+    for e in block_ents:
+        e2 = copy.copy(e)
+        e2.offset = pos + e.offset
+        ents.append(e2)
+    return text, ents
 
 
 def _entity_fallbacks(ents):
@@ -977,20 +1037,20 @@ async def _edit_rich(event, text, ents):
 
 
 async def cmd_add(event) -> None:
-    """/add <amount> <name> <keyword> — run in the payer's DM (or reply to them).
+    """/add <amount> <name> <keyword...> — run in the payer's DM (or reply to them).
 
-    Sends the BOT a reservation request for <keyword> bound to the payer's user
-    id; the bot makes the approval link and returns it. Fills {link} in the done
-    message. Replying to an image (with a post channel set) also posts the image
-    there — but that is optional and never blocks the link. When the payer joins,
-    the bot approves only them and revokes the link."""
+    Reserves a link for EACH keyword via the BOT, bound to the payer. Multiple
+    keywords -> multiple groups (e.g. /add 252 aka cp op lp fp); 'all' -> every
+    group the bot admins. The reserved links are listed numbered/bold/blockquoted
+    where {link} sits in the done message. When the payer joins any of them, the
+    bot approves only them and revokes that link."""
     m = re.match(r"^/add(?:\s+(\S+)(?:\s+(\S+)(?:\s+([\s\S]+))?)?)?$", event.raw_text or "")
     amount_raw = m.group(1) if m else None
     accname = (m.group(2).strip() if m and m.group(2) else "")
-    keyword = (m.group(3).strip() if m and m.group(3) else "")
+    keywords = (m.group(3).split() if m and m.group(3) else [])
 
     if not amount_raw:
-        await _ack(event, "Usage: /add <amount> <name> <keyword>  (in the payer's DM)")
+        await _ack(event, "Usage: /add <amount> <name> <keyword...>  (in the payer's DM)")
         return
     try:
         amount = parse_amount(amount_raw)
@@ -1001,11 +1061,11 @@ async def cmd_add(event) -> None:
     reply = await event.get_reply_message()
     has_media = bool(reply and reply.media)
 
-    # 1) Reserve the group link via the BOT — done FIRST so the optional
-    #    image/channel steps can never skip the hand-off (this was the bug).
-    link = ""
+    # 1) Reserve link(s) via the BOT — FIRST, so the optional image/channel
+    #    steps can never skip the hand-off.
+    entries = []          # [{"link","title"}], deduped, in request order
     payer_id = None
-    if keyword:
+    if keywords:
         if reply and getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
             payer_id = reply.sender_id
         elif event.is_private:
@@ -1018,27 +1078,38 @@ async def cmd_add(event) -> None:
             await _ack(event, "Bot bridge missing: start BOTH programs from the repo "
                               "root so they share data/. Run /doctor on the bot.")
             return
-        print(ui.green("[reserve] ") + f"asking bot: {keyword} -> {payer_id}", flush=True)
-        link = await _reserve_link(keyword, int(payer_id))
-        if not link:
-            await _ack(event, f'The bot did not answer for "{keyword}". Is the bot '
-                              "running (same folder) and admin in that group? Run "
-                              "/doctor on the bot.")
+        seen = set()
+        for kw in keywords:
+            print(ui.green("[reserve] ") + f"asking bot: {kw} -> {payer_id}", flush=True)
+            for e in await _reserve_links(kw, int(payer_id)):
+                lk = e.get("link") if isinstance(e, dict) else None
+                if lk and lk not in seen:
+                    seen.add(lk)
+                    entries.append(e)
+        if not entries:
+            await _ack(event, "The bot returned no links for: "
+                              f"{' '.join(keywords)}. Is the bot running (same folder) "
+                              "and admin in those groups? Run /doctor on the bot.")
             return
-        print(ui.green("[reserve] ") + f"got {keyword}: {ui.bold(link)}", flush=True)
+        print(ui.green("[reserve] ") + f"got {len(entries)} link(s)", flush=True)
 
-    if not keyword and not has_media:
-        await _ack(event, "Give a keyword to send a link: /add <amount> <name> <keyword>, "
+    if not keywords and not has_media:
+        await _ack(event, "Give keyword(s) to send links: /add <amount> <name> <kw...>, "
                           "or reply to an image to just log a payment.")
         return
+
+    single_link = entries[0]["link"] if len(entries) == 1 else ""
 
     order_id = _generate_order_id()
     payment = {
         "amount": amount, "name": accname, "order_id": order_id,
         "ts": _now_ts(), "status": "pending",
     }
-    if link:
-        payment.update({"invite_link": link, "payer_id": payer_id, "keyword": keyword})
+    if entries:
+        payment.update({
+            "invite_links": [e["link"] for e in entries],
+            "payer_id": payer_id, "keywords": keywords,
+        })
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
@@ -1048,10 +1119,13 @@ async def cmd_add(event) -> None:
         payment["post_chat_id"] = target_channel
         payment["post_message_id"] = None
         try:
-            ch_text, ch_ents = await _render(
-                "channel", amount, accname, order_id=order_id,
-                include_current=True, link=link,
-            )
+            if len(entries) > 1:
+                ch_text, ch_ents = await _render_multi(
+                    "channel", amount, accname, order_id, entries, include_current=True)
+            else:
+                ch_text, ch_ents = await _render(
+                    "channel", amount, accname, order_id=order_id,
+                    include_current=True, link=single_link)
         except Exception as e:  # noqa: BLE001
             payment["status"] = "failed"
             payment["error"] = f"render: {type(e).__name__}: {e}"
@@ -1090,9 +1164,13 @@ async def cmd_add(event) -> None:
         payment.pop("error", None)
     _save_pay()
 
-    # 3) Message the payer with {link} (edit the /add command into the reply),
-    #    keeping as much formatting/premium emoji as this account may send.
-    us_text, us_ents = await _render("done", amount, accname, order_id=order_id, link=link)
+    # 3) Message the payer with the link(s) (edit the /add command into the
+    #    reply), keeping as much formatting/premium emoji as the account allows.
+    if len(entries) > 1:
+        us_text, us_ents = await _render_multi("done", amount, accname, order_id, entries)
+    else:
+        us_text, us_ents = await _render(
+            "done", amount, accname, order_id=order_id, link=single_link)
     dropped = await _edit_rich(event, us_text, us_ents)
     if dropped:
         ui.warn(f"Done message: dropped {dropped} premium-emoji entity(ies) — this "
@@ -1525,7 +1603,7 @@ async def on_raw_update(update) -> None:
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
-    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;keyword&gt;</code> - reply to the payer's image; the BOT reserves that group's link for that user and I fill {link}\n"
+    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;kw...&gt;</code> - in the payer's DM: the BOT reserves a link per keyword (or <code>all</code>) for that user; links go where {link} is, numbered/bold/blockquoted\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"

@@ -172,24 +172,31 @@ def has_result(rid: str) -> bool:
     return isinstance(res, dict) and rid in res
 
 
-def put_result(rid: str, link: str, title: str = "") -> None:
-    """BOT: publish the reserved link (or "" on failure) for a request id."""
+def put_result(rid: str, entries) -> None:
+    """BOT: publish the reserved links for a request id.
+
+    `entries` is a list of {"link","title"} dicts (empty list = the bot found
+    the group(s) but couldn't create any link)."""
     now = time.time()
     res = _read_json(RESULTS, {})
     if not isinstance(res, dict):
         res = {}
-    res[rid] = {"link": link or "", "title": title or "", "ts": now}
+    clean = []
+    for e in entries or []:
+        if isinstance(e, dict) and e.get("link"):
+            clean.append({"link": e["link"], "title": e.get("title", "")})
+    res[rid] = {"entries": clean, "ts": now}
     res = {k: v for k, v in res.items() if now - v.get("ts", 0) < _TTL}
     _write_json(RESULTS, res)
 
 
-def get_result(rid: str) -> Optional[str]:
-    """USERBOT: the reserved link for a request id, or None if not published or
-    the bot couldn't make one (empty)."""
+def get_result(rid: str):
+    """USERBOT: the list of {"link","title"} for a request id, or None if the
+    bot hasn't answered yet. An empty list means it answered but reserved none."""
     res = _read_json(RESULTS, {})
     if not isinstance(res, dict):
         return None
     entry = res.get(rid)
-    if not entry:
+    if entry is None:
         return None
-    return entry.get("link") or None
+    return entry.get("entries", [])

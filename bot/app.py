@@ -959,39 +959,51 @@ async def on_startup() -> None:
 
 
 async def _fulfill_reservation(rid: str, query: str, user_id: int) -> None:
-    """Turn a userbot reservation request into a real reserved link."""
+    """Turn a userbot reservation request into reserved link(s).
+
+    'all' reserves EVERY group the bot admins; any other keyword reserves the
+    single best-matching group. Each reserved group is bound to the user, and
+    all resulting links are published back as a list."""
     if not query or not user_id:
-        linkstore.put_result(rid, "", "")
+        linkstore.put_result(rid, [])
         return
-    groups = (await db.all_groups(admin_only=True)) if query.lower() == "all" \
-        else await db.find_groups(query)
+    if query.strip().lower() == "all":
+        groups = await db.all_groups(admin_only=True)
+    else:
+        groups = (await db.find_groups(query))[:1]  # best match per keyword
     if not groups:
-        linkstore.put_result(rid, "", "")
+        linkstore.put_result(rid, [])
         await tell_owner(
             f"Reservation from userbot: no group matches <code>{esc(query)}</code> "
             f"for <code>{user_id}</code>."
         )
         return
-    g = groups[0]
-    link = await create_join_link(g["chat_id"])
-    if not link:
-        linkstore.put_result(rid, "", g["title"])
+
+    entries = []
+    for g in groups:
+        link = await create_join_link(g["chat_id"])
+        if not link:
+            continue
+        await db.set_group_link(g["chat_id"], link)
+        await db.add_binding(g["chat_id"], user_id, link)
+        _remember(link, g["title"], g["short_code"])
+        await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
+        entries.append({"link": link, "title": g["title"]})
+
+    linkstore.put_result(rid, entries)
+    if entries:
+        names = ", ".join(esc(e["title"]) for e in entries)
         await tell_owner(
-            f"Reservation: <b>{esc(g['title'])}</b> — no link (I need the Invite "
-            "Users right there)."
+            f"Reserved {len(entries)} group(s) for <code>{user_id}</code> "
+            f"(userbot /add): {names}\n"
+            "<blockquote>Only they are approved on join, then each link is "
+            "revoked</blockquote>"
         )
-        return
-    await db.set_group_link(g["chat_id"], link)
-    await db.add_binding(g["chat_id"], user_id, link)
-    _remember(link, g["title"], g["short_code"])
-    linkstore.put_result(rid, link, g["title"])
-    await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
-    await tell_owner(
-        f"Reserved <b>{esc(g['title'])}</b> for <code>{user_id}</code> "
-        "(from userbot /add).\n"
-        f"<blockquote>Only they are approved on join, then the link is "
-        f"revoked</blockquote>\n{esc(link)}"
-    )
+    else:
+        await tell_owner(
+            f"Matched <code>{esc(query)}</code> but couldn't create any link "
+            "(need the Invite Users right there)."
+        )
 
 
 async def reservation_poller() -> None:
