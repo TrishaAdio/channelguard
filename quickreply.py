@@ -875,15 +875,20 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
 
 
 async def cmd_add(event) -> None:
-    """/add <amount> [name] — reply to an image to log a payment: post the image
-    to the channel and message the payer with the done template. Group access
-    links are the BOT's job (bot/), not this userbot."""
-    m = re.match(r"^/add(?:\s+(\S+)(?:\s+([\s\S]+))?)?$", event.raw_text or "")
+    """/add <amount> <name> <group>
+
+    Searches the groups THIS account is in (fancy fonts folded), makes an
+    approval-required invite link for the match, fills {link} in the done
+    template with it, and records who paid so the link is revoked once they
+    join. Replying to an image also posts it to the channel. Without a group,
+    it just logs the payment (and posts the image if you reply to one)."""
+    m = re.match(r"^/add(?:\s+(\S+)(?:\s+(\S+)(?:\s+([\s\S]+))?)?)?$", event.raw_text or "")
     amount_raw = m.group(1) if m else None
     accname = (m.group(2).strip() if m and m.group(2) else "")
+    keyword = (m.group(3).strip() if m and m.group(3) else "")
 
     if not amount_raw:
-        await _ack(event, "Usage: reply to an image with  /add <amount> [name]")
+        await _ack(event, "Usage: /add <amount> <name> <group>  (reply to an image to also post it)")
         return
     try:
         amount = parse_amount(amount_raw)
@@ -892,72 +897,115 @@ async def cmd_add(event) -> None:
         return
 
     reply = await event.get_reply_message()
-    if not reply or not reply.media:
-        await _ack(event, "Reply to an image/media message with /add.")
-        return
-    if not _pay.get("post_channel"):
-        await _ack(event, "No post channel set. Type .setchannel in the target channel first.")
+    has_media = bool(reply and reply.media)
+    if not keyword and not has_media:
+        await _ack(event, "Give a group to make a link: /add <amount> <name> <group>, "
+                          "or reply to an image to just log a payment.")
         return
 
-    target_channel = int(_pay["post_channel"])
     order_id = _generate_order_id()
+
+    # Make the paid group's approval-required invite link (this fills {link}).
+    invite_link = group_id = group_title = None
+    if keyword:
+        try:
+            matches = await _find_groups(keyword)
+        except Exception as e:  # noqa: BLE001
+            await _ack(event, f"Group search failed: {type(e).__name__}: {e}")
+            return
+        if not matches:
+            await _ack(event, f'No group I can see matches "{keyword}". Send /groups to list them.')
+            return
+        # Try each match until a link is created — that is the reliable proof
+        # this account is admin with invite rights there.
+        last_err = ""
+        for entity, name in matches:
+            try:
+                link = await _export_invite(entity, title=order_id)
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+                link = None
+            if link:
+                invite_link, group_title, group_id = link, name, get_peer_id(entity)
+                break
+        if not invite_link:
+            await _ack(event, f'Matched "{matches[0][1]}" but could not create a link. '
+                              "I must be admin there with the Add Members / Invite Users right."
+                              + (f" ({last_err})" if last_err else ""))
+            return
+
+    payer_id = event.chat_id if event.is_private else None
     payment = {
         "amount": amount, "name": accname, "order_id": order_id,
         "ts": _now_ts(), "status": "pending",
-        "post_chat_id": target_channel, "post_message_id": None,
     }
+    if invite_link:
+        payment.update({
+            "group_id": group_id, "group_title": group_title,
+            "invite_link": invite_link, "payer_id": payer_id,
+            "join_status": "awaiting",
+        })
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
-    try:
-        ch_text, ch_ents = await _render(
-            "channel", amount, accname, order_id=order_id, include_current=True
-        )
-    except Exception as e:  # noqa: BLE001
+    # Post the proof image to the channel when replying to media (optional).
+    if has_media and _pay.get("post_channel"):
+        target_channel = int(_pay["post_channel"])
+        payment["post_chat_id"] = target_channel
+        payment["post_message_id"] = None
+        try:
+            ch_text, ch_ents = await _render(
+                "channel", amount, accname, order_id=order_id,
+                include_current=True, link=invite_link,
+            )
+        except Exception as e:  # noqa: BLE001
+            payment["status"] = "failed"
+            payment["error"] = f"render: {type(e).__name__}: {e}"
+            _save_pay()
+            await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
+            return
+        marker = _expect_automatic_outgoing(target_channel, [ch_text])
+        try:
+            post_result = await client.send_file(
+                target_channel, file=reply.media, caption=ch_text,
+                formatting_entities=ch_ents or None,
+            )
+        except Exception as e:  # noqa: BLE001
+            _cancel_automatic_outgoing(target_channel, marker)
+            payment["status"] = "failed"
+            payment["error"] = f"upload: {type(e).__name__}: {e}"
+            _save_pay()
+            await _ack(event, f"Posting to the channel failed: {type(e).__name__}: {e}")
+            return
+        _finish_automatic_outgoing(target_channel, marker, post_result)
+        post_ids = sorted(_sent_message_ids(post_result))
+        payment["post_message_id"] = post_ids[0] if post_ids else None
+        if not post_ids:
+            payment["status"] = "untracked"
+            payment["error"] = "Telegram returned no posted message ID"
+    elif has_media and not keyword and not _pay.get("post_channel"):
         payment["status"] = "failed"
-        payment["error"] = f"render: {type(e).__name__}: {e}"
         _save_pay()
-        await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
+        await _ack(event, "No post channel set. Type .setchannel in the target channel first.")
         return
 
-    marker = _expect_automatic_outgoing(target_channel, [ch_text])
-    try:
-        post_result = await client.send_file(
-            target_channel, file=reply.media, caption=ch_text,
-            formatting_entities=ch_ents or None,
-        )
-    except Exception as e:  # noqa: BLE001
-        _cancel_automatic_outgoing(target_channel, marker)
-        payment["status"] = "failed"
-        payment["error"] = f"upload: {type(e).__name__}: {e}"
-        _save_pay()
-        await _ack(event, f"Posting to the channel failed: {type(e).__name__}: {e}")
-        return
-    _finish_automatic_outgoing(target_channel, marker, post_result)
-
-    post_ids = sorted(_sent_message_ids(post_result))
-    if not post_ids:
-        payment["status"] = "untracked"
-        payment["error"] = "Telegram returned no posted message ID"
-        _save_pay()
-        await _ack(event, "Payment posted, but Telegram returned no message ID. "
-                          "It was not added to stats because /cancel couldn't track it.")
-        return
-
-    payment["post_message_id"] = post_ids[0]
-    payment["status"] = "valid"
-    payment.pop("error", None)
+    if payment.get("status") == "pending":
+        payment["status"] = "valid"
+        payment.pop("error", None)
     _save_pay()
 
-    us_text, us_ents = await _render("done", amount, accname, order_id=order_id)
+    # Message the payer: {link} = this order's real invite link.
+    us_text, us_ents = await _render("done", amount, accname, order_id=order_id,
+                                     link=invite_link)
     try:
         await event.edit(us_text, formatting_entities=us_ents or None)
     except Exception:  # noqa: BLE001 - fall back to a fresh message
         await event.respond(us_text, formatting_entities=us_ents or None)
 
     count = len(_todays_payments())
+    dest = f" -> {group_title}" if group_title else ""
     print(ui.green("[pay] ")
-          + f"{order_id} {fmt_inr(amount)} {accname} (#{count} today)", flush=True)
+          + f"{order_id} {fmt_inr(amount)} {accname}{dest} (#{count} today)", flush=True)
 
 
 def _payment_for_post(chat_id: int, message_id: int):
@@ -1376,8 +1424,11 @@ async def on_raw_update(update) -> None:
 HELP_TEXT = (
     "<b>Payment logger</b> (any chat)\n"
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
-    "<code>/add &lt;amount&gt; [name]</code> - reply to an image: log it, message the user, post to the channel\n"
-    "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
+    "<code>/add &lt;amount&gt; &lt;name&gt; &lt;group&gt;</code> - make an approval link for the matched group, fill {link}, track the payer; reply to an image to also post it\n"
+    "<code>/link &lt;name&gt;</code> - search your groups (fancy fonts ok) and get an approval link\n"
+    "<code>/groups</code> - list the groups this account can reach\n"
+    "<code>/remove &lt;orderid&gt;</code> - revoke that order's link and ban the payer\n"
+    "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat (use {link})\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
     "<code>/stats</code> - today's total, count, and split\n"
@@ -1761,7 +1812,18 @@ async def _handle_outgoing(event):
         async with _payment_lock:
             await cmd_setdone(event)
         return
-    # /link, /groups, /remove and group-access live in the BOT (bot/), not here.
+    if low_cmd.startswith("/link"):
+        async with _payment_lock:
+            await cmd_group_link(event)
+        return
+    if low_cmd == "/groups":
+        async with _payment_lock:
+            await cmd_groups(event)
+        return
+    if low_cmd.startswith("/remove"):
+        async with _payment_lock:
+            await cmd_remove(event)
+        return
     if low_cmd == ".setchannel":
         async with _payment_lock:
             await cmd_setchannel(event)
@@ -1959,6 +2021,10 @@ async def main() -> None:
     # Saved Messages controls, and the private-chat L action.
     client.add_event_handler(on_msg, events.NewMessage(incoming=True))
     client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
+    # Added to a group -> notify owner; paid user joins -> revoke that link.
+    client.add_event_handler(on_chat_action, events.ChatAction())
+    # Best-effort auto-approve of a paid user's join request.
+    client.add_event_handler(on_raw_update, events.Raw())
 
     where = f"from {src_raw}" if _state["source_id"] else "from any private chat"
     ui.banner("Quick-reply updater - running")
