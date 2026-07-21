@@ -26,8 +26,9 @@ Example:
   reply to a post with /broadcast 9:30 AM 18 JUL THANKS FOR
 
 Payment logger (send these yourself in ANY chat):
-  /add <amt> [name]              reply to an image -> log it, message the user,
-                                 and auto-post the image + caption to the channel
+  /add <amt> <name> <kw...>      ask the admin bot for buyer-bound group
+                                 link(s), replace {link} in /setdone, and
+                                 optionally post a replied proof image
   /setdone <template>            message sent to the user in the private chat
   /setchannelpostofpayment <t>   caption for the channel post
   .setchannel                    type it in a channel -> post media there
@@ -173,10 +174,6 @@ _state = {
     "away_enabled": config.GREET_NEW,
     "owner_active_until": 0.0,
     "activity_generation": 0,
-    # Link of the group last matched by /link <name>. When set, {link} in
-    # payment templates uses it instead of the rotating /SHORTCUT link.
-    "selected_link": None,
-    "selected_title": None,
 }
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
@@ -770,7 +767,7 @@ def _pay_mapping(amount: float, name: str, order_id: str = "",
         "{amount}": fmt_inr(amount),
         "{name}": name or "",
         "{orderid}": order_id or "",          # per-payment id, e.g. ANI7F3K9Q
-        "{link}": link or "",                 # current invite link (rotates)
+        "{link}": link or "",                 # bot-generated reservation link(s)
         "{rioshare}": fmt_inr(rio),
         "{marco}": fmt_inr(marco),
         "{total}": str(today_count),          # count of payments today
@@ -879,17 +876,12 @@ async def _resolve_template(kind: str):
 
 
 async def _render(kind: str, amount: float, name: str, order_id: str = "",
-                  include_current: bool = False, link: str | None = None):
+                  include_current: bool = False, link: str = ""):
+    """Render a payment template using only its explicit bot reservation link.
+
+    Guard/demo links are deliberately never a payment fallback.
+    """
     text, ents = await _resolve_template(kind)
-    # {link} priority: an explicit per-order link (from /add <group>), else the
-    # group last matched by /link, else the current rotating /SHORTCUT link.
-    if link is None:
-        link = _state.get("selected_link") or ""
-        if not link:
-            try:
-                link = await _current_link() or ""
-            except Exception:  # noqa: BLE001
-                link = ""
     return _substitute(
         text,
         ents,
@@ -924,25 +916,51 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
         pass
 
 
-async def _reserve_links(keyword: str, user_id: int, timeout: float = 15.0) -> list:
-    """Ask the BOT (via the shared file) to reserve approval link(s) for
-    `keyword` bound to `user_id`, then wait for the bot to publish them.
-    Returns a list of {"link","title"} ('all' -> every group; else one)."""
+async def _reserve_links(keywords, user_id: int, timeout: float = 45.0) -> dict:
+    """Send all group keywords to the bot in one durable bridge request."""
+    empty = {"entries": [], "failures": []}
     if linkstore is None:
-        return []
+        return {
+            "entries": [],
+            "failures": [{"keyword": "bridge", "reason": "bridge unavailable"}],
+        }
     try:
-        rid = linkstore.request_link(keyword, int(user_id))
-    except Exception:  # noqa: BLE001
-        return []
+        rid = linkstore.request_links(keywords, int(user_id))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "entries": [],
+            "failures": [{"keyword": "bridge", "reason": str(e)}],
+        }
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if linkstore.has_result(rid):
-                return linkstore.get_result(rid) or []
-        except Exception:  # noqa: BLE001
-            return []
+            result = linkstore.get_result_details(rid)
+            if result is not None:
+                return {
+                    "entries": list(result.get("entries") or []),
+                    "failures": list(result.get("failures") or []),
+                }
+        except Exception as e:  # noqa: BLE001
+            return {
+                "entries": [],
+                "failures": [{"keyword": "bridge", "reason": str(e)}],
+            }
         await asyncio.sleep(0.4)
-    return []
+    try:
+        cancelled = linkstore.cancel_request(rid)
+        if not cancelled:
+            result = linkstore.get_result_details(rid)
+            if result is not None:
+                return {
+                    "entries": list(result.get("entries") or []),
+                    "failures": list(result.get("failures") or []),
+                }
+    except Exception:  # noqa: BLE001
+        pass
+    empty["failures"].append({
+        "keyword": "bridge", "reason": "bot response timed out"
+    })
+    return empty
 
 
 def _build_link_block(entries: list):
@@ -979,35 +997,38 @@ async def _render_multi(kind: str, amount: float, name: str, order_id: str,
 
     block, block_ents = _build_link_block(entries)
     token = "{link}"
-    idx = text.find(token)
-    if idx < 0:
+    positions = []
+    if token not in text:
         sep = "" if (not text or text.endswith("\n")) else "\n"
-        pos = _u16(text) + _u16(sep)
+        positions.append(_u16(text) + _u16(sep))
         text = text + sep + block
     else:
-        pos = _u16(text[:idx])
-        delta = _u16(block) - _u16(token)
-        r_start, r_end = pos, pos + _u16(token)
-        for e in ents:
-            e_start, e_end = e.offset, e.offset + e.length
-            if e_end <= r_start:
-                pass
-            elif e_start >= r_end:
-                e.offset += delta
-            else:
-                e.length = max(0, e.length + delta)
-        text = text[:idx] + block + text[idx + len(token):]
-    for e in block_ents:
-        e2 = copy.copy(e)
-        e2.offset = pos + e.offset
-        ents.append(e2)
+        while token in text:
+            idx = text.find(token)
+            pos = _u16(text[:idx])
+            positions.append(pos)
+            delta = _u16(block) - _u16(token)
+            r_start, r_end = pos, pos + _u16(token)
+            for entity in ents:
+                e_start = entity.offset
+                e_end = entity.offset + entity.length
+                if e_end <= r_start:
+                    pass
+                elif e_start >= r_end:
+                    entity.offset += delta
+                else:
+                    entity.length = max(0, entity.length + delta)
+            text = text[:idx] + block + text[idx + len(token):]
+    for pos in positions:
+        for entity in block_ents:
+            clone = copy.copy(entity)
+            clone.offset = pos + entity.offset
+            ents.append(clone)
     return text, ents
 
 
 def _entity_fallbacks(ents):
-    """Progressively-degrading entity sets: full -> drop premium/custom emoji
-    (which a non-premium account can't send, and which make Telegram reject the
-    WHOLE set, killing bold/blockquote too) -> plain."""
+    """Full entities, then custom-emoji-free entities, then plain text."""
     ents = list(ents or [])
     tries = [ents]
     no_custom = [e for e in ents if type(e).__name__ != "MessageEntityCustomEmoji"]
@@ -1018,22 +1039,33 @@ def _entity_fallbacks(ents):
     return tries
 
 
+def _is_entity_error(error: Exception) -> bool:
+    """Only formatting/entity rejections are safe to retry with fewer entities."""
+    detail = f"{type(error).__name__}: {error}".upper()
+    markers = (
+        "ENTITY", "CUSTOM_EMOJI", "CUSTOM EMOJI", "EMOTICON",
+        "PREMIUM_ACCOUNT_REQUIRED", "PREMIUM ACCOUNT REQUIRED",
+    )
+    return any(marker in detail for marker in markers)
+
+
 async def _edit_rich(event, text, ents):
-    """Edit the command into `text`, keeping as much formatting as the account
-    is allowed to send. Returns how many entities were dropped (0 = all kept)."""
-    for attempt in _entity_fallbacks(ents):
+    """Edit once, degrading entities only for a Telegram entity rejection."""
+    original = list(ents or [])
+    last_error = None
+    for attempt in _entity_fallbacks(original):
         try:
             await event.edit(text, formatting_entities=attempt or None)
-            return len(ents or []) - len(attempt)
+            return len(original) - len(attempt)
         except MessageNotModifiedError:
-            return len(ents or []) - len(attempt)
-        except Exception:  # noqa: BLE001
-            continue
-    try:
-        await event.respond(text)
-    except Exception:  # noqa: BLE001
-        pass
-    return len(ents or [])
+            return len(original) - len(attempt)
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if not _is_entity_error(e):
+                raise
+    if last_error is not None:
+        raise last_error
+    return 0
 
 
 async def cmd_add(event) -> None:
@@ -1061,9 +1093,10 @@ async def cmd_add(event) -> None:
     reply = await event.get_reply_message()
     has_media = bool(reply and reply.media)
 
-    # 1) Reserve link(s) via the BOT — FIRST, so the optional image/channel
-    #    steps can never skip the hand-off.
-    entries = []          # [{"link","title"}], deduped, in request order
+    # 1) Send one batched request to the BOT. The userbot never searches groups
+    #    or reuses the guard's /demo link for a payment.
+    entries = []
+    failures = []
     payer_id = None
     if keywords:
         if reply and getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
@@ -1075,21 +1108,28 @@ async def cmd_add(event) -> None:
                               "or reply to their message.")
             return
         if linkstore is None:
-            await _ack(event, "Bot bridge missing: start BOTH programs from the repo "
-                              "root so they share data/. Run /doctor on the bot.")
+            await _ack(event, "Bot bridge unavailable.")
             return
-        seen = set()
-        for kw in keywords:
-            print(ui.green("[reserve] ") + f"asking bot: {kw} -> {payer_id}", flush=True)
-            for e in await _reserve_links(kw, int(payer_id)):
-                lk = e.get("link") if isinstance(e, dict) else None
-                if lk and lk not in seen:
-                    seen.add(lk)
-                    entries.append(e)
+
+        print(
+            ui.green("[reserve] ")
+            + f"asking bot: {' '.join(keywords)} -> {payer_id}",
+            flush=True,
+        )
+        result = await _reserve_links(keywords, int(payer_id))
+        failures = result["failures"]
+        seen_links = set()
+        for entry in result["entries"]:
+            link = entry.get("link") if isinstance(entry, dict) else None
+            if link and link not in seen_links:
+                seen_links.add(link)
+                entries.append(entry)
         if not entries:
-            await _ack(event, "The bot returned no links for: "
-                              f"{' '.join(keywords)}. Is the bot running (same folder) "
-                              "and admin in those groups? Run /doctor on the bot.")
+            detail = "; ".join(
+                f"{item.get('keyword')}: {item.get('reason')}"
+                for item in failures
+            ) or "no links returned"
+            await _ack(event, f"No group links: {detail}")
             return
         print(ui.green("[reserve] ") + f"got {len(entries)} link(s)", flush=True)
 
@@ -1097,8 +1137,6 @@ async def cmd_add(event) -> None:
         await _ack(event, "Give keyword(s) to send links: /add <amount> <name> <kw...>, "
                           "or reply to an image to just log a payment.")
         return
-
-    single_link = entries[0]["link"] if len(entries) == 1 else ""
 
     order_id = _generate_order_id()
     payment = {
@@ -1110,6 +1148,8 @@ async def cmd_add(event) -> None:
             "invite_links": [e["link"] for e in entries],
             "payer_id": payer_id, "keywords": keywords,
         })
+        if failures:
+            payment["reservation_failures"] = failures
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
@@ -1119,13 +1159,13 @@ async def cmd_add(event) -> None:
         payment["post_chat_id"] = target_channel
         payment["post_message_id"] = None
         try:
-            if len(entries) > 1:
+            if entries:
                 ch_text, ch_ents = await _render_multi(
                     "channel", amount, accname, order_id, entries, include_current=True)
             else:
                 ch_text, ch_ents = await _render(
                     "channel", amount, accname, order_id=order_id,
-                    include_current=True, link=single_link)
+                    include_current=True, link="")
         except Exception as e:  # noqa: BLE001
             payment["status"] = "failed"
             payment["error"] = f"render: {type(e).__name__}: {e}"
@@ -1144,7 +1184,8 @@ async def cmd_add(event) -> None:
                 break
             except Exception as e:  # noqa: BLE001
                 last_err = e
-                continue
+                if not _is_entity_error(e):
+                    break
         if post_result is None:
             _cancel_automatic_outgoing(target_channel, marker)
             payment["status"] = "failed"
@@ -1164,18 +1205,27 @@ async def cmd_add(event) -> None:
         payment.pop("error", None)
     _save_pay()
 
-    # 3) Message the payer with the link(s) (edit the /add command into the
-    #    reply), keeping as much formatting/premium emoji as the account allows.
-    if len(entries) > 1:
-        us_text, us_ents = await _render_multi("done", amount, accname, order_id, entries)
+    # 3) Replace {link} in /setdone with the exact link block returned by the
+    #    bot. Even one link uses the same numbered bold blockquote format.
+    if entries:
+        us_text, us_ents = await _render_multi(
+            "done", amount, accname, order_id, entries
+        )
     else:
         us_text, us_ents = await _render(
-            "done", amount, accname, order_id=order_id, link=single_link)
+            "done", amount, accname, order_id=order_id, link=""
+        )
     dropped = await _edit_rich(event, us_text, us_ents)
     if dropped:
-        ui.warn(f"Done message: dropped {dropped} premium-emoji entity(ies) — this "
-                "account isn't Telegram Premium, so custom emoji can't be sent "
-                "(bold/blockquote kept).")
+        ui.warn(f"Done message: dropped {dropped} unsupported entity(ies).")
+    if failures:
+        detail = "; ".join(
+            f"{item.get('keyword')}: {item.get('reason')}" for item in failures
+        )
+        try:
+            await event.respond(f"No link for {detail}")
+        except Exception as e:  # noqa: BLE001
+            ui.warn(f"Couldn't send partial-failure note: {type(e).__name__}: {e}")
 
     count = len(_todays_payments())
     print(ui.green("[pay] ")
@@ -1453,7 +1503,7 @@ async def cmd_group_link(event) -> None:
         await _ack(event, "Usage: /link <group name> - searches groups you admin.")
         return
     try:
-        matches = await _find_admin_groups(query)
+        matches = await _find_groups(query)
     except Exception as e:  # noqa: BLE001
         await _ack(event, f"Group search failed: {type(e).__name__}: {e}")
         return
@@ -1478,7 +1528,7 @@ async def cmd_group_link(event) -> None:
 async def cmd_groups(event) -> None:
     """/groups: list the groups/channels this account can invite to."""
     try:
-        groups = await _find_admin_groups("")
+        groups = await _find_groups("")
     except Exception as e:  # noqa: BLE001
         await _ack(event, f"Group list failed: {type(e).__name__}: {e}")
         return
@@ -2098,15 +2148,30 @@ async def on_outgoing(event):
                 pass
 
 
+def _is_guard_demo_link(sender_id: int, link: str) -> bool:
+    """Accept /demo rotations only from guard.py, never from the admin bot."""
+    try:
+        published_by_guard = (
+            linkstore is not None and linkstore.is_demo_link(link)
+        )
+    except Exception:  # noqa: BLE001
+        published_by_guard = False
+    source_id = _state["source_id"]
+    if source_id is not None:
+        return sender_id == source_id and published_by_guard
+    return published_by_guard
+
+
 async def on_msg(event):
     if not event.is_private:
         return
     sender = event.sender_id
     src = _state["source_id"]
 
-    # 1) Invite link relayed from the guard -> update the /demo + greeting link.
+    # Only guard.py may rotate /demo. The link must match guard.py's local
+    # handoff; LINK_SOURCE, when configured, is an additional sender check.
     match = LINK_RE.search(event.raw_text or "")
-    if match and (src is None or sender == src):
+    if match and _is_guard_demo_link(sender, match.group(0)):
         try:
             await _handle_link(event, match.group(0))
         except Exception as e:  # noqa: BLE001
@@ -2170,7 +2235,7 @@ async def main() -> None:
     src_raw = config.LINK_SOURCE_RAW.strip()
     if not src_raw:
         src_raw = ui.ask(
-            "Account that SENDS the invite link (username/id, blank = any)",
+            "Guard account that sends demo links (username/id, blank = local guard handoff)",
             default="",
         )
         if src_raw:
@@ -2180,14 +2245,16 @@ async def main() -> None:
             ent = await client.get_entity(config.coerce(src_raw))
             _state["source_id"] = ent.id
         except Exception:
-            ui.warn("Couldn't resolve LINK_SOURCE — accepting links from any private chat.")
+            ui.warn("Couldn't resolve LINK_SOURCE — /demo will accept only the "
+                    "link published by local guard.py.")
 
     # Incoming DMs -> link update / greet. All outgoing messages -> presence,
     # Saved Messages controls, and the private-chat L action.
     client.add_event_handler(on_msg, events.NewMessage(incoming=True))
     client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
 
-    where = f"from {src_raw}" if _state["source_id"] else "from any private chat"
+    where = (f"from {src_raw}" if _state["source_id"]
+             else "from local guard.py handoff only")
     ui.banner("Quick-reply updater - running")
     ui.success(f"As {ui.bold(me.first_name)} (id {me.id}).")
     ui.info(f"Keeping /{ui.bold(config.SHORTCUT)} link current ({where}).")

@@ -11,6 +11,7 @@ Tables:
 Every write is committed immediately; the module is safe to import before the
 database file exists (``init`` creates it).
 """
+
 from __future__ import annotations
 
 import time
@@ -82,6 +83,21 @@ CREATE TABLE IF NOT EXISTS bindings (
     PRIMARY KEY (chat_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  TEXT NOT NULL,
+    keyword     TEXT NOT NULL DEFAULT '',
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    invite_link TEXT NOT NULL UNIQUE,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    last_error  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL DEFAULT 0,
+    approved_at REAL,
+    revoked_at  REAL,
+    UNIQUE (request_id, keyword, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     kind     TEXT NOT NULL,
@@ -96,6 +112,12 @@ CREATE INDEX IF NOT EXISTS idx_jr_status ON join_requests(status);
 CREATE INDEX IF NOT EXISTS idx_ol_order ON order_links(order_id);
 CREATE INDEX IF NOT EXISTS idx_ol_link ON order_links(invite_link);
 CREATE INDEX IF NOT EXISTS idx_bind_link ON bindings(invite_link);
+CREATE INDEX IF NOT EXISTS idx_reservation_join
+    ON reservations(chat_id, user_id, invite_link, status);
+CREATE INDEX IF NOT EXISTS idx_reservation_link
+    ON reservations(invite_link, status);
+CREATE INDEX IF NOT EXISTS idx_reservation_revoke
+    ON reservations(status, created_at);
 """
 
 _conn: Optional[aiosqlite.Connection] = None
@@ -112,6 +134,25 @@ async def init() -> None:
     await _conn.execute("PRAGMA journal_mode=WAL;")
     await _conn.execute("PRAGMA foreign_keys=ON;")
     await _conn.executescript(_SCHEMA)
+    # Preserve active links created by older releases. The old bindings table
+    # allowed only one row per (chat,user); new reservations are keyed by the
+    # exact invite link so simultaneous purchases stay independent.
+    await _conn.execute(
+        """
+        INSERT OR IGNORE INTO reservations
+            (request_id, keyword, chat_id, user_id, invite_link, status,
+             created_at, approved_at)
+        SELECT
+            'legacy-' || chat_id || '-' || user_id || '-' || CAST(created_at AS TEXT),
+            'legacy', chat_id, user_id, invite_link,
+            CASE WHEN status='pending' THEN 'pending'
+                 ELSE 'approved_revoke_pending' END,
+            created_at,
+            CASE WHEN status='pending' THEN NULL ELSE created_at END
+        FROM bindings
+        WHERE invite_link IS NOT NULL AND invite_link != ''
+        """
+    )
     await _conn.commit()
 
 
@@ -172,8 +213,17 @@ async def upsert_group(
             is_admin=excluded.is_admin,
             updated_at=excluded.updated_at
         """,
-        (chat_id, title, short_code, chat_type, username, invite_link,
-         int(is_admin), now, now),
+        (
+            chat_id,
+            title,
+            short_code,
+            chat_type,
+            username,
+            invite_link,
+            int(is_admin),
+            now,
+            now,
+        ),
     )
 
 
@@ -249,9 +299,7 @@ async def upsert_template(
 
 
 async def get_template(keyword: str) -> Optional[aiosqlite.Row]:
-    return await _one(
-        "SELECT * FROM templates WHERE keyword=?", (keyword.lower(),)
-    )
+    return await _one("SELECT * FROM templates WHERE keyword=?", (keyword.lower(),))
 
 
 async def all_templates() -> list[aiosqlite.Row]:
@@ -384,15 +432,11 @@ async def set_order_status(order_id: str, status: str) -> None:
 
 
 async def find_order_link_by_invite(invite_link: str) -> Optional[aiosqlite.Row]:
-    return await _one(
-        "SELECT * FROM order_links WHERE invite_link=?", (invite_link,)
-    )
+    return await _one("SELECT * FROM order_links WHERE invite_link=?", (invite_link,))
 
 
 async def set_order_link_joined(link_id: int, user_id: int) -> None:
-    await _run(
-        "UPDATE order_links SET joined_user=? WHERE id=?", (user_id, link_id)
-    )
+    await _run("UPDATE order_links SET joined_user=? WHERE id=?", (user_id, link_id))
 
 
 async def set_order_link_revoked(link_id: int) -> None:
@@ -400,44 +444,102 @@ async def set_order_link_revoked(link_id: int) -> None:
 
 
 async def all_orders(limit: int = 20) -> list[aiosqlite.Row]:
-    return await _all(
-        "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+    return await _all("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,))
+
+
+# --- reservations (one exact invite link reserved for one paid user) ------
+async def add_reservation(
+    request_id: str,
+    keyword: str,
+    chat_id: int,
+    user_id: int,
+    invite_link: str,
+) -> bool:
+    """Persist the first link minted for this request/group.
+
+    Lease takeovers can briefly leave two workers creating the same reservation.
+    The first insert wins; a stale worker must never overwrite that link.
+    """
+    cur = await _db().execute(
+        """
+        INSERT OR IGNORE INTO reservations
+            (request_id, keyword, chat_id, user_id, invite_link, status,
+             created_at)
+        VALUES (?,?,?,?,?, 'pending', ?)
+        """,
+        (request_id, keyword, chat_id, user_id, invite_link, time.time()),
+    )
+    await _db().commit()
+    return cur.rowcount == 1
+
+
+async def reservation_for_request_group(
+    request_id: str, keyword: str, chat_id: int
+) -> Optional[aiosqlite.Row]:
+    return await _one(
+        "SELECT * FROM reservations WHERE request_id=? AND keyword=? AND chat_id=?",
+        (request_id, keyword, chat_id),
     )
 
 
-# --- bindings (one paid user reserved for one group's link) ---------------
-async def add_binding(chat_id: int, user_id: int, invite_link: str) -> None:
+async def reservation_for_join(
+    chat_id: int, user_id: int, invite_link: str
+) -> Optional[aiosqlite.Row]:
+    """Return only an exact pending chat+user+invite-link reservation."""
+    return await _one(
+        "SELECT * FROM reservations "
+        "WHERE chat_id=? AND user_id=? AND invite_link=? AND status='pending' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (chat_id, user_id, invite_link),
+    )
+
+
+async def active_reservation_by_link(
+    chat_id: int, invite_link: str
+) -> Optional[aiosqlite.Row]:
+    """Keep protecting a link while a successful approval awaits revocation."""
+    return await _one(
+        "SELECT * FROM reservations "
+        "WHERE chat_id=? AND invite_link=? "
+        "AND status IN ('pending', 'approving', 'approved_revoke_pending') "
+        "ORDER BY created_at DESC LIMIT 1",
+        (chat_id, invite_link),
+    )
+
+
+async def set_reservation_status(
+    reservation_id: int,
+    status: str,
+    error: str = "",
+) -> None:
+    now = time.time()
+    approved_at = now if status in {"approving", "approved_revoke_pending"} else None
+    revoked_at = now if status == "completed" else None
     await _run(
         """
-        INSERT INTO bindings (chat_id, user_id, invite_link, status, created_at)
-        VALUES (?,?,?, 'pending', ?)
-        ON CONFLICT(chat_id, user_id) DO UPDATE SET
-            invite_link=excluded.invite_link,
-            status='pending',
-            created_at=excluded.created_at
+        UPDATE reservations SET
+            status=?,
+            last_error=?,
+            approved_at=COALESCE(?, approved_at),
+            revoked_at=COALESCE(?, revoked_at)
+        WHERE id=?
         """,
-        (chat_id, user_id, invite_link, time.time()),
+        (status, error[:500], approved_at, revoked_at, reservation_id),
     )
 
 
-async def get_binding(chat_id: int, user_id: int) -> Optional[aiosqlite.Row]:
-    return await _one(
-        "SELECT * FROM bindings WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+async def reservations_for_request(request_id: str) -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM reservations WHERE request_id=? ORDER BY id",
+        (request_id,),
     )
 
 
-async def binding_by_link(invite_link: str) -> Optional[aiosqlite.Row]:
-    return await _one(
-        "SELECT * FROM bindings WHERE invite_link=? AND status='pending' "
-        "ORDER BY created_at DESC",
-        (invite_link,),
-    )
-
-
-async def set_binding_status(chat_id: int, user_id: int, status: str) -> None:
-    await _run(
-        "UPDATE bindings SET status=? WHERE chat_id=? AND user_id=?",
-        (status, chat_id, user_id),
+async def pending_reservation_revocations() -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM reservations "
+        "WHERE status IN ('approving', 'approved_revoke_pending') "
+        "ORDER BY approved_at, created_at"
     )
 
 

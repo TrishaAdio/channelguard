@@ -18,8 +18,8 @@ ROTATE_MINUTES = float(os.getenv("ROTATE_MINUTES", "5"))
 SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
 
 # --- Quick-reply updater (second userbot) ---------------------------------
-# Account that SENDS the invite link to the quick-reply userbot (usually the
-# guard account). Blank = accept links from any private chat.
+# Guard account that sends the rotating demo link. When blank, quickreply.py
+# accepts only the exact link published by local guard.py in data/demo_link.json.
 LINK_SOURCE_RAW = os.getenv("LINK_SOURCE", "")
 # The Business quick reply shortcut name to keep equal to the link.
 SHORTCUT = os.getenv("SHORTCUT", "demo")

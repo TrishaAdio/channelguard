@@ -2,6 +2,7 @@
 
 Run:  python -m bot           (from the repo root)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +26,7 @@ from aiogram.types import (
 )
 
 from . import config, db
-from .utils import render_template, truncate, unique_short_code
+from .utils import fold_fonts, render_template, truncate, unique_short_code
 
 # Shared link store (repo root). The bot writes every link it generates here so
 # the userbot can paste it into the payment "Thanks for paying" message.
@@ -41,6 +42,7 @@ def _remember(link: str | None, title: str = "", short: str = "") -> None:
             linkstore.save_link(link, title, short)
         except Exception:  # noqa: BLE001
             pass
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,12 +73,16 @@ def owner_only(message: Message) -> bool:
     )
 
 
-async def tell_owner(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+async def tell_owner(
+    text: str, reply_markup: Optional[InlineKeyboardMarkup] = None
+) -> None:
     """DM the owner, swallowing the 'owner never /started the bot' error."""
     try:
         await bot.send_message(config.OWNER_ID, text, reply_markup=reply_markup)
     except TelegramForbiddenError:
-        log.warning("Owner %s has not started the bot yet — can't DM them.", config.OWNER_ID)
+        log.warning(
+            "Owner %s has not started the bot yet — can't DM them.", config.OWNER_ID
+        )
     except Exception as e:  # noqa: BLE001
         log.error("Failed to DM owner: %s: %s", type(e).__name__, e)
 
@@ -123,13 +129,22 @@ async def create_single_use_link(chat_id: int) -> Optional[str]:
         return None
 
 
-async def revoke_link(chat_id: int, link: Optional[str]) -> None:
+async def revoke_link(chat_id: int, link: Optional[str]) -> bool:
+    """Revoke an invite link and report whether it is safely unusable."""
     if not link:
-        return
+        return True
     try:
         await bot.revoke_chat_invite_link(chat_id, link)
+        return True
+    except TelegramBadRequest as e:
+        detail = str(e).upper()
+        if "INVITE_HASH_EXPIRED" in detail or "INVITE HASH EXPIRED" in detail:
+            return True
+        log.warning("revoke_chat_invite_link failed for %s: %s", chat_id, e)
+        return False
     except Exception as e:  # noqa: BLE001
-        log.debug("revoke_chat_invite_link failed for %s: %s", chat_id, e)
+        log.warning("revoke_chat_invite_link failed for %s: %s", chat_id, e)
+        return False
 
 
 async def get_or_create_link(chat_id: int) -> Optional[str]:
@@ -176,8 +191,13 @@ async def on_my_chat_member(update: ChatMemberUpdated) -> None:
         await onboard_group(chat)
     elif status == ChatMemberStatus.MEMBER:
         await db.upsert_group(
-            chat.id, title, "", chat.type, getattr(chat, "username", None),
-            None, is_admin=False,
+            chat.id,
+            title,
+            "",
+            chat.type,
+            getattr(chat, "username", None),
+            None,
+            is_admin=False,
         )
         await db.log_event("added_no_admin", chat.id)
         await tell_owner(
@@ -201,14 +221,29 @@ async def onboard_group(chat) -> None:
     title = chat.title or chat.full_name or str(chat.id)
     prev = await db.get_group(chat.id)
     existing = await db.all_groups()
-    taken = [g["short_code"] for g in existing if g["chat_id"] != chat.id and g["short_code"]]
+    taken = [
+        g["short_code"] for g in existing if g["chat_id"] != chat.id and g["short_code"]
+    ]
     # Keep a previously assigned short code AND link stable across re-adds /
     # re-promotions — don't churn a link the owner may have already shared.
-    code = prev["short_code"] if prev and prev["short_code"] else unique_short_code(title, taken)
-    link = prev["invite_link"] if prev and prev["invite_link"] else await create_join_link(chat.id)
+    code = (
+        prev["short_code"]
+        if prev and prev["short_code"]
+        else unique_short_code(title, taken)
+    )
+    link = (
+        prev["invite_link"]
+        if prev and prev["invite_link"]
+        else await create_join_link(chat.id)
+    )
     await db.upsert_group(
-        chat.id, title, code, chat.type, getattr(chat, "username", None),
-        link, is_admin=True,
+        chat.id,
+        title,
+        code,
+        chat.type,
+        getattr(chat, "username", None),
+        link,
+        is_admin=True,
     )
     await db.log_event("added", chat.id, detail=code)
     _remember(link, title, code)
@@ -249,49 +284,82 @@ async def on_join_request(req: ChatJoinRequest) -> None:
 
     title = chat.title or str(chat.id)
 
-    # (1) This user was reserved for this group (CP:USERID) -> approve ONLY them,
-    # then revoke the link so it can't be reused.
-    binding = await db.get_binding(chat.id, user.id)
-    if binding and binding["status"] == "pending":
+    # Auto-approval requires an exact chat + user + invite-link reservation.
+    # A buyer using a general link (or another reservation) is never approved.
+    reservation = None
+    if used_link:
+        reservation = await db.reservation_for_join(chat.id, user.id, used_link)
+    if reservation:
+        # Persist before Telegram approval. If the process dies after Telegram
+        # accepts the approval, the retry loop sees `approving` and burns the
+        # link rather than leaving it reusable.
+        await db.set_reservation_status(reservation["id"], "approving")
         try:
             await bot.approve_chat_join_request(chat.id, user.id)
-            await db.set_binding_status(chat.id, user.id, "approved")
-            await db.set_join_status(chat.id, user.id, "approved")
-            await revoke_link(chat.id, binding["invite_link"])
-            await db.log_event("bind_approved", chat.id, user.id)
-            await tell_owner(
-                f"Approved reserved user for <b>{esc(title)}</b>\n"
-                f"<blockquote><code>{user.id}</code> — link revoked</blockquote>"
-            )
         except Exception as e:  # noqa: BLE001
-            await tell_owner(f"Auto-approve failed for <code>{user.id}</code>: {esc(e)}")
+            # Telegram failures can be ambiguous (request applied, response
+            # lost), so fence the link and revoke it instead of returning it to
+            # pending state.
+            await db.set_reservation_status(
+                reservation["id"],
+                "approved_revoke_pending",
+                f"approve uncertain: {type(e).__name__}: {e}",
+            )
+            if await revoke_link(chat.id, used_link):
+                await db.set_reservation_status(reservation["id"], "completed")
+            await tell_owner(
+                f"Auto-approve failed for <code>{user.id}</code>: {esc(e)}"
+            )
+            return
+
+        await db.set_join_status(chat.id, user.id, "approved")
+        await db.set_reservation_status(reservation["id"], "approved_revoke_pending")
+        revoked = await revoke_link(chat.id, used_link)
+        if revoked:
+            await db.set_reservation_status(reservation["id"], "completed")
+            await db.log_event("reservation_completed", chat.id, user.id)
+            state = "link revoked"
+        else:
+            await db.set_reservation_status(
+                reservation["id"],
+                "approved_revoke_pending",
+                "revoke failed; retry scheduled",
+            )
+            await db.log_event("reservation_revoke_pending", chat.id, user.id)
+            state = "revocation pending"
+        await tell_owner(
+            f"Approved reserved user for <b>{esc(title)}</b>\n"
+            f"<blockquote><code>{user.id}</code> — {state}</blockquote>"
+        )
         return
 
-    # (2) Someone else tried a link reserved for a specific user -> decline them.
+    # Any active reservation link remains protected, including while a failed
+    # revocation is being retried.
     if used_link:
-        reserved = await db.binding_by_link(used_link)
+        reserved = await db.active_reservation_by_link(chat.id, used_link)
         if reserved and reserved["user_id"] != user.id:
             try:
                 await bot.decline_chat_join_request(chat.id, user.id)
                 await db.set_join_status(chat.id, user.id, "declined")
                 await tell_owner(
-                    f"Declined <code>{user.id}</code> — that link is reserved for "
-                    f"<code>{reserved['user_id']}</code> in <b>{esc(title)}</b>."
+                    f"Declined <code>{user.id}</code> for <b>{esc(title)}</b>."
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("reserved-link decline failed: %s", e)
             return
 
     uname = f"@{username}" if username else "no username"
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="Approve", callback_data=f"jr:a:{chat.id}:{user.id}"
-            ),
-            InlineKeyboardButton(
-                text="Decline", callback_data=f"jr:d:{chat.id}:{user.id}"
-            ),
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Approve", callback_data=f"jr:a:{chat.id}:{user.id}"
+                ),
+                InlineKeyboardButton(
+                    text="Decline", callback_data=f"jr:d:{chat.id}:{user.id}"
+                ),
+            ]
+        ]
     )
     await tell_owner(
         f"Join request — <b>{esc(title)}</b>\n"
@@ -493,19 +561,27 @@ async def cmd_doctor(message: Message) -> None:
 
     # Shared link store (the userbot bridge).
     if linkstore is None:
-        out.append("Shared store: <b>MISSING</b> — start the bot from the repo "
-                   "root (<code>python -m bot</code>) so it can import linkstore.")
+        out.append(
+            "Shared store: <b>MISSING</b> — start the bot from the repo "
+            "root (<code>python -m bot</code>) so it can import linkstore."
+        )
     else:
         try:
             linkstore.request_link("__doctor__", 1)
-            out.append(f"Shared store: <b>OK</b> <code>{esc(str(linkstore.STORE))}</code>")
+            out.append(
+                f"Shared store: <b>OK</b> <code>{esc(str(linkstore.STORE))}</code>"
+            )
         except Exception as e:  # noqa: BLE001
-            out.append(f"Shared store: <b>WRITE FAILED</b> {esc(type(e).__name__)}: {esc(e)}")
+            out.append(
+                f"Shared store: <b>WRITE FAILED</b> {esc(type(e).__name__)}: {esc(e)}"
+            )
 
     groups = await db.all_groups()
     if not groups:
-        out.append("No groups known yet. Add me to a group as admin (while I'm "
-                   "running) so I receive the event.")
+        out.append(
+            "No groups known yet. Add me to a group as admin (while I'm "
+            "running) so I receive the event."
+        )
     for g in groups[:15]:
         label = f"<code>{esc(g['short_code'] or '-')}</code> {esc(truncate(g['title'], 24))}"
         try:
@@ -513,7 +589,9 @@ async def cmd_doctor(message: Message) -> None:
             status = str(mem.status)
             can_invite = getattr(mem, "can_invite_users", None)
         except Exception as e:  # noqa: BLE001
-            out.append(f"{label} — can't read my membership: {esc(type(e).__name__)}: {esc(e)}")
+            out.append(
+                f"{label} — can't read my membership: {esc(type(e).__name__)}: {esc(e)}"
+            )
             continue
         # The real test: can I actually mint an approval link here?
         try:
@@ -524,8 +602,11 @@ async def cmd_doctor(message: Message) -> None:
             link_note = "<b>link OK</b>"
         except Exception as e:  # noqa: BLE001
             link_note = f"<b>link FAIL</b> {esc(type(e).__name__)}: {esc(e)}"
-        invite_flag = "" if can_invite is None else (
-            " can_invite" if can_invite else " <b>NO invite right</b>")
+        invite_flag = (
+            ""
+            if can_invite is None
+            else (" can_invite" if can_invite else " <b>NO invite right</b>")
+        )
         out.append(f"{label} — {esc(status)}{invite_flag} — {link_note}")
 
     await message.answer("\n".join(out)[:4000])
@@ -578,7 +659,6 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
             )
             continue
         await db.add_order_link(order_id, g["chat_id"], link)
-        _remember(link, g["title"], g["short_code"])
         rendered = render_template(
             body,
             {
@@ -674,16 +754,18 @@ async def cmd_pending(message: Message) -> None:
         title = g["title"] if g else str(r["chat_id"])
         uname = f"@{r['username']}" if r["username"] else "no username"
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="Approve",
-                    callback_data=f"jr:a:{r['chat_id']}:{r['user_id']}",
-                ),
-                InlineKeyboardButton(
-                    text="Decline",
-                    callback_data=f"jr:d:{r['chat_id']}:{r['user_id']}",
-                ),
-            ]]
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Approve",
+                        callback_data=f"jr:a:{r['chat_id']}:{r['user_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Decline",
+                        callback_data=f"jr:d:{r['chat_id']}:{r['user_id']}",
+                    ),
+                ]
+            ]
         )
         await message.answer(
             f"<b>{esc(title)}</b>\n"
@@ -746,8 +828,9 @@ async def _remove_user(message: Message, ident: str) -> None:
             kicked += 1
         except Exception:  # noqa: BLE001
             pass
-    await db.log_event("remove_user", user_id=user_id,
-                       detail=f"declined={declined} kicked={kicked}")
+    await db.log_event(
+        "remove_user", user_id=user_id, detail=f"declined={declined} kicked={kicked}"
+    )
     await message.answer(
         f"User <code>{user_id}</code>: declined {declined} request(s), "
         f"removed from {kicked} group(s)."
@@ -772,18 +855,24 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
 
     links = await db.order_links(order_id)
     revoked = banned = 0
-    for l in links:
-        if not l["revoked"]:
-            await revoke_link(l["chat_id"], l["invite_link"])
-            await db.set_order_link_revoked(l["id"])
+    for order_link in links:
+        if not order_link["revoked"]:
+            await revoke_link(order_link["chat_id"], order_link["invite_link"])
+            await db.set_order_link_revoked(order_link["id"])
         revoked += 1
-        if l["joined_user"]:
+        if order_link["joined_user"]:
             try:
-                await bot.ban_chat_member(l["chat_id"], l["joined_user"])
+                await bot.ban_chat_member(
+                    order_link["chat_id"], order_link["joined_user"]
+                )
                 banned += 1
             except Exception as e:  # noqa: BLE001
-                log.warning("ban failed for %s in %s: %s",
-                            l["joined_user"], l["chat_id"], e)
+                log.warning(
+                    "ban failed for %s in %s: %s",
+                    order_link["joined_user"],
+                    order_link["chat_id"],
+                    e,
+                )
     await db.set_order_status(order_id, "revoked")
     await db.log_event("order_revoke", detail=f"{order_id} banned={banned}")
     await message.answer(
@@ -832,10 +921,15 @@ async def bind_user_to_group(message: Message, query: str, user_id: int) -> None
     """Mint an approval-required link for the matched group and reserve it for a
     single user id: only that user is auto-approved (then the link is revoked)."""
     if not query:
-        await message.answer("Usage: <code>&lt;group&gt;:&lt;userid&gt;</code>  e.g. <code>cp:7406804576</code>")
+        await message.answer(
+            "Usage: <code>&lt;group&gt;:&lt;userid&gt;</code>  e.g. <code>cp:7406804576</code>"
+        )
         return
-    groups = (await db.all_groups(admin_only=True)) if query.lower() == "all" \
+    groups = (
+        (await db.all_groups(admin_only=True))
+        if query.lower() == "all"
         else await db.find_groups(query)
+    )
     if not groups:
         await message.answer(
             f"No group matches <code>{esc(query)}</code>. Try <code>/groups</code>."
@@ -849,10 +943,9 @@ async def bind_user_to_group(message: Message, query: str, user_id: int) -> None
             "Users right there.</blockquote>"
         )
         return
-    await db.set_group_link(g["chat_id"], link)
-    await db.add_binding(g["chat_id"], user_id, link)
-    _remember(link, g["title"], g["short_code"])
-    await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
+    request_id = f"manual-{message.chat.id}-{message.message_id}"
+    await db.add_reservation(request_id, query, g["chat_id"], user_id, link)
+    await db.log_event("reservation_created", g["chat_id"], user_id, query)
     await message.answer(
         f"<b>{esc(g['title'])}</b>\n"
         f"<blockquote>Reserved for <code>{user_id}</code> — only they are "
@@ -935,98 +1028,277 @@ async def on_error(event) -> bool:
 
 
 # --------------------------------------------------------------------------
-# lifecycle
+# lifecycle and userbot reservation bridge
 # --------------------------------------------------------------------------
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _start_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def on_startup() -> None:
     await db.init()
-    # Drop any leftover webhook so long-polling actually receives updates.
     try:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception as e:  # noqa: BLE001
         log.debug("delete_webhook: %s", e)
     me = await bot.get_me()
     log.info("Started as @%s (id %s). OWNER_ID=%s", me.username, me.id, config.OWNER_ID)
-    log.info("Commands are DM-only. If yours are ignored, DM the bot /id and "
-             "check the owner match.")
+    log.info(
+        "Commands are DM-only. If yours are ignored, DM the bot /id and "
+        "check the owner match."
+    )
     await tell_owner(
         f"<b>ChannelGuard online</b> as @{esc(me.username)}.\n"
         "<blockquote>Add me as admin to a group to begin. "
         "Send <code>/help</code> for commands.</blockquote>"
     )
     if linkstore is not None:
-        asyncio.create_task(reservation_poller())
+        _start_background(reservation_poller())
         log.info("Reservation poller started (userbot /add bridge).")
+    _start_background(revocation_retry_loop())
 
 
-async def _fulfill_reservation(rid: str, query: str, user_id: int) -> None:
-    """Turn a userbot reservation request into reserved link(s).
+async def _groups_for_keyword(query: str):
+    """Resolve one keyword deterministically; reject ambiguous substring hits."""
+    query = query.strip()
+    if query.lower() == "all":
+        return await db.all_groups(admin_only=True), ""
+    matches = await db.find_groups(query)
+    if not matches:
+        return [], "no matching admin group"
+    folded = fold_fonts(query).casefold()
+    exact = [
+        group
+        for group in matches
+        if fold_fonts(group["short_code"] or "").casefold() == folded
+    ]
+    if len(exact) == 1:
+        return exact, ""
+    if len(matches) == 1:
+        return matches, ""
+    names = ", ".join(str(group["title"]) for group in matches[:4])
+    return [], f"ambiguous match: {names}"
 
-    'all' reserves EVERY group the bot admins; any other keyword reserves the
-    single best-matching group. Each reserved group is bound to the user, and
-    all resulting links are published back as a list."""
-    if not query or not user_id:
-        linkstore.put_result(rid, [])
-        return
-    if query.strip().lower() == "all":
-        groups = await db.all_groups(admin_only=True)
-    else:
-        groups = (await db.find_groups(query))[:1]  # best match per keyword
-    if not groups:
-        linkstore.put_result(rid, [])
-        await tell_owner(
-            f"Reservation from userbot: no group matches <code>{esc(query)}</code> "
-            f"for <code>{user_id}</code>."
+
+async def _cancel_request_reservations(rid: str) -> None:
+    """Revoke links minted for a request explicitly cancelled by its caller."""
+    for reservation in await db.reservations_for_request(rid):
+        if reservation["status"] not in {"pending", "approving"}:
+            continue
+        if await revoke_link(reservation["chat_id"], reservation["invite_link"]):
+            await db.set_reservation_status(reservation["id"], "cancelled")
+        else:
+            await db.set_reservation_status(
+                reservation["id"],
+                "approved_revoke_pending",
+                "cancelled request; revoke retry scheduled",
+            )
+
+
+async def _fulfill_reservation(
+    rid: str, queries, user_id: int, lease_token: str
+) -> None:
+    """Have the bot resolve every keyword and mint buyer-bound join links."""
+    clean_queries = []
+    seen_queries = set()
+    for raw in queries or []:
+        query = str(raw).strip()
+        key = query.casefold()
+        if query and key not in seen_queries:
+            seen_queries.add(key)
+            clean_queries.append(query)
+    if not clean_queries or not user_id:
+        linkstore.put_result(
+            rid,
+            [],
+            [{"keyword": "request", "reason": "invalid request"}],
+            lease_token,
         )
         return
 
     entries = []
-    for g in groups:
-        link = await create_join_link(g["chat_id"])
-        if not link:
+    failures = []
+    selected_chats = set()
+    for query in clean_queries:
+        if linkstore.is_request_cancelled(rid):
+            await _cancel_request_reservations(rid)
+            return
+        if not linkstore.renew_request(rid, lease_token):
+            return
+        groups, reason = await _groups_for_keyword(query)
+        if not groups:
+            failures.append({"keyword": query, "reason": reason})
             continue
-        await db.set_group_link(g["chat_id"], link)
-        await db.add_binding(g["chat_id"], user_id, link)
-        _remember(link, g["title"], g["short_code"])
-        await db.log_event("bind", g["chat_id"], user_id, g["short_code"])
-        entries.append({"link": link, "title": g["title"]})
 
-    linkstore.put_result(rid, entries)
+        made_for_query = 0
+        for group in groups:
+            chat_id = group["chat_id"]
+            if linkstore.is_request_cancelled(rid):
+                await _cancel_request_reservations(rid)
+                return
+            if not linkstore.renew_request(rid, lease_token):
+                return
+            if chat_id in selected_chats:
+                continue
+            selected_chats.add(chat_id)
+
+            existing = await db.reservation_for_request_group(rid, query, chat_id)
+            if existing:
+                if existing["status"] == "pending":
+                    link = existing["invite_link"]
+                else:
+                    failures.append(
+                        {
+                            "keyword": query,
+                            "reason": f"reservation is {existing['status']}",
+                        }
+                    )
+                    continue
+            else:
+                link = await create_join_link(chat_id)
+                if not link:
+                    failures.append(
+                        {
+                            "keyword": query,
+                            "reason": f"could not create link for {group['title']}",
+                        }
+                    )
+                    continue
+                if linkstore.is_request_cancelled(rid):
+                    await revoke_link(chat_id, link)
+                    await _cancel_request_reservations(rid)
+                    return
+                if not linkstore.renew_request(rid, lease_token):
+                    await revoke_link(chat_id, link)
+                    return
+                try:
+                    inserted = await db.add_reservation(
+                        rid, query, chat_id, user_id, link
+                    )
+                except Exception:
+                    await revoke_link(chat_id, link)
+                    raise
+                if not inserted:
+                    # A lease successor/predecessor won the insert race. Revoke
+                    # only this worker's duplicate and converge on the stored
+                    # link; never overwrite or revoke the winner's reservation.
+                    await revoke_link(chat_id, link)
+                    existing = await db.reservation_for_request_group(
+                        rid, query, chat_id
+                    )
+                    if not existing or existing["status"] != "pending":
+                        failures.append(
+                            {
+                                "keyword": query,
+                                "reason": "reservation race could not be reconciled",
+                            }
+                        )
+                        continue
+                    link = existing["invite_link"]
+                else:
+                    await db.log_event("reservation_created", chat_id, user_id, query)
+
+            entries.append(
+                {
+                    "link": link,
+                    "title": group["title"],
+                    "keyword": query,
+                }
+            )
+            made_for_query += 1
+
+        if not made_for_query and not any(
+            failure["keyword"] == query for failure in failures
+        ):
+            failures.append({"keyword": query, "reason": "duplicate group"})
+
+    if linkstore.is_request_cancelled(rid):
+        await _cancel_request_reservations(rid)
+        return
+    if not linkstore.renew_request(rid, lease_token):
+        return
+    if not linkstore.put_result(rid, entries, failures, lease_token):
+        if linkstore.is_request_cancelled(rid):
+            await _cancel_request_reservations(rid)
+        return
     if entries:
-        names = ", ".join(esc(e["title"]) for e in entries)
+        names = ", ".join(esc(entry["title"]) for entry in entries)
         await tell_owner(
-            f"Reserved {len(entries)} group(s) for <code>{user_id}</code> "
-            f"(userbot /add): {names}\n"
-            "<blockquote>Only they are approved on join, then each link is "
-            "revoked</blockquote>"
+            f"Reserved {len(entries)} group(s) for <code>{user_id}</code>: {names}"
         )
-    else:
-        await tell_owner(
-            f"Matched <code>{esc(query)}</code> but couldn't create any link "
-            "(need the Invite Users right there)."
-        )
+    if failures:
+        failed = ", ".join(esc(item["keyword"]) for item in failures)
+        await tell_owner(f"Reservation failed for: <code>{failed}</code>")
 
 
 async def reservation_poller() -> None:
-    """Watch the shared file for userbot reservation requests and fulfill them."""
-    seen: set[str] = set()
+    """Lease bridge requests, retry transient failures, and publish results."""
     while True:
         try:
-            for req in linkstore.pending_requests():
-                rid = req.get("id")
-                if not rid or rid in seen or linkstore.has_result(rid):
-                    if rid:
-                        seen.add(rid)
+            # Cancellation is durable in the bridge store. Cleaning it here as
+            # well as in the active worker closes the crash gap where a worker
+            # dies after persisting a reservation but before observing cancel.
+            for rid in linkstore.cancelled_request_ids():
+                await _cancel_request_reservations(rid)
+            for req in linkstore.claim_requests():
+                rid = str(req.get("id", ""))
+                lease_token = str(req.get("lease_token", ""))
+                if not rid or not lease_token:
                     continue
-                seen.add(rid)
-                await _fulfill_reservation(
-                    rid, str(req.get("query", "")), int(req.get("user_id", 0) or 0)
-                )
+                if linkstore.has_result(rid):
+                    linkstore.complete_request(rid, lease_token)
+                    continue
+                queries = req.get("queries") or [req.get("query", "")]
+                try:
+                    await _fulfill_reservation(
+                        rid,
+                        queries,
+                        int(req.get("user_id", 0) or 0),
+                        lease_token,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    linkstore.release_request(
+                        rid, lease_token, f"{type(e).__name__}: {e}"
+                    )
+                    log.warning(
+                        "reservation %s failed; queued for retry: %s: %s",
+                        rid,
+                        type(e).__name__,
+                        e,
+                    )
         except Exception as e:  # noqa: BLE001
             log.warning("reservation poller error: %s: %s", type(e).__name__, e)
         await asyncio.sleep(1.5)
 
 
+async def revocation_retry_loop() -> None:
+    """Keep approved reservation links protected until revocation succeeds."""
+    while True:
+        try:
+            for reservation in await db.pending_reservation_revocations():
+                if await revoke_link(
+                    reservation["chat_id"], reservation["invite_link"]
+                ):
+                    await db.set_reservation_status(reservation["id"], "completed")
+                    await db.log_event(
+                        "reservation_completed",
+                        reservation["chat_id"],
+                        reservation["user_id"],
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.warning("revocation retry error: %s: %s", type(e).__name__, e)
+        await asyncio.sleep(20)
+
+
 async def on_shutdown() -> None:
+    for task in list(_background_tasks):
+        task.cancel()
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
     await db.close()
     await bot.session.close()
 
