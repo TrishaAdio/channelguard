@@ -57,6 +57,9 @@ GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "n
 ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 
 # --- Payment logger (quickreply.py extension) -----------------------------
+# Persistent fallback for the payment upload channel. ``.setchannel`` writes
+# this automatically, while data/pay.json remains the live runtime store.
+PAYMENT_CHANNEL_RAW = os.getenv("PAYMENT_CHANNEL", "")
 # Revenue split for the {rioshare}/{marco} caption parameters.
 RIO_PCT = _float("RIO_PCT", 55.0, minimum=0.0)
 MARCO_PCT = _float("MARCO_PCT", 45.0, minimum=0.0)
@@ -103,6 +106,10 @@ def owner():
 
 def link_source():
     return coerce(LINK_SOURCE_RAW)
+
+
+def payment_channel():
+    return coerce(PAYMENT_CHANNEL_RAW)
 
 
 def save_env(updates: dict) -> None:
