@@ -8,14 +8,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", "0"))
+
+def _int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int((os.getenv(name, "") or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value) if minimum is not None else value
+
+
+def _float(name: str, default: float, minimum: float | None = None) -> float:
+    try:
+        value = float((os.getenv(name, "") or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value) if minimum is not None else value
+
+
+API_ID = _int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "")
 CHANNEL_RAW = os.getenv("CHANNEL", "")
 OWNER_RAW = os.getenv("OWNER", "")
-ROTATE_MINUTES = float(os.getenv("ROTATE_MINUTES", "5"))
+ROTATE_MINUTES = _float("ROTATE_MINUTES", 5.0, minimum=0.1)
 # Security sweep: kick all non-admin members on startup and every N minutes.
 # 0 disables the recurring sweep (the startup sweep still runs).
-SWEEP_MINUTES = float(os.getenv("SWEEP_MINUTES", "5"))
+SWEEP_MINUTES = _float("SWEEP_MINUTES", 5.0, minimum=0.0)
 
 # --- Quick-reply updater (second userbot) ---------------------------------
 # Guard account that sends the rotating demo link. When blank, quickreply.py
@@ -37,12 +54,12 @@ SWAP_GREETING = os.getenv("SWAP_GREETING", "0").strip().lower() not in ("0", "fa
 GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "no", "")
 # A manual outgoing message means the owner is active for this long. Telegram's
 # live UserStatusOnline is checked too; this window covers delayed status updates.
-ONLINE_MINUTES = max(0.0, float(os.getenv("ONLINE_MINUTES", "2")))
+ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 
 # --- Payment logger (quickreply.py extension) -----------------------------
 # Revenue split for the {rioshare}/{marco} caption parameters.
-RIO_PCT = float(os.getenv("RIO_PCT", "55"))
-MARCO_PCT = float(os.getenv("MARCO_PCT", "45"))
+RIO_PCT = _float("RIO_PCT", 55.0, minimum=0.0)
+MARCO_PCT = _float("MARCO_PCT", 45.0, minimum=0.0)
 # What {rioshare}/{marco} are computed from:
 #   today       -> that % of the TOTAL amount received so far today
 #   transaction -> that % of THIS single payment's amount
@@ -54,7 +71,7 @@ TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
 # {orderid} template parameter: a prefix followed by a random suffix, generated
 # once per payment (e.g. ANI7F3K9Q). Configure the prefix and suffix length.
 ORDER_PREFIX = os.getenv("ORDER_PREFIX", "ANI")
-ORDER_ID_LENGTH = max(3, int(os.getenv("ORDER_ID_LENGTH", "6")))
+ORDER_ID_LENGTH = _int("ORDER_ID_LENGTH", 6, minimum=3)
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session

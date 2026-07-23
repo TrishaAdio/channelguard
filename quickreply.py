@@ -56,6 +56,7 @@ import time
 import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -230,6 +231,17 @@ def _acquire_single_instance_lock() -> bool:
     return True
 
 
+def _write_small_json(path, data) -> None:
+    """Atomically persist small state files used by the greeting handlers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
 def _load_greeted() -> set[int]:
     if config.GREETED_FILE.exists():
         try:
@@ -240,7 +252,7 @@ def _load_greeted() -> set[int]:
 
 
 def _save_greeted() -> None:
-    config.GREETED_FILE.write_text(json.dumps(sorted(_greeted)))
+    _write_small_json(config.GREETED_FILE, sorted(_greeted))
 
 
 def _load_greeting():
@@ -256,8 +268,9 @@ def _load_greeting():
 
 
 def _save_greeting(chat_id: int, message_id: int) -> None:
-    config.GREETING_FILE.write_text(
-        json.dumps({"chat_id": int(chat_id), "message_id": int(message_id)})
+    _write_small_json(
+        config.GREETING_FILE,
+        {"chat_id": int(chat_id), "message_id": int(message_id)},
     )
 
 
@@ -582,21 +595,16 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
             continue
         payment = dict(raw)
         try:
-            amount = float(payment.get("amount"))
+            amount = parse_amount(payment.get("amount"))
             ts = float(payment.get("ts"))
-            if (
-                not math.isfinite(amount)
-                or amount <= 0
-                or amount > 1_000_000_000_000_000
-                or not math.isfinite(ts)
-            ):
+            if not math.isfinite(ts):
                 raise ValueError
             # Finite floats can still be outside the platform datetime range.
             datetime.fromtimestamp(ts, _TZ)
-        except (TypeError, ValueError, OverflowError, OSError):
+        except (TypeError, ValueError, InvalidOperation, OverflowError, OSError):
             repairs.append(f"payment #{index + 1} skipped (invalid amount/time)")
             continue
-        payment["amount"] = amount
+        payment["amount"] = format(amount, "f")
         payment["ts"] = ts
         payment["name"] = str(payment.get("name") or "")
         if "order_id" in payment:
@@ -697,12 +705,41 @@ def _todays_payments() -> list:
     ]
 
 
+_CENT = Decimal("0.01")
+_MAX_AMOUNT = Decimal("1000000000000000")
+
+
+def parse_amount(raw: str) -> Decimal:
+    """Parse one positive, finite INR amount and round it to paise."""
+    cleaned = str(raw).replace(",", "").replace("\u20b9", "").strip()
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation as error:
+        raise ValueError("invalid amount") from error
+    if not value.is_finite() or value <= 0 or value > _MAX_AMOUNT:
+        raise ValueError("amount must be positive and finite")
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _money(value) -> Decimal:
+    """Normalize trusted stored/calculated money without accepting NaN/Inf."""
+    value = Decimal(str(value)).quantize(_CENT, rounding=ROUND_HALF_UP)
+    if not value.is_finite():
+        raise ValueError("non-finite money value")
+    return value
+
+
+def _payment_total(payments) -> Decimal:
+    return sum((_money(payment["amount"]) for payment in payments), Decimal("0.00"))
+
+
 def fmt_inr(value) -> str:
-    """Format a number with the Rupee sign and Indian digit grouping."""
+    """Format exact money with the Rupee sign and Indian digit grouping."""
+    value = _money(value)
     neg = value < 0
-    value = abs(float(value))
+    value = abs(value)
     whole = int(value)
-    frac = round(value - whole, 2)
+    paise = int((value - Decimal(whole)) * 100)
 
     s = str(whole)
     if len(s) > 3:
@@ -718,14 +755,10 @@ def fmt_inr(value) -> str:
     else:
         grouped = s
 
-    out = "\u20b9" + grouped  # rupee sign
-    if frac > 0:
-        out += ("%.2f" % frac)[1:]  # ".50"
+    out = "\u20b9" + grouped
+    if paise:
+        out += f".{paise:02d}"
     return ("-" if neg else "") + out
-
-
-def parse_amount(raw: str) -> float:
-    return float(str(raw).replace(",", "").replace("\u20b9", "").strip())
 
 
 # {orderid} suffix uses an unambiguous alphabet (no 0/O/1/I) so IDs are easy to
@@ -750,18 +783,19 @@ def _generate_order_id() -> str:
     return prefix + "".join(random.choices(_ORDER_ALPHABET, k=length + 4))
 
 
-def _pay_mapping(amount: float, name: str, order_id: str = "",
+def _pay_mapping(amount: Decimal, name: str, order_id: str = "",
                  include_current: bool = False, link: str = "") -> dict:
+    amount = _money(amount)
     day = _todays_payments()
-    today_total = sum(p["amount"] for p in day)
+    today_total = _payment_total(day)
     today_count = len(day)
     if include_current:
         today_total += amount
         today_count += 1
 
     base = today_total if config.SHARE_BASE == "today" else amount
-    rio = base * config.RIO_PCT / 100.0
-    marco = base * config.MARCO_PCT / 100.0
+    rio = base * Decimal(str(config.RIO_PCT)) / Decimal("100")
+    marco = base * Decimal(str(config.MARCO_PCT)) / Decimal("100")
 
     return {
         "{amount}": fmt_inr(amount),
@@ -875,7 +909,7 @@ async def _resolve_template(kind: str):
     return text, []
 
 
-async def _render(kind: str, amount: float, name: str, order_id: str = "",
+async def _render(kind: str, amount: Decimal, name: str, order_id: str = "",
                   include_current: bool = False, link: str = ""):
     """Render a payment template using only its explicit bot reservation link.
 
@@ -916,16 +950,20 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
         pass
 
 
-async def _reserve_links(keywords, user_id: int, timeout: float = 45.0) -> dict:
-    """Send all group keywords to the bot in one durable bridge request."""
-    empty = {"entries": [], "failures": []}
+async def _reserve_links(
+    keywords, user_id: int, request_key: str, timeout: float = 45.0
+) -> dict:
+    """Send one idempotent reservation request to the admin bot."""
+    empty = {"request_id": "", "entries": [], "failures": []}
     if linkstore is None:
         return {
             "entries": [],
             "failures": [{"keyword": "bridge", "reason": "bridge unavailable"}],
         }
     try:
-        rid = linkstore.request_links(keywords, int(user_id))
+        rid = linkstore.request_links(
+            keywords, int(user_id), request_key=request_key
+        )
     except Exception as e:  # noqa: BLE001
         return {
             "entries": [],
@@ -937,11 +975,13 @@ async def _reserve_links(keywords, user_id: int, timeout: float = 45.0) -> dict:
             result = linkstore.get_result_details(rid)
             if result is not None:
                 return {
+                    "request_id": rid,
                     "entries": list(result.get("entries") or []),
                     "failures": list(result.get("failures") or []),
                 }
         except Exception as e:  # noqa: BLE001
             return {
+                "request_id": rid,
                 "entries": [],
                 "failures": [{"keyword": "bridge", "reason": str(e)}],
             }
@@ -952,11 +992,13 @@ async def _reserve_links(keywords, user_id: int, timeout: float = 45.0) -> dict:
             result = linkstore.get_result_details(rid)
             if result is not None:
                 return {
+                    "request_id": rid,
                     "entries": list(result.get("entries") or []),
                     "failures": list(result.get("failures") or []),
                 }
     except Exception:  # noqa: BLE001
         pass
+    empty["request_id"] = rid
     empty["failures"].append({
         "keyword": "bridge", "reason": "bot response timed out"
     })
@@ -983,7 +1025,7 @@ def _build_link_block(entries: list):
     return block, ents
 
 
-async def _render_multi(kind: str, amount: float, name: str, order_id: str,
+async def _render_multi(kind: str, amount: Decimal, name: str, order_id: str,
                         entries: list, include_current: bool = False):
     """Render a template but put the numbered/bold/blockquoted link block where
     {link} is (or append it if the template has no {link})."""
@@ -1068,6 +1110,42 @@ async def _edit_rich(event, text, ents):
     return 0
 
 
+async def _cancel_reserved_links(request_id: str) -> None:
+    """Ask the admin bot to revoke every link minted for a failed payment."""
+    if not request_id or linkstore is None:
+        return
+    try:
+        linkstore.cancel_request(request_id, force=True)
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            f"Reservation cleanup could not be queued: "
+            f"{type(error).__name__}: {error}"
+        )
+
+
+async def _fail_payment(event, payment: dict, request_id: str, message: str) -> None:
+    payment["status"] = "failed"
+    payment["error"] = message[:500]
+    _save_pay()
+    await _cancel_reserved_links(request_id)
+    await _ack(event, message)
+
+
+async def _recover_pending_payments() -> None:
+    """Fail closed after an interrupted /add and revoke its reserved links."""
+    changed = False
+    for payment in _pay.get("payments", []):
+        if payment.get("status") != "pending":
+            continue
+        payment["status"] = "failed"
+        payment["error"] = "interrupted before receipt completion"
+        await _cancel_reserved_links(payment.get("reservation_request_id", ""))
+        changed = True
+    if changed:
+        _save_pay()
+        ui.warn("Recovered interrupted payment command(s); reserved links queued for revocation.")
+
+
 async def cmd_add(event) -> None:
     """/add <amount> <name> <keyword...> — run in the payer's DM (or reply to them).
 
@@ -1087,7 +1165,23 @@ async def cmd_add(event) -> None:
     try:
         amount = parse_amount(amount_raw)
     except ValueError:
-        await _ack(event, f"Amount '{amount_raw}' is not a valid number.")
+        await _ack(event, f"Amount '{amount_raw}' is not a positive number.")
+        return
+
+    command_key = _command_identity(event)
+    existing_payment = next(
+        (
+            payment for payment in reversed(_pay.get("payments", []))
+            if payment.get("command_key") == command_key
+            and payment.get("status") in {"pending", "valid", "untracked"}
+        ),
+        None,
+    )
+    if existing_payment:
+        await _ack(
+            event,
+            f"Payment already recorded — {existing_payment.get('order_id', '')}",
+        )
         return
 
     reply = await event.get_reply_message()
@@ -1098,6 +1192,7 @@ async def cmd_add(event) -> None:
     entries = []
     failures = []
     payer_id = None
+    request_id = ""
     if keywords:
         if reply and getattr(reply, "sender_id", None) and reply.sender_id != _state["self_id"]:
             payer_id = reply.sender_id
@@ -1116,7 +1211,10 @@ async def cmd_add(event) -> None:
             + f"asking bot: {' '.join(keywords)} -> {payer_id}",
             flush=True,
         )
-        result = await _reserve_links(keywords, int(payer_id))
+        result = await _reserve_links(
+            keywords, int(payer_id), request_key=command_key
+        )
+        request_id = result.get("request_id", "")
         failures = result["failures"]
         seen_links = set()
         for entry in result["entries"]:
@@ -1129,6 +1227,7 @@ async def cmd_add(event) -> None:
                 f"{item.get('keyword')}: {item.get('reason')}"
                 for item in failures
             ) or "no links returned"
+            await _cancel_reserved_links(request_id)
             await _ack(event, f"No group links: {detail}")
             return
         print(ui.green("[reserve] ") + f"got {len(entries)} link(s)", flush=True)
@@ -1139,9 +1238,43 @@ async def cmd_add(event) -> None:
         return
 
     order_id = _generate_order_id()
+    try:
+        if entries:
+            us_text, us_ents = await _render_multi(
+                "done", amount, accname, order_id, entries
+            )
+        else:
+            us_text, us_ents = await _render(
+                "done", amount, accname, order_id=order_id, link=""
+            )
+        ch_text = ch_ents = None
+        if has_media and _pay.get("post_channel"):
+            if entries:
+                ch_text, ch_ents = await _render_multi(
+                    "channel", amount, accname, order_id, entries,
+                    include_current=True,
+                )
+            else:
+                ch_text, ch_ents = await _render(
+                    "channel", amount, accname, order_id=order_id,
+                    include_current=True, link="",
+                )
+    except Exception as error:  # noqa: BLE001
+        await _cancel_reserved_links(request_id)
+        await _ack(
+            event,
+            f"Could not prepare payment message: {type(error).__name__}: {error}",
+        )
+        return
+
     payment = {
-        "amount": amount, "name": accname, "order_id": order_id,
-        "ts": _now_ts(), "status": "pending",
+        "amount": format(amount, "f"),
+        "name": accname,
+        "order_id": order_id,
+        "command_key": command_key,
+        "reservation_request_id": request_id,
+        "ts": _now_ts(),
+        "status": "pending",
     }
     if entries:
         payment.update({
@@ -1153,25 +1286,44 @@ async def cmd_add(event) -> None:
     _pay.setdefault("payments", []).append(payment)
     _save_pay()
 
-    # 2) Optional: post the proof image to the channel (only if both present).
+    # 2) Deliver the private receipt first. This is the authoritative commit:
+    # startup recovery only compensates records that never reached this point.
+    if failures:
+        detail = "; ".join(
+            f"{item.get('keyword')}: {item.get('reason')}" for item in failures
+        )
+        us_text += f"\n\nUnavailable: {detail}"
+    receipt_sent = False
+    try:
+        dropped = await _edit_rich(event, us_text, us_ents)
+        receipt_sent = True
+        if dropped:
+            ui.warn(f"Done message: dropped {dropped} unsupported entity(ies).")
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            f"Rich receipt edit failed; sending plain text: "
+            f"{type(error).__name__}: {error}"
+        )
+        receipt_sent = await _ack(event, us_text)
+    if not receipt_sent:
+        await _fail_payment(
+            event, payment, request_id, "Could not deliver the payment receipt."
+        )
+        return
+
+    payment["status"] = "valid"
+    payment.pop("error", None)
+    _save_pay()
+
+    # 3) Channel posting is secondary. The valid receipt is persisted first, so
+    # a crash after Telegram accepts this upload never invalidates its links.
     if has_media and _pay.get("post_channel"):
         target_channel = int(_pay["post_channel"])
         payment["post_chat_id"] = target_channel
         payment["post_message_id"] = None
-        try:
-            if entries:
-                ch_text, ch_ents = await _render_multi(
-                    "channel", amount, accname, order_id, entries, include_current=True)
-            else:
-                ch_text, ch_ents = await _render(
-                    "channel", amount, accname, order_id=order_id,
-                    include_current=True, link="")
-        except Exception as e:  # noqa: BLE001
-            payment["status"] = "failed"
-            payment["error"] = f"render: {type(e).__name__}: {e}"
-            _save_pay()
-            await _ack(event, f"Could not render payment post: {type(e).__name__}: {e}")
-            return
+        payment["post_status"] = "posting"
+        _save_pay()
+
         marker = _expect_automatic_outgoing(target_channel, [ch_text])
         post_result = None
         last_err = None
@@ -1188,44 +1340,18 @@ async def cmd_add(event) -> None:
                     break
         if post_result is None:
             _cancel_automatic_outgoing(target_channel, marker)
-            payment["status"] = "failed"
-            payment["error"] = f"upload: {type(last_err).__name__}: {last_err}"
+            payment["post_status"] = "failed"
+            payment["post_error"] = f"{type(last_err).__name__}: {last_err}"
             _save_pay()
-            await _ack(event, f"Posting to the channel failed: {type(last_err).__name__}: {last_err}")
-            return
-        _finish_automatic_outgoing(target_channel, marker, post_result)
-        post_ids = sorted(_sent_message_ids(post_result))
-        payment["post_message_id"] = post_ids[0] if post_ids else None
-        if not post_ids:
-            payment["status"] = "untracked"
-            payment["error"] = "Telegram returned no posted message ID"
-
-    if payment.get("status") == "pending":
-        payment["status"] = "valid"
-        payment.pop("error", None)
-    _save_pay()
-
-    # 3) Replace {link} in /setdone with the exact link block returned by the
-    #    bot. Even one link uses the same numbered bold blockquote format.
-    if entries:
-        us_text, us_ents = await _render_multi(
-            "done", amount, accname, order_id, entries
-        )
-    else:
-        us_text, us_ents = await _render(
-            "done", amount, accname, order_id=order_id, link=""
-        )
-    dropped = await _edit_rich(event, us_text, us_ents)
-    if dropped:
-        ui.warn(f"Done message: dropped {dropped} unsupported entity(ies).")
-    if failures:
-        detail = "; ".join(
-            f"{item.get('keyword')}: {item.get('reason')}" for item in failures
-        )
-        try:
-            await event.respond(f"No link for {detail}")
-        except Exception as e:  # noqa: BLE001
-            ui.warn(f"Couldn't send partial-failure note: {type(e).__name__}: {e}")
+            ui.warn(f"Payment channel post failed: {payment['post_error']}")
+        else:
+            _finish_automatic_outgoing(target_channel, marker, post_result)
+            post_ids = sorted(_sent_message_ids(post_result))
+            payment["post_message_id"] = post_ids[0] if post_ids else None
+            payment["post_status"] = "posted" if post_ids else "untracked"
+            if not post_ids:
+                payment["post_error"] = "Telegram returned no posted message ID"
+            _save_pay()
 
     count = len(_todays_payments())
     print(ui.green("[pay] ")
@@ -1360,7 +1486,7 @@ async def cmd_cancel(event) -> None:
         _save_pay()
 
     day = _todays_payments()
-    total = sum(p["amount"] for p in day)
+    total = _payment_total(day)
     try:
         await event.delete()
     except Exception:  # noqa: BLE001
@@ -1376,20 +1502,19 @@ async def cmd_cancel(event) -> None:
     )
 
 
-async def _ack(event, text: str, **kwargs) -> None:
-    """Report a result, tolerating every edit hiccup so a completed action is
-    NEVER mis-reported as 'Command failed'. MessageNotModifiedError happens
-    routinely when a second instance edits the same message to the same text;
-    any other edit failure falls back to a fresh reply."""
+async def _ack(event, text: str, **kwargs) -> bool:
+    """Edit the command or send one fallback response; report delivery."""
     try:
         await event.edit(text, **kwargs)
+        return True
     except MessageNotModifiedError:
-        pass
+        return True
     except Exception:  # noqa: BLE001
         try:
             await event.respond(text, **kwargs)
+            return True
         except Exception:  # noqa: BLE001
-            pass
+            return False
 
 
 async def _set_template(event, kind: str, cmd: str, label: str) -> None:
@@ -1430,7 +1555,10 @@ async def cmd_setchannelpost(event) -> None:
 
 
 async def cmd_setchannel(event) -> None:
-    """Set the CURRENT chat/channel as the post target."""
+    """Set the current Telegram channel/supergroup as the post target."""
+    if not getattr(event, "is_channel", False):
+        await _ack(event, "Run .setchannel inside the target channel.")
+        return
     chat_id = event.chat_id
     chat = await event.get_chat()
     title = getattr(chat, "title", None) or "this chat"
@@ -1441,9 +1569,9 @@ async def cmd_setchannel(event) -> None:
 
 async def cmd_stats(event) -> None:
     day = _todays_payments()
-    total = sum(p["amount"] for p in day)
-    rio = total * config.RIO_PCT / 100.0
-    marco = total * config.MARCO_PCT / 100.0
+    total = _payment_total(day)
+    rio = total * Decimal(str(config.RIO_PCT)) / Decimal("100")
+    marco = total * Decimal(str(config.MARCO_PCT)) / Decimal("100")
     await _ack(
         event,
         f"Today - {fmt_inr(total)} - {len(day)} payments\n"
@@ -2130,8 +2258,46 @@ async def _handle_outgoing(event):
         await event.reply(f"Greeting is {greeting}. Away messages are {away}.")
 
 
+def _command_identity(event) -> str:
+    """Stable identity used to prevent two workers handling one command twice."""
+    text = (getattr(event, "raw_text", "") or "").strip()
+    if not (text.startswith(("/", ".")) or text == "L"):
+        return ""
+    chat_id = getattr(event, "chat_id", None)
+    message_id = getattr(event, "id", None)
+    if chat_id is None or message_id is None:
+        return ""
+    return f"{_state.get('self_id', 0)}:{chat_id}:{message_id}"
+
+
+async def _renew_command_claim(key: str, token: str) -> None:
+    """Keep long-running commands fenced until their handler exits."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not linkstore.renew_command(key, token):
+                return
+        except Exception as error:  # noqa: BLE001
+            ui.error(f"command lock renewal failed: {type(error).__name__}: {error}")
+            return
+
+
 async def on_outgoing(event):
-    """Keep one bad payment record or command from disabling all commands."""
+    """Run each command message once, even if updates or workers duplicate it."""
+    command_key = _command_identity(event)
+    command_token = ""
+    renew_task = None
+    if command_key and linkstore is not None:
+        try:
+            command_token = linkstore.claim_command(command_key) or ""
+        except Exception as error:  # noqa: BLE001
+            ui.error(f"command lock failed: {type(error).__name__}: {error}")
+            return
+        if not command_token:
+            return
+        renew_task = asyncio.create_task(
+            _renew_command_claim(command_key, command_token)
+        )
     try:
         await _handle_outgoing(event)
     except Exception as e:  # noqa: BLE001
@@ -2142,10 +2308,16 @@ async def on_outgoing(event):
             detail = f"{type(e).__name__}: {e}".strip()
             if len(detail) > 350:
                 detail = detail[:349] + "\u2026"
+            await _ack(event, f"Command failed - {detail}")
+    finally:
+        if renew_task is not None:
+            renew_task.cancel()
+            await asyncio.gather(renew_task, return_exceptions=True)
+        if command_key and command_token:
             try:
-                await event.edit(f"Command failed - {detail}")
-            except Exception:  # noqa: BLE001
-                pass
+                linkstore.complete_command(command_key, command_token)
+            except Exception as error:  # noqa: BLE001
+                ui.error(f"command completion save failed: {type(error).__name__}: {error}")
 
 
 def _is_guard_demo_link(sender_id: int, link: str) -> bool:
@@ -2198,15 +2370,15 @@ async def on_msg(event):
         return
     try:
         status = await send_greeting(event, generation)
-        _greeted.add(sender)
-        _save_greeted()
-        if status == "none":
+        if status in {"greeting", "away"}:
+            _greeted.add(sender)
+            _save_greeted()
+            print(ui.green("[greet] ") + f"sent {status} to {sender}", flush=True)
+        elif status == "none":
             ui.warn(f"No greeting set (reply to a post with /set). Skipped {sender}.")
-        elif status == "suppressed":
+        else:
             print(ui.dim(f"[greet] owner became active or away was disabled; skipped {sender}"),
                   flush=True)
-        else:
-            print(ui.green("[greet] ") + f"sent {status} to {sender}", flush=True)
     except Exception as e:  # noqa: BLE001
         ui.error(f"greet failed for {sender}: {type(e).__name__}: {e}")
 
@@ -2231,6 +2403,7 @@ async def main() -> None:
     global _greeted, _pay
     _greeted = _load_greeted()
     _pay = _load_pay()
+    await _recover_pending_payments()
 
     src_raw = config.LINK_SOURCE_RAW.strip()
     if not src_raw:
@@ -2267,7 +2440,7 @@ async def main() -> None:
         ui.info("Away messages are disabled.")
     pc = _pay.get("post_channel")
     day = _todays_payments()
-    total = sum(p["amount"] for p in day)
+    total = _payment_total(day)
     pc_state = str(pc) if pc else ui.yellow("not set - type .setchannel in a channel")
     ui.info(f"Payment logger: post channel [{pc_state}]. "
             + ui.dim(f"today {fmt_inr(total)} / {len(day)} payment(s). '.help' for commands."))

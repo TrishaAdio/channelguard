@@ -9,6 +9,8 @@ import asyncio
 import html
 import logging
 import re
+import time
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -51,8 +53,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("channelguard.bot")
 
+# Validate before aiogram constructs a client; a placeholder token otherwise
+# raises an unrelated TokenValidationError and hides the missing setting.
+config.require()
 bot = Bot(
-    token=config.BOT_TOKEN or "MISSING",
+    token=config.BOT_TOKEN,
     default=DefaultBotProperties(
         parse_mode=ParseMode.HTML, link_preview_is_disabled=True
     ),
@@ -147,6 +152,18 @@ async def revoke_link(chat_id: int, link: Optional[str]) -> bool:
         return False
 
 
+async def revoke_or_journal(chat_id: int, link: Optional[str]) -> bool:
+    """Revoke now or durably queue the link for background cleanup."""
+    if await revoke_link(chat_id, link):
+        return True
+    if link and linkstore is not None:
+        try:
+            linkstore.queue_revoke(chat_id, link)
+        except Exception as error:  # noqa: BLE001
+            log.error("Could not journal failed revocation for %s: %s", chat_id, error)
+    return False
+
+
 async def get_or_create_link(chat_id: int) -> Optional[str]:
     """Reuse the group's stored link, minting one if none exists."""
     row = await db.get_group(chat_id)
@@ -159,13 +176,14 @@ async def get_or_create_link(chat_id: int) -> Optional[str]:
 
 
 async def rotate_link(chat_id: int) -> Optional[str]:
-    """Revoke the current link and store a fresh one (used after a join)."""
+    """Revoke the current general link before replacing it."""
     row = await db.get_group(chat_id)
     old = row["invite_link"] if row else None
+    if old and not await revoke_link(chat_id, old):
+        return None
     new = await create_join_link(chat_id)
     if new:
         await db.set_group_link(chat_id, new)
-        await revoke_link(chat_id, old)
     return new
 
 
@@ -293,35 +311,89 @@ async def on_join_request(req: ChatJoinRequest) -> None:
         # Persist before Telegram approval. If the process dies after Telegram
         # accepts the approval, the retry loop sees `approving` and burns the
         # link rather than leaving it reusable.
-        await db.set_reservation_status(reservation["id"], "approving")
+        acquired = await db.claim_reservation_status(
+            reservation["id"], {"pending"}, "approving"
+        )
+        if not acquired:
+            return
         try:
             await bot.approve_chat_join_request(chat.id, user.id)
         except Exception as e:  # noqa: BLE001
-            # Telegram failures can be ambiguous (request applied, response
-            # lost), so fence the link and revoke it instead of returning it to
-            # pending state.
-            await db.set_reservation_status(
-                reservation["id"],
-                "approved_revoke_pending",
+            # Telegram failures can be ambiguous. Cancellation may also have
+            # won while approval was in flight, so remove the user defensively.
+            cancellation_won = not await db.claim_reservation_status(
+                reservation["id"], {"approving"}, "approved_revoke_pending",
                 f"approve uncertain: {type(e).__name__}: {e}",
             )
+            if cancellation_won:
+                try:
+                    await bot.ban_chat_member(chat.id, user.id)
+                    await bot.unban_chat_member(
+                        chat.id, user.id, only_if_banned=True
+                    )
+                except Exception as removal_error:  # noqa: BLE001
+                    log.warning("uncertain approval removal failed: %s", removal_error)
             if await revoke_link(chat.id, used_link):
-                await db.set_reservation_status(reservation["id"], "completed")
+                terminal = "cancelled" if cancellation_won else "completed"
+                await db.claim_reservation_status(
+                    reservation["id"],
+                    {"cancel_requested" if cancellation_won else "approved_revoke_pending"},
+                    terminal,
+                )
+            elif cancellation_won:
+                await db.set_reservation_status(
+                    reservation["id"],
+                    "cancel_revoke_pending",
+                    "uncertain approval raced cancellation",
+                )
             await tell_owner(
                 f"Auto-approve failed for <code>{user.id}</code>: {esc(e)}"
             )
             return
 
         await db.set_join_status(chat.id, user.id, "approved")
-        await db.set_reservation_status(reservation["id"], "approved_revoke_pending")
+        still_valid = await db.claim_reservation_status(
+            reservation["id"], {"approving"}, "approved_revoke_pending"
+        )
+        if not still_valid:
+            current = await db.get_reservation(reservation["id"])
+            cancellation_won = current and current["status"] in {
+                "cancelling", "cancel_requested", "cancel_revoke_pending",
+            }
+            if not cancellation_won:
+                # A stale-approval recovery worker already fenced the link.
+                await tell_owner(
+                    f"Approved reserved user for <b>{esc(title)}</b>\n"
+                    f"<blockquote><code>{user.id}</code> — revocation handled</blockquote>"
+                )
+                return
+            # Payment cancellation won while Telegram approval was in flight.
+            try:
+                await bot.ban_chat_member(chat.id, user.id)
+                await bot.unban_chat_member(chat.id, user.id, only_if_banned=True)
+            except Exception as error:  # noqa: BLE001
+                log.warning("cancelled reservation removal failed: %s", error)
+            if await revoke_link(chat.id, used_link):
+                await db.set_reservation_status(reservation["id"], "cancelled")
+            else:
+                await db.set_reservation_status(
+                    reservation["id"],
+                    "cancel_revoke_pending",
+                    "approval raced cancellation; revoke retry scheduled",
+                )
+            await db.set_join_status(chat.id, user.id, "declined")
+            return
         revoked = await revoke_link(chat.id, used_link)
         if revoked:
-            await db.set_reservation_status(reservation["id"], "completed")
+            await db.claim_reservation_status(
+                reservation["id"], {"approved_revoke_pending"}, "completed"
+            )
             await db.log_event("reservation_completed", chat.id, user.id)
             state = "link revoked"
         else:
-            await db.set_reservation_status(
+            await db.claim_reservation_status(
                 reservation["id"],
+                {"approved_revoke_pending"},
                 "approved_revoke_pending",
                 "revoke failed; retry scheduled",
             )
@@ -333,11 +405,18 @@ async def on_join_request(req: ChatJoinRequest) -> None:
         )
         return
 
-    # Any active reservation link remains protected, including while a failed
-    # revocation is being retried.
+    # Active reservation links never fall through to manual owner approval.
     if used_link:
         reserved = await db.active_reservation_by_link(chat.id, used_link)
-        if reserved and reserved["user_id"] != user.id:
+        cancellation_states = {
+            "cancelling", "cancel_requested", "cancel_revoke_pending",
+            "expiring", "expire_revoke_pending",
+        }
+        should_decline = reserved and (
+            reserved["user_id"] != user.id
+            or reserved["status"] in cancellation_states
+        )
+        if should_decline:
             try:
                 await bot.decline_chat_join_request(chat.id, user.id)
                 await db.set_join_status(chat.id, user.id, "declined")
@@ -346,6 +425,8 @@ async def on_join_request(req: ChatJoinRequest) -> None:
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("reserved-link decline failed: %s", e)
+            return
+        if reserved:
             return
 
     uname = f"@{username}" if username else "no username"
@@ -442,9 +523,14 @@ async def on_chat_member(update: ChatMemberUpdated) -> None:
     order_id = link_row["order_id"]
     await db.set_order_link_joined(link_row["id"], user.id)
     await db.set_order_status(order_id, "joined")
-    # Single-use link is spent — revoke it so it can never be reused.
-    await revoke_link(update.chat.id, update.invite_link.invite_link)
-    await db.set_order_link_revoked(link_row["id"])
+    # Single-use link is spent. Keep it pending in SQLite until Telegram
+    # confirms revocation so the retry loop can finish ambiguous failures.
+    if await revoke_link(update.chat.id, update.invite_link.invite_link):
+        await db.set_order_link_revoked(link_row["id"])
+        revoke_state = "link revoked"
+    else:
+        await db.set_order_status(order_id, "joined_revoke_pending")
+        revoke_state = "revocation pending"
     await db.log_event("order_joined", update.chat.id, user.id, order_id)
 
     uname = f"@{user.username}" if user.username else "no username"
@@ -452,7 +538,7 @@ async def on_chat_member(update: ChatMemberUpdated) -> None:
         f"Order <code>{esc(order_id)}</code> joined — "
         f"<b>{esc(update.chat.title or update.chat.id)}</b>\n"
         f"<blockquote>{esc(user.full_name)}   {esc(uname)}   "
-        f"<code>{user.id}</code></blockquote>"
+        f"<code>{user.id}</code>   {revoke_state}</blockquote>"
     )
 
 
@@ -612,76 +698,114 @@ async def cmd_doctor(message: Message) -> None:
     await message.answer("\n".join(out)[:4000])
 
 
+async def _compensate_order(order_id: str) -> None:
+    """Revoke every link from an order whose creation did not complete."""
+    pending = False
+    for order_link in await db.order_links(order_id):
+        if order_link["revoked"]:
+            continue
+        if await revoke_link(order_link["chat_id"], order_link["invite_link"]):
+            await db.set_order_link_revoked(order_link["id"])
+        else:
+            pending = True
+    await db.set_order_status(order_id, "revoke_pending" if pending else "failed")
+
+
 @dp.message(Command("add"), F.chat.type == ChatType.PRIVATE)
 async def cmd_add(message: Message, command: CommandObject) -> None:
-    """Create a paid order: mint a single-use link per matched group, post it
-    (with an ANI order id) here and to the payment channel."""
+    """Create one order and return its generated links once."""
     if not owner_only(message):
         return await deny(message)
-    args = (command.args or "").strip()
-    parts = args.split(maxsplit=2)
+    parts = (command.args or "").strip().split(maxsplit=2)
     if len(parts) < 3:
         await message.answer(
-            "Usage: <code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt;</code>\n"
-            "<blockquote>keyword = a group short code / name, or <code>all</code>. "
-            "Mints a single-use link only that buyer can use and posts it with "
-            "an order id. Set the post format with "
-            "<code>/tpl &lt;keyword&gt;</code>.</blockquote>"
+            "Usage: <code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt;</code>"
         )
         return
-    amount, account, keyword = parts[0], parts[1], parts[2]
+    amount, account, keyword = parts
+    try:
+        parsed_amount = Decimal(amount.replace(",", ""))
+        if not parsed_amount.is_finite() or parsed_amount <= 0:
+            raise InvalidOperation
+    except InvalidOperation:
+        await message.answer("Amount must be a positive number.")
+        return
 
-    if keyword.strip().lower() == "all":
-        groups = await db.all_groups(admin_only=True)
-    else:
-        groups = await db.find_groups(keyword)
+    groups = (
+        await db.all_groups(admin_only=True)
+        if keyword.strip().lower() == "all"
+        else await db.find_groups(keyword)
+    )
     if not groups:
-        await message.answer(
-            f"Nothing matches <code>{esc(keyword)}</code>. "
-            "Try <code>/groups</code> or <code>all</code>."
-        )
+        await message.answer(f"Nothing matches <code>{esc(keyword)}</code>.")
         return
 
     tpl = await db.get_template(keyword.lower())
     body = tpl["body"] if tpl and tpl["body"] else config.ORDER_TEMPLATE
+    order_id = await db.create_next_order(
+        config.ORDER_PREFIX, amount, account, keyword.lower()
+    )
 
-    order_id = await db.next_order_id(config.ORDER_PREFIX)
-    await db.create_order(order_id, amount, account, keyword.lower())
-
-    made = 0
-    for g in groups:
-        link = await create_single_use_link(g["chat_id"])
-        if not link:
-            await message.answer(
-                f"<b>{esc(g['title'])}</b>\n"
-                "<blockquote>No link — I need the Invite Users right "
-                "there.</blockquote>"
+    generated = []
+    failures = []
+    try:
+        for group in groups:
+            link = await create_single_use_link(group["chat_id"])
+            if not link:
+                failures.append(group["title"])
+                continue
+            try:
+                link_id = await db.add_order_link(order_id, group["chat_id"], link)
+            except Exception:
+                if not await revoke_link(group["chat_id"], link):
+                    if linkstore is not None:
+                        linkstore.queue_revoke(group["chat_id"], link)
+                    log.error(
+                        "Queued untracked invite for revocation: chat=%s",
+                        group["chat_id"],
+                    )
+                raise
+            rendered = render_template(
+                body,
+                {
+                    "link": link,
+                    "title": group["title"],
+                    "short": group["short_code"],
+                    "amount": amount,
+                    "name": account,
+                    "keyword": keyword.lower(),
+                    "orderid": order_id,
+                },
             )
-            continue
-        await db.add_order_link(order_id, g["chat_id"], link)
-        rendered = render_template(
-            body,
-            {
-                "link": link,
-                "title": g["title"],
-                "short": g["short_code"],
-                "amount": amount,
-                "name": account,
-                "keyword": keyword.lower(),
-                "orderid": order_id,
-            },
-        )
-        await message.answer(rendered)
-        if config.PAYMENT_CHANNEL:
+            generated.append((group, link_id, link, rendered))
+    except Exception:
+        await _compensate_order(order_id)
+        raise
+
+    if not generated:
+        await db.set_order_status(order_id, "failed")
+        await db.delete_order_if_empty(order_id)
+        await message.answer("Could not create an invite link for the matched group(s).")
+        return
+
+    response = "\n\n".join(item[3] for item in generated)
+    if failures:
+        response += "\n\nUnavailable: " + ", ".join(esc(name) for name in failures)
+    try:
+        await message.answer(response)
+    except Exception:
+        await _compensate_order(order_id)
+        raise
+
+    if config.PAYMENT_CHANNEL:
+        for _group, _link_id, _link, rendered in generated:
             try:
                 await bot.send_message(config.PAYMENT_CHANNEL, rendered)
-            except Exception as e:  # noqa: BLE001
-                log.warning("payment channel post failed: %s", e)
-        made += 1
+            except Exception as error:  # noqa: BLE001
+                log.warning("payment channel post failed: %s", error)
 
-    await db.log_event("order_add", detail=f"{order_id} keyword={keyword} links={made}")
-    await message.answer(
-        f"Order <code>{esc(order_id)}</code> — {made} single-use link(s)."
+    await db.log_event(
+        "order_add", detail=f"{order_id} keyword={keyword} links={len(generated)}"
     )
 
 
@@ -854,12 +978,16 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
     order_id = order["order_id"]
 
     links = await db.order_links(order_id)
-    revoked = banned = 0
+    revoked = pending = banned = 0
     for order_link in links:
         if not order_link["revoked"]:
-            await revoke_link(order_link["chat_id"], order_link["invite_link"])
-            await db.set_order_link_revoked(order_link["id"])
-        revoked += 1
+            if await revoke_link(order_link["chat_id"], order_link["invite_link"]):
+                await db.set_order_link_revoked(order_link["id"])
+                revoked += 1
+            else:
+                pending += 1
+        else:
+            revoked += 1
         if order_link["joined_user"]:
             try:
                 await bot.ban_chat_member(
@@ -873,11 +1001,14 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
                     order_link["chat_id"],
                     e,
                 )
-    await db.set_order_status(order_id, "revoked")
-    await db.log_event("order_revoke", detail=f"{order_id} banned={banned}")
+    await db.set_order_status(order_id, "revoke_pending" if pending else "revoked")
+    await db.log_event(
+        "order_revoke",
+        detail=f"{order_id} revoked={revoked} pending={pending} banned={banned}",
+    )
     await message.answer(
-        f"Order <code>{esc(order_id)}</code> revoked — "
-        f"{revoked} link(s), {banned} user(s) banned."
+        f"Order <code>{esc(order_id)}</code> — "
+        f"{revoked} revoked, {pending} pending, {banned} banned."
     )
 
 
@@ -1036,7 +1167,21 @@ _background_tasks: set[asyncio.Task] = set()
 def _start_background(coro) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def finished(done: asyncio.Task) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            log.error(
+                "Background task %s stopped: %s: %s",
+                done.get_name(),
+                type(error).__name__,
+                error,
+            )
+
+    task.add_done_callback(finished)
 
 
 async def on_startup() -> None:
@@ -1085,16 +1230,44 @@ async def _groups_for_keyword(query: str):
 
 
 async def _cancel_request_reservations(rid: str) -> None:
-    """Revoke links minted for a request explicitly cancelled by its caller."""
+    """Fence and revoke links minted for a cancelled payment request."""
     for reservation in await db.reservations_for_request(rid):
-        if reservation["status"] not in {"pending", "approving"}:
+        status = reservation["status"]
+        if status == "pending":
+            acquired = await db.claim_reservation_status(
+                reservation["id"], {"pending"}, "cancelling"
+            )
+        elif status in {"approving", "approved_revoke_pending", "completed"}:
+            acquired = await db.claim_reservation_status(
+                reservation["id"],
+                {status},
+                "cancel_requested",
+                "payment cancelled after reservation approval began",
+            )
+        else:
             continue
+        if not acquired:
+            continue
+
+        if status != "pending":
+            try:
+                await bot.ban_chat_member(
+                    reservation["chat_id"], reservation["user_id"]
+                )
+                await bot.unban_chat_member(
+                    reservation["chat_id"],
+                    reservation["user_id"],
+                    only_if_banned=True,
+                )
+            except Exception as error:  # noqa: BLE001
+                log.warning("cancelled reservation removal failed: %s", error)
+
         if await revoke_link(reservation["chat_id"], reservation["invite_link"]):
             await db.set_reservation_status(reservation["id"], "cancelled")
         else:
             await db.set_reservation_status(
                 reservation["id"],
-                "approved_revoke_pending",
+                "cancel_revoke_pending",
                 "cancelled request; revoke retry scheduled",
             )
 
@@ -1169,24 +1342,24 @@ async def _fulfill_reservation(
                     )
                     continue
                 if linkstore.is_request_cancelled(rid):
-                    await revoke_link(chat_id, link)
+                    await revoke_or_journal(chat_id, link)
                     await _cancel_request_reservations(rid)
                     return
                 if not linkstore.renew_request(rid, lease_token):
-                    await revoke_link(chat_id, link)
+                    await revoke_or_journal(chat_id, link)
                     return
                 try:
                     inserted = await db.add_reservation(
                         rid, query, chat_id, user_id, link
                     )
                 except Exception:
-                    await revoke_link(chat_id, link)
+                    await revoke_or_journal(chat_id, link)
                     raise
                 if not inserted:
                     # A lease successor/predecessor won the insert race. Revoke
                     # only this worker's duplicate and converge on the stored
                     # link; never overwrite or revoke the winner's reservation.
-                    await revoke_link(chat_id, link)
+                    await revoke_or_journal(chat_id, link)
                     existing = await db.reservation_for_request_group(
                         rid, query, chat_id
                     )
@@ -1276,19 +1449,91 @@ async def reservation_poller() -> None:
 
 
 async def revocation_retry_loop() -> None:
-    """Keep approved reservation links protected until revocation succeeds."""
+    """Retry failed revocations and expire unused buyer reservations."""
     while True:
         try:
-            for reservation in await db.pending_reservation_revocations():
+            if linkstore is not None:
+                for item in linkstore.pending_revokes():
+                    if await revoke_link(item["chat_id"], item["link"]):
+                        linkstore.complete_revoke(item["chat_id"], item["link"])
+
+            cutoff = time.time() - config.RESERVATION_TTL_MINUTES * 60
+            for reservation in await db.expired_pending_reservations(cutoff):
+                acquired = await db.claim_reservation_status(
+                    reservation["id"], {"pending"}, "expiring"
+                )
+                if not acquired:
+                    continue
                 if await revoke_link(
                     reservation["chat_id"], reservation["invite_link"]
                 ):
-                    await db.set_reservation_status(reservation["id"], "completed")
+                    await db.set_reservation_status(reservation["id"], "expired")
                     await db.log_event(
-                        "reservation_completed",
+                        "reservation_expired",
                         reservation["chat_id"],
                         reservation["user_id"],
                     )
+                else:
+                    await db.set_reservation_status(
+                        reservation["id"],
+                        "expire_revoke_pending",
+                        "expiry revoke failed; retry scheduled",
+                    )
+
+            for reservation in await db.pending_reservation_revocations(
+                time.time() - 300
+            ):
+                if reservation["status"] == "approving":
+                    claimed = await db.claim_reservation_status(
+                        reservation["id"],
+                        {"approving"},
+                        "approved_revoke_pending",
+                        "stale approval recovery",
+                    )
+                    if not claimed:
+                        continue
+                    reservation = await db.get_reservation(reservation["id"])
+                    if reservation is None:
+                        continue
+                cancellation = reservation["status"] in {
+                    "cancel_requested", "cancel_revoke_pending"
+                }
+                if cancellation:
+                    try:
+                        await bot.ban_chat_member(
+                            reservation["chat_id"], reservation["user_id"]
+                        )
+                        await bot.unban_chat_member(
+                            reservation["chat_id"],
+                            reservation["user_id"],
+                            only_if_banned=True,
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        log.warning("reservation removal retry failed: %s", error)
+                if await revoke_link(
+                    reservation["chat_id"], reservation["invite_link"]
+                ):
+                    terminal = (
+                        "cancelled" if cancellation
+                        else "expired" if reservation["status"] == "expire_revoke_pending"
+                        else "completed"
+                    )
+                    changed = await db.claim_reservation_status(
+                        reservation["id"], {reservation["status"]}, terminal
+                    )
+                    if changed:
+                        await db.log_event(
+                            f"reservation_{terminal}",
+                            reservation["chat_id"],
+                            reservation["user_id"],
+                        )
+
+            for order_link in await db.pending_order_link_revocations():
+                if await revoke_link(
+                    order_link["chat_id"], order_link["invite_link"]
+                ):
+                    await db.set_order_link_revoked(order_link["id"])
+                    await db.reconcile_order_status(order_link["order_id"])
         except Exception as e:  # noqa: BLE001
             log.warning("revocation retry error: %s: %s", type(e).__name__, e)
         await asyncio.sleep(20)
