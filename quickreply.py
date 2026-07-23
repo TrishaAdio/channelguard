@@ -1081,6 +1081,54 @@ def _entity_fallbacks(ents):
     return tries
 
 
+def _fit_media_caption(text: str, entities, preserve: str = "", limit: int = 1024):
+    """Fit a rendered caption to Telegram's UTF-16 limit.
+
+    If the requested order id would otherwise be cut from an oversized caption,
+    keep it at the front. Formatting entities are shifted/clipped to remain
+    valid, so a long template cannot make the channel upload fail.
+    """
+    text = text or ""
+    entities = [copy.copy(entity) for entity in (entities or [])]
+    if _u16(text) <= limit:
+        return text, entities, False
+
+    def prefix_length(max_units: int) -> int:
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _u16(text[:middle]) <= max_units:
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    prefix = ""
+    keep = prefix_length(limit)
+    preserve_at = text.find(preserve) if preserve else -1
+    if preserve_at >= 0 and preserve_at + len(preserve) > keep:
+        prefix = preserve + "\n"
+        keep = prefix_length(max(0, limit - _u16(prefix)))
+        # Do not leave a partial duplicate of the preserved order id at the end.
+        if preserve_at < keep:
+            keep = preserve_at
+
+    clipped = prefix + text[:keep]
+    final_length = _u16(clipped)
+    shift = _u16(prefix)
+    kept_entities = []
+    original_limit = final_length - shift
+    for entity in entities:
+        if entity.offset >= original_limit:
+            continue
+        entity.length = min(entity.length, original_limit - entity.offset)
+        if entity.length <= 0:
+            continue
+        entity.offset += shift
+        kept_entities.append(entity)
+    return clipped, kept_entities, True
+
+
 def _is_entity_error(error: Exception) -> bool:
     """Only formatting/entity rejections are safe to retry with fewer entities."""
     detail = f"{type(error).__name__}: {error}".upper()
@@ -1238,6 +1286,7 @@ async def cmd_add(event) -> None:
         return
 
     order_id = _generate_order_id()
+    channel_caption_truncated = False
     try:
         if entries:
             us_text, us_ents = await _render_multi(
@@ -1259,6 +1308,9 @@ async def cmd_add(event) -> None:
                     "channel", amount, accname, order_id=order_id,
                     include_current=True, link="",
                 )
+            ch_text, ch_ents, channel_caption_truncated = _fit_media_caption(
+                ch_text, ch_ents, preserve=order_id
+            )
     except Exception as error:  # noqa: BLE001
         await _cancel_reserved_links(request_id)
         await _ack(
@@ -1276,6 +1328,12 @@ async def cmd_add(event) -> None:
         "ts": _now_ts(),
         "status": "pending",
     }
+    if channel_caption_truncated:
+        payment["channel_caption_truncated"] = True
+        ui.warn(
+            f"Payment channel caption exceeded Telegram's 1024-unit limit; "
+            f"trimmed it while preserving order id {order_id}."
+        )
     if entries:
         payment.update({
             "invite_links": [e["link"] for e in entries],
