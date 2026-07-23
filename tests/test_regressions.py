@@ -534,6 +534,64 @@ def test_order_id_token_aliases_render_with_valid_entities() -> None:
     assert entities[0].length == quickreply._u16("ANIABC234")
 
 
+@pytest.mark.parametrize("amount_token", ["14", "14INR", "₹14", "14.00"])
+def test_exact_photo_add_renders_14_and_order_id_everywhere(
+    monkeypatch, amount_token
+) -> None:
+    async def scenario() -> None:
+        template = (
+            "Thanks For Paying 🎭\n"
+            "We Have Successfully Received Your Payment Of {amount}\n\n"
+            "Order ID : ❴ ORDER\u2060_ID ❵ 🔥\n\n"
+            "Hold On ! We Are Preparing Your Links Now ♻️"
+        )
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["post_channel"] = -1001
+        quickreply._pay["done_template"] = template
+        quickreply._pay["channel_template"] = template
+        private = []
+        channel = []
+
+        class Client:
+            async def send_file(self, *_args, **kwargs):
+                channel.append(kwargs["caption"])
+                return SimpleNamespace(id=123)
+
+        class Event:
+            raw_text = f"/add {amount_token} Amit"
+            chat_id = 42
+            id = 80
+            is_private = True
+
+            async def get_reply_message(self):
+                return SimpleNamespace(media=object(), sender_id=42)
+
+            async def edit(self, text, **_kwargs):
+                private.append(text)
+
+            async def respond(self, text, **_kwargs):
+                private.append(text)
+
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        monkeypatch.setattr(quickreply, "client", Client())
+
+        await quickreply.cmd_add(Event())
+
+        assert len(private) == 1
+        assert len(channel) == 1
+        order_id = quickreply._pay["payments"][0]["order_id"]
+        assert quickreply._pay["payments"][0]["amount"] == "14.00"
+        for rendered in (private[0], channel[0]):
+            assert "₹14" in rendered
+            assert order_id in rendered
+            assert "{amount}" not in rendered.casefold()
+            assert "orderid" not in rendered.casefold()
+            assert "order_id" not in rendered.casefold()
+
+    asyncio.run(scenario())
+
+
 def test_partial_group_failure_renders_values_privately_and_in_channel(
     monkeypatch,
 ) -> None:

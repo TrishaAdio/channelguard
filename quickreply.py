@@ -539,6 +539,9 @@ async def _copy_to(peer, src):
 # --------------------------------------------------------------------------
 # Payment logger
 # --------------------------------------------------------------------------
+QUICKREPLY_BUILD = "payment-template-v2"
+
+
 def _default_pay() -> dict:
     return {
         "post_channel": None,
@@ -869,7 +872,9 @@ def _substitute(text: str, entities, mapping: dict):
 
 
 _TEMPLATE_TOKEN_ALIAS_RE = re.compile(
-    r"[\{\uff5b]([^{}\uff5b\uff5d]{1,40})[\}\uff5d]",
+    r"[\{\uff5b\ufe5b\u2774]"
+    r"([^{}\uff5b\uff5d\ufe5b\ufe5c\u2774\u2775]{1,40})"
+    r"[\}\uff5d\ufe5c\u2775]",
     re.IGNORECASE,
 )
 _TEMPLATE_TOKEN_ALIASES = {
@@ -895,15 +900,34 @@ def _canonicalize_template_tokens(text: str, entities):
     """
     aliases = {}
     for match in _TEMPLATE_TOKEN_ALIAS_RE.finditer(text or ""):
-        key = re.sub(
-            r"[\s_\-\u200b-\u200d\ufeff]+", "", match.group(1)
-        ).casefold()
+        key = unicodedata.normalize("NFKC", match.group(1))
+        key = re.sub(r"[\s_\-\u200b-\u200f\u2060\ufeff]+", "", key).casefold()
         canonical = _TEMPLATE_TOKEN_ALIASES.get(key)
         if canonical:
             aliases[match.group(0)] = canonical
     if not aliases:
         return text or "", [copy.copy(entity) for entity in (entities or [])]
     return _substitute(text, entities, aliases)
+
+
+def _force_required_token_values(
+    text: str, entities, amount: Decimal, order_id: str
+):
+    """Replace required tokens again at the final delivery boundary.
+
+    This deliberately protects legacy ``pay.json`` templates too: even if they
+    were saved by an older release with unusual Unicode braces or invisible
+    characters, a receipt can never expose an amount/order placeholder.
+    """
+    text, entities = _canonicalize_template_tokens(text, entities)
+    return _substitute(
+        text,
+        entities,
+        {
+            "{amount}": fmt_inr(amount),
+            "{orderid}": str(order_id or ""),
+        },
+    )
 
 
 def _serialize_entities(entities) -> list[dict]:
@@ -1248,6 +1272,9 @@ async def _safe_payment_output(
                 include_current=include_current,
                 link="",
             )
+        text, entities = _force_required_token_values(
+            text, entities, amount, order_id
+        )
         return _decorate_payment_output(
             text, entities, amount, order_id, failures
         )
@@ -2029,9 +2056,12 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
     reply = await event.get_reply_message()
     if reply is not None and (reply.raw_text or ""):
         _pay[f"{kind}_ref"] = {"chat_id": int(reply.chat_id), "message_id": int(reply.id)}
-        _pay[f"{kind}_template"] = reply.raw_text  # plain text the entities map onto
+        template, entities = _canonicalize_template_tokens(
+            reply.raw_text, reply.entities
+        )
+        _pay[f"{kind}_template"] = template
         # Store the formatting verbatim so it survives even if the post is gone.
-        _pay[f"{kind}_entities"] = _serialize_entities(reply.entities)
+        _pay[f"{kind}_entities"] = _serialize_entities(entities)
         _save_pay()
         n = len(_pay[f"{kind}_entities"])
         await _ack(event, f"{label} saved from that post - {n} formatting/emoji "
@@ -2043,6 +2073,7 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
     if not template:
         await _ack(event, f"Send the text after {cmd}, or reply to a formatted post with {cmd}.")
         return
+    template, _ = _canonicalize_template_tokens(template, [])
     _pay[f"{kind}_template"] = template
     _pay.pop(f"{kind}_ref", None)
     _pay.pop(f"{kind}_entities", None)
@@ -2651,7 +2682,10 @@ async def _handle_outgoing(event):
     # Messages) so the longer commands win.
     low_cmd = raw_text.strip().lower()
     if low_cmd in (".ping", "/ping"):
-        await _ack(event, "Quick-reply userbot is running.")
+        await _ack(
+            event,
+            f"Quick-reply userbot is running ({QUICKREPLY_BUILD}).",
+        )
         return
     if low_cmd in (".help", "/help", "/commands", "/start"):
         await _ack(event, HELP_TEXT, parse_mode="html")
