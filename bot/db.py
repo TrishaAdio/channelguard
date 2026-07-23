@@ -14,6 +14,7 @@ database file exists (``init`` creates it).
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Iterable, Optional
 
@@ -121,6 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_reservation_revoke
 """
 
 _conn: Optional[aiosqlite.Connection] = None
+_write_lock = asyncio.Lock()
 
 
 async def init() -> None:
@@ -170,8 +172,9 @@ def _db() -> aiosqlite.Connection:
 
 
 async def _run(sql: str, params: Iterable[Any] = ()) -> None:
-    await _db().execute(sql, tuple(params))
-    await _db().commit()
+    async with _write_lock:
+        await _db().execute(sql, tuple(params))
+        await _db().commit()
 
 
 async def _all(sql: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
@@ -307,11 +310,12 @@ async def all_templates() -> list[aiosqlite.Row]:
 
 
 async def remove_template(keyword: str) -> bool:
-    cur = await _db().execute(
-        "DELETE FROM templates WHERE keyword=?", (keyword.lower(),)
-    )
-    await _db().commit()
-    return cur.rowcount > 0
+    async with _write_lock:
+        cur = await _db().execute(
+            "DELETE FROM templates WHERE keyword=?", (keyword.lower(),)
+        )
+        await _db().commit()
+        return cur.rowcount > 0
 
 
 # --- join requests --------------------------------------------------------
@@ -369,44 +373,67 @@ async def find_pending_by_username(username: str) -> list[aiosqlite.Row]:
 
 
 # --- orders ---------------------------------------------------------------
-async def next_order_id(prefix: str) -> str:
-    """Return the next sequential id for ``prefix`` (e.g. ANI0001)."""
-    rows = await _all(
-        "SELECT order_id FROM orders WHERE order_id LIKE ?", (prefix + "%",)
-    )
-    plen = len(prefix)
-    mx = 0
-    for r in rows:
-        suffix = r["order_id"][plen:]
-        if suffix.isdigit():
-            mx = max(mx, int(suffix))
-    return f"{prefix}{mx + 1:04d}"
+async def create_next_order(
+    prefix: str, amount: str, account_name: str, keyword: str
+) -> str:
+    """Allocate and insert the next sequential order in one transaction."""
+    async with _write_lock:
+        connection = _db()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await connection.execute(
+                "SELECT order_id FROM orders WHERE order_id LIKE ?",
+                (prefix + "%",),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            plen = len(prefix)
+            mx = 0
+            for row in rows:
+                suffix = row["order_id"][plen:]
+                if suffix.isdigit():
+                    mx = max(mx, int(suffix))
+            order_id = f"{prefix}{mx + 1:04d}"
+            now = time.time()
+            await connection.execute(
+                """
+                INSERT INTO orders
+                    (order_id, amount, account_name, keyword, status,
+                     created_at, updated_at)
+                VALUES (?,?,?,?, 'open', ?, ?)
+                """,
+                (order_id, amount, account_name, keyword, now, now),
+            )
+            await connection.commit()
+            return order_id
+        except Exception:
+            await connection.rollback()
+            raise
 
 
-async def create_order(
-    order_id: str, amount: str, account_name: str, keyword: str
-) -> None:
-    now = time.time()
-    await _run(
-        """
-        INSERT INTO orders (order_id, amount, account_name, keyword, status,
-                            created_at, updated_at)
-        VALUES (?,?,?,?, 'open', ?, ?)
-        """,
-        (order_id, amount, account_name, keyword, now, now),
-    )
+async def delete_order_if_empty(order_id: str) -> bool:
+    """Remove a failed order only when it has no surviving invite links."""
+    async with _write_lock:
+        cur = await _db().execute(
+            "DELETE FROM orders WHERE order_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM order_links WHERE order_id=?)",
+            (order_id, order_id),
+        )
+        await _db().commit()
+        return cur.rowcount > 0
 
 
 async def add_order_link(order_id: str, chat_id: int, invite_link: str) -> int:
-    cur = await _db().execute(
-        """
-        INSERT INTO order_links (order_id, chat_id, invite_link, created_at)
-        VALUES (?,?,?,?)
-        """,
-        (order_id, chat_id, invite_link, time.time()),
-    )
-    await _db().commit()
-    return cur.lastrowid
+    async with _write_lock:
+        cur = await _db().execute(
+            """
+            INSERT INTO order_links (order_id, chat_id, invite_link, created_at)
+            VALUES (?,?,?,?)
+            """,
+            (order_id, chat_id, invite_link, time.time()),
+        )
+        await _db().commit()
+        return int(cur.lastrowid)
 
 
 async def get_order(order_id: str) -> Optional[aiosqlite.Row]:
@@ -460,17 +487,18 @@ async def add_reservation(
     Lease takeovers can briefly leave two workers creating the same reservation.
     The first insert wins; a stale worker must never overwrite that link.
     """
-    cur = await _db().execute(
-        """
-        INSERT OR IGNORE INTO reservations
-            (request_id, keyword, chat_id, user_id, invite_link, status,
-             created_at)
-        VALUES (?,?,?,?,?, 'pending', ?)
-        """,
-        (request_id, keyword, chat_id, user_id, invite_link, time.time()),
-    )
-    await _db().commit()
-    return cur.rowcount == 1
+    async with _write_lock:
+        cur = await _db().execute(
+            """
+            INSERT OR IGNORE INTO reservations
+                (request_id, keyword, chat_id, user_id, invite_link, status,
+                 created_at)
+            VALUES (?,?,?,?,?, 'pending', ?)
+            """,
+            (request_id, keyword, chat_id, user_id, invite_link, time.time()),
+        )
+        await _db().commit()
+        return cur.rowcount == 1
 
 
 async def reservation_for_request_group(
@@ -501,10 +529,45 @@ async def active_reservation_by_link(
     return await _one(
         "SELECT * FROM reservations "
         "WHERE chat_id=? AND invite_link=? "
-        "AND status IN ('pending', 'approving', 'approved_revoke_pending') "
+        "AND status IN ('pending', 'approving', 'approved_revoke_pending', "
+        "'cancelling', 'cancel_requested', 'cancel_revoke_pending', "
+        "'expiring', 'expire_revoke_pending') "
         "ORDER BY created_at DESC LIMIT 1",
         (chat_id, invite_link),
     )
+
+
+async def claim_reservation_status(
+    reservation_id: int,
+    expected_statuses: set[str],
+    status: str,
+    error: str = "",
+) -> bool:
+    """Atomically acquire a reservation lifecycle transition."""
+    if not expected_statuses:
+        return False
+    now = time.time()
+    approved_at = now if status in {"approving", "approved_revoke_pending"} else None
+    placeholders = ",".join("?" for _ in expected_statuses)
+    params = (
+        status,
+        error[:500],
+        approved_at,
+        reservation_id,
+        *sorted(expected_statuses),
+    )
+    async with _write_lock:
+        cur = await _db().execute(
+            f"""
+            UPDATE reservations SET
+                status=?, last_error=?,
+                approved_at=COALESCE(?, approved_at)
+            WHERE id=? AND status IN ({placeholders})
+            """,
+            params,
+        )
+        await _db().commit()
+        return cur.rowcount == 1
 
 
 async def set_reservation_status(
@@ -528,6 +591,10 @@ async def set_reservation_status(
     )
 
 
+async def get_reservation(reservation_id: int) -> Optional[aiosqlite.Row]:
+    return await _one("SELECT * FROM reservations WHERE id=?", (reservation_id,))
+
+
 async def reservations_for_request(request_id: str) -> list[aiosqlite.Row]:
     return await _all(
         "SELECT * FROM reservations WHERE request_id=? ORDER BY id",
@@ -535,12 +602,53 @@ async def reservations_for_request(request_id: str) -> list[aiosqlite.Row]:
     )
 
 
-async def pending_reservation_revocations() -> list[aiosqlite.Row]:
+async def pending_reservation_revocations(
+    approving_before: float,
+) -> list[aiosqlite.Row]:
     return await _all(
         "SELECT * FROM reservations "
-        "WHERE status IN ('approving', 'approved_revoke_pending') "
-        "ORDER BY approved_at, created_at"
+        "WHERE status IN ('approved_revoke_pending', 'cancel_requested', "
+        "'cancel_revoke_pending', 'expire_revoke_pending') "
+        "OR (status='approving' AND approved_at<=?) "
+        "ORDER BY approved_at, created_at",
+        (approving_before,),
     )
+
+
+async def expired_pending_reservations(cutoff: float) -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM reservations "
+        "WHERE status='pending' AND created_at<=? ORDER BY created_at",
+        (cutoff,),
+    )
+
+
+async def pending_order_link_revocations() -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT ol.* FROM order_links ol "
+        "JOIN orders o ON o.order_id=ol.order_id "
+        "WHERE ol.revoked=0 "
+        "AND (ol.joined_user IS NOT NULL OR o.status='revoke_pending') "
+        "ORDER BY ol.created_at"
+    )
+
+
+async def reconcile_order_status(order_id: str) -> None:
+    """Move a parent order out of pending after its targeted links are revoked."""
+    row = await _one(
+        "SELECT status, "
+        "EXISTS(SELECT 1 FROM order_links WHERE order_id=? AND revoked=0) AS has_open, "
+        "EXISTS(SELECT 1 FROM order_links WHERE order_id=? "
+        "AND joined_user IS NOT NULL AND revoked=0) AS has_spent_open "
+        "FROM orders WHERE order_id=?",
+        (order_id, order_id, order_id),
+    )
+    if not row:
+        return
+    if row["status"] == "revoke_pending" and not row["has_open"]:
+        await set_order_status(order_id, "revoked")
+    elif row["status"] == "joined_revoke_pending" and not row["has_spent_open"]:
+        await set_order_status(order_id, "joined")
 
 
 # --- events ---------------------------------------------------------------

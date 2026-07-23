@@ -20,8 +20,12 @@ STORE = Path(__file__).resolve().parent / "data" / "links.json"
 REQUESTS = STORE.parent / "link_requests.json"
 RESULTS = STORE.parent / "link_results.json"
 DEMO_LINK = STORE.parent / "demo_link.json"
+COMMANDS = STORE.parent / "command_claims.json"
+REVOKES = STORE.parent / "pending_revokes.json"
 _MAX_ENTRIES = 500
 _TTL = 3600
+_COMMAND_TTL = 86400
+_COMMAND_LEASE_SECONDS = 300
 _LEASE_SECONDS = 120
 
 _SMALL_CAPS = {
@@ -59,20 +63,38 @@ def _write_json(path: Path, data) -> None:
 
 @contextmanager
 def _exclusive(path: Path):
-    """Serialize read-modify-write operations across bot/userbot processes."""
+    """Serialize read-modify-write operations on POSIX and Windows."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     handle = open(lock_path, "a+")
+    windows_lock = False
     try:
-        import fcntl
+        try:
+            import fcntl
+        except ImportError:
+            import msvcrt
 
-        fcntl.flock(handle, fcntl.LOCK_EX)
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            windows_lock = True
+        else:
+            fcntl.flock(handle, fcntl.LOCK_EX)
         yield
     finally:
         try:
-            import fcntl
+            if windows_lock:
+                import msvcrt
 
-            fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_UN)
         finally:
             handle.close()
 
@@ -185,6 +207,115 @@ def is_demo_link(link: str) -> bool:
     return bool(link) and link == get_demo_link()
 
 
+# --- outgoing command idempotency ----------------------------------------
+def claim_command(
+    key: str, lease_seconds: int = _COMMAND_LEASE_SECONDS
+) -> Optional[str]:
+    """Claim one command and return its fencing token, or ``None``."""
+    if not key:
+        return None
+    now = time.time()
+    token = uuid.uuid4().hex
+
+    def update(claims):
+        if not isinstance(claims, dict):
+            claims = {}
+        claims = {
+            claim_key: claim
+            for claim_key, claim in claims.items()
+            if now - float(claim.get("ts", 0) or 0) < _COMMAND_TTL
+        }
+        current = claims.get(key)
+        if current:
+            if current.get("status") == "completed":
+                return claims, None
+            if float(current.get("lease_until", 0) or 0) > now:
+                return claims, None
+        claims[key] = {
+            "status": "processing",
+            "token": token,
+            "lease_until": now + max(30, int(lease_seconds)),
+            "ts": now,
+        }
+        return claims, token
+
+    return _mutate(COMMANDS, {}, update)
+
+
+def renew_command(
+    key: str, token: str, lease_seconds: int = _COMMAND_LEASE_SECONDS
+) -> bool:
+    now = time.time()
+
+    def update(claims):
+        if not isinstance(claims, dict):
+            claims = {}
+        claim = claims.get(key)
+        if (
+            not claim
+            or claim.get("status") != "processing"
+            or claim.get("token") != token
+            or float(claim.get("lease_until", 0) or 0) <= now
+        ):
+            return claims, False
+        claim["lease_until"] = now + max(30, int(lease_seconds))
+        claim["ts"] = now
+        return claims, True
+
+    return bool(_mutate(COMMANDS, {}, update))
+
+
+def complete_command(key: str, token: str) -> bool:
+    """Complete a command only when the caller still owns its fencing token."""
+    now = time.time()
+
+    def update(claims):
+        if not isinstance(claims, dict):
+            claims = {}
+        claim = claims.get(key)
+        if (
+            not claim
+            or claim.get("status") != "processing"
+            or claim.get("token") != token
+        ):
+            return claims, False
+        claims[key] = {"status": "completed", "lease_until": 0, "ts": now}
+        return claims, True
+
+    return bool(_mutate(COMMANDS, {}, update))
+
+
+# --- emergency invite revocation journal ---------------------------------
+def queue_revoke(chat_id: int, link: str) -> str:
+    """Durably retain a link when its primary database write failed."""
+    key = f"{int(chat_id)}:{link}"
+
+    def update(items):
+        if not isinstance(items, dict):
+            items = {}
+        items[key] = {"chat_id": int(chat_id), "link": link, "ts": time.time()}
+        return items, key
+
+    return _mutate(REVOKES, {}, update)
+
+
+def pending_revokes() -> list[dict]:
+    items = _read_json(REVOKES, {})
+    return list(items.values()) if isinstance(items, dict) else []
+
+
+def complete_revoke(chat_id: int, link: str) -> None:
+    key = f"{int(chat_id)}:{link}"
+
+    def update(items):
+        if not isinstance(items, dict):
+            items = {}
+        items.pop(key, None)
+        return items, None
+
+    _mutate(REVOKES, {}, update)
+
+
 # --- reservation bridge --------------------------------------------------
 def _clean_queries(queries) -> list[str]:
     if isinstance(queries, str):
@@ -200,12 +331,13 @@ def _clean_queries(queries) -> list[str]:
     return clean
 
 
-def request_links(queries, user_id: int) -> str:
-    """Queue one batched bot request for all requested group keywords."""
+def request_links(queries, user_id: int, request_key: str = "") -> str:
+    """Queue one batched bot request, reusing an existing caller identity."""
     clean = _clean_queries(queries)
     if not clean:
         raise ValueError("at least one group keyword is required")
     rid = uuid.uuid4().hex
+    request_key = str(request_key or "").strip()
     now = time.time()
 
     def update(reqs):
@@ -215,8 +347,20 @@ def request_links(queries, user_id: int) -> str:
             req for req in reqs
             if now - float(req.get("ts", 0) or 0) < _TTL
         ]
+        if request_key:
+            existing = next(
+                (
+                    req for req in reqs
+                    if req.get("request_key") == request_key
+                    and req.get("status") != "cancelled"
+                ),
+                None,
+            )
+            if existing:
+                return reqs, str(existing["id"])
         reqs.append({
             "id": rid,
+            "request_key": request_key,
             "queries": clean,
             "user_id": int(user_id),
             "status": "pending",
@@ -346,23 +490,32 @@ def release_request(
     return _set_request_state(rid, "pending", error, lease_token)
 
 
-def cancel_request(rid: str) -> bool:
-    """Cancel only if no result was already committed."""
+def cancel_request(rid: str, force: bool = False) -> bool:
+    """Cancel a request; ``force`` also compensates an already returned result."""
     with _exclusive_many((REQUESTS, RESULTS)):
         reqs = _read_json(REQUESTS, [])
         results = _read_json(RESULTS, {})
-        if isinstance(results, dict) and rid in results:
+        if not isinstance(results, dict):
+            results = {}
+        if rid in results and not force:
             return False
         if not isinstance(reqs, list):
             reqs = []
         changed = False
         for req in reqs:
-            if req.get("id") == rid and req.get("status") != "completed":
-                req["status"] = "cancelled"
-                req["lease_until"] = 0
-                req.pop("lease_token", None)
-                changed = True
+            if req.get("id") != rid:
+                continue
+            if req.get("status") == "completed" and not force:
                 break
+            req["status"] = "cancelled"
+            req["lease_until"] = 0
+            req.pop("lease_token", None)
+            changed = True
+            break
+        if force and rid in results:
+            results.pop(rid, None)
+            _write_json(RESULTS, results)
+            changed = True
         if changed:
             _write_json(REQUESTS, reqs)
         return changed

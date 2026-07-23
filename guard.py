@@ -22,7 +22,9 @@ from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsReq
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import (
     ChannelParticipantAdmin,
+    ChannelParticipantBanned,
     ChannelParticipantCreator,
+    ChannelParticipantLeft,
     ChannelParticipantsKicked,
     ChatBannedRights,
     UpdateChannelParticipant,
@@ -38,6 +40,8 @@ _UNBAN_RIGHTS = ChatBannedRights(until_date=None)
 
 client: TelegramClient | None = None
 _state = {"self_id": 0, "channel": None, "channel_id": 0, "owner": None, "owner_id": 0}
+_kicks_in_flight: set[int] = set()
+_background_tasks: set[asyncio.Task] = set()
 
 
 async def notify(text: str) -> None:
@@ -178,27 +182,32 @@ async def sweep_loop() -> None:
         return
     while True:
         await asyncio.sleep(config.SWEEP_MINUTES * 60)
-        n = await sweep_members()
-        if n:
-            print(ui.yellow("[sweep] ") + f"removed {n} member(s)")
-            await notify(f"Security sweep removed <b>{n}</b> member(s).")
+        try:
+            n = await sweep_members()
+            if n:
+                print(ui.yellow("[sweep] ") + f"removed {n} member(s)")
+                await notify(f"Security sweep removed <b>{n}</b> member(s).")
+        except Exception as error:  # noqa: BLE001
+            ui.error(f"security sweep failed: {type(error).__name__}: {error}")
 
 
 async def unban_all() -> int:
     """Clear every existing ban in the channel (so nobody stays banned)."""
     channel = _state["channel"]
     cleared = 0
-    offset = 0
     while True:
         try:
+            # Always read the first page because successful unbans remove rows
+            # from this filtered list and shift every later page toward zero.
             res = await client(GetParticipantsRequest(
-                channel, ChannelParticipantsKicked(q=""), offset, 100, hash=0,
+                channel, ChannelParticipantsKicked(q=""), 0, 100, hash=0,
             ))
         except Exception as e:  # noqa: BLE001
             print(ui.red("[unban] ") + f"list failed: {type(e).__name__}")
             break
         if not res.participants:
             break
+        page_cleared = 0
         for p in res.participants:
             peer = getattr(p, "peer", None)
             if peer is None:
@@ -206,11 +215,11 @@ async def unban_all() -> int:
             try:
                 await client(EditBannedRequest(channel, peer, _UNBAN_RIGHTS))
                 cleared += 1
+                page_cleared += 1
                 await asyncio.sleep(0.2)
             except Exception:
                 pass
-        offset += len(res.participants)
-        if len(res.participants) < 100:
+        if page_cleared == 0:
             break
     return cleared
 
@@ -223,12 +232,44 @@ def _can_ban(channel) -> bool:
     return bool(ar and getattr(ar, "ban_users", False))
 
 
+async def _kick_once(user_id: int) -> None:
+    """Collapse overlapping notifications only while a kick is in flight."""
+    if user_id in _kicks_in_flight:
+        return
+    _kicks_in_flight.add(user_id)
+    try:
+        await kick(user_id)
+    finally:
+        _kicks_in_flight.discard(user_id)
+
+
+def _start_background(coro, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def finished(done: asyncio.Task) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            ui.error(f"{done.get_name()} stopped: {type(error).__name__}: {error}")
+
+    task.add_done_callback(finished)
+
+
 async def on_participant(update):
     if not isinstance(update, UpdateChannelParticipant):
         return
     if _state["channel_id"] and update.channel_id != _state["channel_id"]:
         return
-    joined = update.prev_participant is None and update.new_participant is not None
+    previous_outside = update.prev_participant is None or isinstance(
+        update.prev_participant, (ChannelParticipantLeft, ChannelParticipantBanned)
+    )
+    current_inside = update.new_participant is not None and not isinstance(
+        update.new_participant, (ChannelParticipantLeft, ChannelParticipantBanned)
+    )
+    joined = previous_outside and current_inside
     print(ui.dim(
         f"[participant] user={update.user_id} "
         f"prev={type(update.prev_participant).__name__ if update.prev_participant else None} "
@@ -236,7 +277,7 @@ async def on_participant(update):
         f" -> {'JOIN' if joined else 'change'}"
     ))
     if joined:
-        await kick(update.user_id)
+        await _kick_once(update.user_id)
 
 
 async def on_chat_action(event):
@@ -244,7 +285,7 @@ async def on_chat_action(event):
     if not (event.user_joined or event.user_added):
         return
     for uid in (event.user_ids or ([event.user_id] if event.user_id else [])):
-        await kick(uid)
+        await _kick_once(uid)
 
 
 async def main() -> None:
@@ -315,8 +356,8 @@ async def main() -> None:
     # (a type-filtered Raw can miss updates on some layers).
     client.add_event_handler(on_participant, events.Raw)
     client.add_event_handler(on_chat_action, events.ChatAction(chats=channel))
-    asyncio.create_task(rotate_loop())
-    asyncio.create_task(sweep_loop())
+    _start_background(rotate_loop(), "link-rotation")
+    _start_background(sweep_loop(), "security-sweep")
 
     sweep_note = (f"security sweep every {config.SWEEP_MINUTES:g} min; "
                   if config.SWEEP_MINUTES > 0 else "")
@@ -327,7 +368,13 @@ async def main() -> None:
     ui.info(f"Rotating invite link every {ui.bold(f'{config.ROTATE_MINUTES:g}')} min; "
             f"{sweep_note}joiners are kicked + unbanned (no lasting ban). "
             + ui.dim("Ctrl+C to stop."))
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        for task in list(_background_tasks):
+            task.cancel()
+        if _background_tasks:
+            await asyncio.gather(*_background_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

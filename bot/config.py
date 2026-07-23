@@ -50,6 +50,8 @@ CLEAN_SERVICE = _bool("CLEAN_SERVICE", True)
 # is gated), and rotating it invalidates a link you may have already shared.
 # Single-use /add order links are always one-time regardless of this setting.
 ROTATE_ON_JOIN = _bool("ROTATE_ON_JOIN", False)
+# Pending buyer reservations are revoked after this many minutes if unused.
+RESERVATION_TTL_MINUTES = max(5, _int("RESERVATION_TTL_MINUTES", 60))
 # Optional friendly title for the invite links the bot creates.
 LINK_TITLE = (os.getenv("LINK_TITLE", "ChannelGuard") or "ChannelGuard").strip()
 
