@@ -377,3 +377,48 @@ def test_media_caption_limit_uses_utf16_units() -> None:
     assert quickreply._u16(text) == 1024
     assert entities == []
     assert clipped is True
+
+
+def test_quickreply_account_lock_is_shared_across_checkouts(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        quickreply.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    lock_path = quickreply._account_instance_lock_path(42)
+    assert lock_path == tmp_path / "channelguard-quickreply-account-42.lock"
+    assert quickreply._account_instance_lock_path(42) == lock_path
+    assert quickreply._account_instance_lock_path(43) != lock_path
+
+    original_handles = quickreply._instance_locks
+    quickreply._instance_locks = []
+    try:
+        assert quickreply._acquire_single_instance_lock(lock_path)
+        assert not quickreply._acquire_single_instance_lock(lock_path)
+    finally:
+        for handle in quickreply._instance_locks:
+            handle.close()
+        quickreply._instance_locks = original_handles
+
+
+def test_order_id_token_aliases_render_with_valid_entities() -> None:
+    alias = "｛ ORDER\u200b_ID ｝"
+    template = f"Order: {alias}"
+    entity = quickreply.MessageEntityBold(
+        offset=quickreply._u16("Order: "),
+        length=quickreply._u16(alias),
+    )
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pay["channel_template"] = template
+    quickreply._pay["channel_entities"] = quickreply._serialize_entities([entity])
+
+    text, entities = asyncio.run(
+        quickreply._render(
+            "channel", quickreply.Decimal("10"), "Bob", order_id="ANIABC234"
+        )
+    )
+
+    assert text == "Order: ANIABC234"
+    assert len(entities) == 1
+    assert entities[0].offset == quickreply._u16("Order: ")
+    assert entities[0].length == quickreply._u16("ANIABC234")

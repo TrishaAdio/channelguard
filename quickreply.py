@@ -52,11 +52,13 @@ import math
 import os
 import random
 import re
+import tempfile
 import time
 import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -186,45 +188,57 @@ _payment_lock = asyncio.Lock()
 # (+ optional *_ref message references), and the payments log.
 _pay: dict = {}
 
-# Kept open for the whole process so a second copy can't grab the same lock.
-_instance_lock = None
+# Keep every acquired lock handle open for the process lifetime. There are two:
+# one beside pay.json to protect a checkout's session/data, and one in the host
+# temp directory keyed by Telegram account to fence stale copies in other clones.
+_instance_locks = []
 
 
-def _acquire_single_instance_lock() -> bool:
-    """Take an exclusive lock so only ONE quickreply.py runs per machine.
+def _account_instance_lock_path(account_id: int):
+    """Host-global lock path shared by every checkout for this Telegram user."""
+    return (
+        Path(tempfile.gettempdir())
+        / f"channelguard-quickreply-account-{int(account_id)}.lock"
+    )
 
-    Running two copies on the same account makes them fight over every command:
-    one edits the message to its result while the other overwrites it with
-    'Command failed', and each error lands in a different terminal. Returns
-    True if this process owns the lock, False if another instance already does.
+
+def _acquire_single_instance_lock(lock_path=None) -> bool:
+    """Take a non-blocking process lock and retain it until shutdown.
+
+    The initial checkout-local lock prevents two processes opening the same
+    session/data files. After login, a second account-scoped lock in the host
+    temp directory prevents another checkout from handling the same Telegram
+    account and overwriting command results a moment later.
     """
-    global _instance_lock
     try:
         import fcntl
     except ImportError:
         return True  # non-POSIX platform: skip the guard rather than block
-    lock_path = config.PAY_FILE.parent / "quickreply.lock"
+
+    lock_path = Path(lock_path or (config.PAY_FILE.parent / "quickreply.lock"))
+    handle = None
     try:
-        config.PAY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(lock_path, "r+" if lock_path.exists() else "w+")
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, BlockingIOError):
-        # Someone else holds it — surface the PID they wrote so it can be killed.
+        if handle is not None:
+            handle.close()
         holder = ""
         try:
-            with open(lock_path) as existing:
+            with open(lock_path, encoding="utf-8") as existing:
                 holder = existing.read().strip()
         except OSError:
             pass
-        if holder:
-            ui.error(f"The other running quickreply.py is PID {holder}. "
-                     f"Stop it with:  kill {holder}")
+        detail = f" ({holder})" if holder else ""
+        ui.error(f"Another quickreply.py owns {lock_path}{detail}.")
         return False
-    _instance_lock = handle  # hold the fd open; the OS frees it when we exit
+
+    _instance_locks.append(handle)
     try:
         handle.seek(0)
         handle.truncate()
-        handle.write(str(os.getpid()))
+        handle.write(f"pid={os.getpid()} cwd={Path.cwd()}")
         handle.flush()
     except OSError:
         pass
@@ -851,6 +865,30 @@ def _substitute(text: str, entities, mapping: dict):
     return new_text, entities
 
 
+_ORDER_ID_TOKEN_ALIAS_RE = re.compile(
+    r"[\{\uff5b][\s\u200b-\u200d\ufeff]*order"
+    r"[\s_\-\u200b-\u200d\ufeff]*id"
+    r"[\s\u200b-\u200d\ufeff]*[\}\uff5d]",
+    re.IGNORECASE,
+)
+
+
+def _canonicalize_template_tokens(text: str, entities):
+    """Normalize visually equivalent order-id tokens before substitution.
+
+    Telegram templates are often copied from styled posts and may contain
+    full-width braces, capitalization, spaces, or invisible joiners. Keep the
+    entity offsets correct while converting those forms to `{orderid}`.
+    """
+    aliases = {
+        match.group(0): "{orderid}"
+        for match in _ORDER_ID_TOKEN_ALIAS_RE.finditer(text or "")
+    }
+    if not aliases:
+        return text or "", [copy.copy(entity) for entity in (entities or [])]
+    return _substitute(text, entities, aliases)
+
+
 def _serialize_entities(entities) -> list[dict]:
     """Store entities as plain dicts so formatting + premium emoji survive even
     if the original template post is later deleted (no re-fetch needed)."""
@@ -916,6 +954,7 @@ async def _render(kind: str, amount: Decimal, name: str, order_id: str = "",
     Guard/demo links are deliberately never a payment fallback.
     """
     text, ents = await _resolve_template(kind)
+    text, ents = _canonicalize_template_tokens(text, ents)
     return _substitute(
         text,
         ents,
@@ -1030,6 +1069,7 @@ async def _render_multi(kind: str, amount: Decimal, name: str, order_id: str,
     """Render a template but put the numbered/bold/blockquoted link block where
     {link} is (or append it if the template has no {link})."""
     text, ents = await _resolve_template(kind)
+    text, ents = _canonicalize_template_tokens(text, ents)
     ents = [copy.copy(e) for e in ents]
     # Substitute every token EXCEPT {link}; we place the styled block by hand.
     mapping = _pay_mapping(amount, name, order_id=order_id,
@@ -2456,6 +2496,13 @@ async def main() -> None:
     client = TelegramClient(config.QR_SESSION, config.API_ID, config.API_HASH)
     await client.start()  # prompts phone + OTP for THIS account on first run
     me = await client.get_me()
+    if not _acquire_single_instance_lock(_account_instance_lock_path(me.id)):
+        ui.error(
+            "Another checkout is already running quickreply.py for this Telegram "
+            "account. Stop every stale quickreply.py process, then start one copy."
+        )
+        await client.disconnect()
+        return
     _state["self_id"] = me.id
 
     global _greeted, _pay
