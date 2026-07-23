@@ -302,3 +302,78 @@ def test_channel_post_failure_keeps_committed_payment_and_one_receipt(monkeypatc
         assert payment["post_status"] == "failed"
 
     asyncio.run(scenario())
+
+
+
+def test_add_fits_channel_caption_and_preserves_order_id(monkeypatch) -> None:
+    async def scenario() -> None:
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["post_channel"] = -1001
+        quickreply._pay["channel_template"] = ("x" * 1020) + " {orderid}"
+        sent = []
+        edits = []
+
+        async def reserve(*_args, **_kwargs):
+            return {
+                "request_id": "request",
+                "entries": [
+                    {"link": "https://t.me/+paid", "title": "Group", "keyword": "cp"}
+                ],
+                "failures": [],
+            }
+
+        class Client:
+            async def send_file(self, *_args, **kwargs):
+                sent.append(kwargs)
+                return SimpleNamespace(id=123)
+
+        monkeypatch.setattr(quickreply, "_reserve_links", reserve)
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        monkeypatch.setattr(quickreply, "client", Client())
+
+        class Event:
+            raw_text = "/add 10 Bob cp"
+            chat_id = 42
+            id = 79
+            is_private = True
+
+            async def get_reply_message(self):
+                return SimpleNamespace(media=object(), sender_id=42)
+
+            async def edit(self, text, **_kwargs):
+                edits.append(text)
+
+            async def respond(self, text, **_kwargs):
+                edits.append(text)
+
+        await quickreply.cmd_add(Event())
+
+        assert len(edits) == 1
+        assert len(sent) == 1
+        payment = quickreply._pay["payments"][0]
+        caption = sent[0]["caption"]
+        assert payment["status"] == "valid"
+        assert payment["post_status"] == "posted"
+        assert payment["channel_caption_truncated"] is True
+        assert payment["order_id"] in caption
+        assert quickreply._u16(caption) <= 1024
+        assert all(
+            entity.offset + entity.length <= quickreply._u16(caption)
+            for entity in (sent[0]["formatting_entities"] or [])
+        )
+
+    asyncio.run(scenario())
+
+
+def test_media_caption_limit_uses_utf16_units() -> None:
+    exact = "😀" * 512
+    text, entities, clipped = quickreply._fit_media_caption(exact, [])
+    assert text == exact
+    assert entities == []
+    assert clipped is False
+
+    text, entities, clipped = quickreply._fit_media_caption(exact + "x", [])
+    assert quickreply._u16(text) == 1024
+    assert entities == []
+    assert clipped is True
