@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS orders (
     account_name TEXT NOT NULL DEFAULT '',
     keyword      TEXT NOT NULL DEFAULT '',
     status       TEXT NOT NULL DEFAULT 'open',
+    command_key  TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT 'bot',
+    buyer_id     INTEGER,
+    request_id   TEXT NOT NULL DEFAULT '',
+    response_html TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL DEFAULT 0,
     updated_at   REAL NOT NULL DEFAULT 0
 );
@@ -72,6 +77,7 @@ CREATE TABLE IF NOT EXISTS order_links (
     invite_link TEXT NOT NULL,
     joined_user INTEGER,
     revoked     INTEGER NOT NULL DEFAULT 0,
+    buyer_removed INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL DEFAULT 0
 );
 
@@ -87,6 +93,7 @@ CREATE TABLE IF NOT EXISTS bindings (
 CREATE TABLE IF NOT EXISTS reservations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id  TEXT NOT NULL,
+    order_id    TEXT NOT NULL DEFAULT '',
     keyword     TEXT NOT NULL DEFAULT '',
     chat_id     INTEGER NOT NULL,
     user_id     INTEGER NOT NULL,
@@ -136,6 +143,24 @@ async def init() -> None:
     await _conn.execute("PRAGMA journal_mode=WAL;")
     await _conn.execute("PRAGMA foreign_keys=ON;")
     await _conn.executescript(_SCHEMA)
+    # SQLite's CREATE TABLE IF NOT EXISTS does not add columns to installations
+    # created by earlier releases. Keep migrations additive and idempotent.
+    await _ensure_column("orders", "command_key", "TEXT NOT NULL DEFAULT ''")
+    await _ensure_column("orders", "source", "TEXT NOT NULL DEFAULT 'bot'")
+    await _ensure_column("orders", "buyer_id", "INTEGER")
+    await _ensure_column("orders", "request_id", "TEXT NOT NULL DEFAULT ''")
+    await _ensure_column("orders", "response_html", "TEXT NOT NULL DEFAULT ''")
+    await _ensure_column("reservations", "order_id", "TEXT NOT NULL DEFAULT ''")
+    await _ensure_column(
+        "order_links", "buyer_removed", "INTEGER NOT NULL DEFAULT 0"
+    )
+    await _conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_command_key "
+        "ON orders(command_key) WHERE command_key != ''"
+    )
+    await _conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_request ON orders(request_id)"
+    )
     # Preserve active links created by older releases. The old bindings table
     # allowed only one row per (chat,user); new reservations are keyed by the
     # exact invite link so simultaneous purchases stay independent.
@@ -156,6 +181,16 @@ async def init() -> None:
         """
     )
     await _conn.commit()
+
+
+async def _ensure_column(table: str, column: str, declaration: str) -> None:
+    cur = await _conn.execute(f"PRAGMA table_info({table})")
+    names = {row[1] for row in await cur.fetchall()}
+    await cur.close()
+    if column not in names:
+        await _conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        )
 
 
 async def close() -> None:
@@ -374,13 +409,31 @@ async def find_pending_by_username(username: str) -> list[aiosqlite.Row]:
 
 # --- orders ---------------------------------------------------------------
 async def create_next_order(
-    prefix: str, amount: str, account_name: str, keyword: str
+    prefix: str,
+    amount: str,
+    account_name: str,
+    keyword: str,
+    *,
+    command_key: str = "",
+    source: str = "bot",
+    buyer_id: Optional[int] = None,
+    request_id: str = "",
 ) -> str:
-    """Allocate and insert the next sequential order in one transaction."""
+    """Allocate one sequential order, idempotently for a Telegram command."""
     async with _write_lock:
         connection = _db()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            if command_key:
+                cur = await connection.execute(
+                    "SELECT order_id FROM orders WHERE command_key=?",
+                    (command_key,),
+                )
+                existing = await cur.fetchone()
+                await cur.close()
+                if existing:
+                    await connection.commit()
+                    return str(existing["order_id"])
             cur = await connection.execute(
                 "SELECT order_id FROM orders WHERE order_id LIKE ?",
                 (prefix + "%",),
@@ -399,10 +452,22 @@ async def create_next_order(
                 """
                 INSERT INTO orders
                     (order_id, amount, account_name, keyword, status,
+                     command_key, source, buyer_id, request_id,
                      created_at, updated_at)
-                VALUES (?,?,?,?, 'open', ?, ?)
+                VALUES (?,?,?,?, 'open', ?, ?, ?, ?, ?, ?)
                 """,
-                (order_id, amount, account_name, keyword, now, now),
+                (
+                    order_id,
+                    amount,
+                    account_name,
+                    keyword,
+                    command_key,
+                    source,
+                    buyer_id,
+                    request_id,
+                    now,
+                    now,
+                ),
             )
             await connection.commit()
             return order_id
@@ -411,13 +476,53 @@ async def create_next_order(
             raise
 
 
+async def register_order(
+    order_id: str,
+    amount: str,
+    account_name: str,
+    keyword: str,
+    *,
+    command_key: str = "",
+    source: str = "bridge",
+    buyer_id: Optional[int] = None,
+    request_id: str = "",
+) -> bool:
+    """Register a caller-provided canonical id without ever replacing metadata."""
+    now = time.time()
+    async with _write_lock:
+        cur = await _db().execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (order_id, amount, account_name, keyword, status,
+                 command_key, source, buyer_id, request_id,
+                 created_at, updated_at)
+            VALUES (?,?,?,?, 'open', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                amount,
+                account_name,
+                keyword,
+                command_key,
+                source,
+                buyer_id,
+                request_id,
+                now,
+                now,
+            ),
+        )
+        await _db().commit()
+        return cur.rowcount == 1
+
+
 async def delete_order_if_empty(order_id: str) -> bool:
     """Remove a failed order only when it has no surviving invite links."""
     async with _write_lock:
         cur = await _db().execute(
             "DELETE FROM orders WHERE order_id=? "
-            "AND NOT EXISTS (SELECT 1 FROM order_links WHERE order_id=?)",
-            (order_id, order_id),
+            "AND NOT EXISTS (SELECT 1 FROM order_links WHERE order_id=?) "
+            "AND NOT EXISTS (SELECT 1 FROM reservations WHERE order_id=?)",
+            (order_id, order_id, order_id),
         )
         await _db().commit()
         return cur.rowcount > 0
@@ -425,9 +530,15 @@ async def delete_order_if_empty(order_id: str) -> bool:
 
 async def add_order_link(order_id: str, chat_id: int, invite_link: str) -> int:
     async with _write_lock:
+        existing = await _one(
+            "SELECT id FROM order_links WHERE invite_link=?", (invite_link,)
+        )
+        if existing is not None:
+            return int(existing["id"])
         cur = await _db().execute(
             """
-            INSERT INTO order_links (order_id, chat_id, invite_link, created_at)
+            INSERT INTO order_links
+                (order_id, chat_id, invite_link, created_at)
             VALUES (?,?,?,?)
             """,
             (order_id, chat_id, invite_link, time.time()),
@@ -445,6 +556,18 @@ async def get_order(order_id: str) -> Optional[aiosqlite.Row]:
     return row
 
 
+async def get_order_by_command_key(command_key: str) -> Optional[aiosqlite.Row]:
+    if not command_key:
+        return None
+    return await _one("SELECT * FROM orders WHERE command_key=?", (command_key,))
+
+
+async def get_order_by_request_id(request_id: str) -> Optional[aiosqlite.Row]:
+    if not request_id:
+        return None
+    return await _one("SELECT * FROM orders WHERE request_id=?", (request_id,))
+
+
 async def order_links(order_id: str) -> list[aiosqlite.Row]:
     return await _all(
         "SELECT * FROM order_links WHERE order_id=? ORDER BY id", (order_id,)
@@ -458,6 +581,13 @@ async def set_order_status(order_id: str, status: str) -> None:
     )
 
 
+async def set_order_response(order_id: str, response_html: str) -> None:
+    await _run(
+        "UPDATE orders SET response_html=?, updated_at=? WHERE order_id=?",
+        (response_html, time.time(), order_id),
+    )
+
+
 async def find_order_link_by_invite(invite_link: str) -> Optional[aiosqlite.Row]:
     return await _one("SELECT * FROM order_links WHERE invite_link=?", (invite_link,))
 
@@ -466,8 +596,36 @@ async def set_order_link_joined(link_id: int, user_id: int) -> None:
     await _run("UPDATE order_links SET joined_user=? WHERE id=?", (user_id, link_id))
 
 
+async def set_order_link_joined_by_invite(
+    invite_link: str, user_id: int
+) -> None:
+    await _run(
+        "UPDATE order_links SET joined_user=? WHERE invite_link=?",
+        (user_id, invite_link),
+    )
+
+
+async def set_order_link_buyer_removed(link_id: int) -> None:
+    await _run(
+        "UPDATE order_links SET buyer_removed=1 WHERE id=?", (link_id,)
+    )
+
+
+async def set_order_link_buyer_removed_by_invite(invite_link: str) -> None:
+    await _run(
+        "UPDATE order_links SET buyer_removed=1 WHERE invite_link=?",
+        (invite_link,),
+    )
+
+
 async def set_order_link_revoked(link_id: int) -> None:
     await _run("UPDATE order_links SET revoked=1 WHERE id=?", (link_id,))
+
+
+async def set_order_link_revoked_by_invite(invite_link: str) -> None:
+    await _run(
+        "UPDATE order_links SET revoked=1 WHERE invite_link=?", (invite_link,)
+    )
 
 
 async def all_orders(limit: int = 20) -> list[aiosqlite.Row]:
@@ -481,6 +639,7 @@ async def add_reservation(
     chat_id: int,
     user_id: int,
     invite_link: str,
+    order_id: str = "",
 ) -> bool:
     """Persist the first link minted for this request/group.
 
@@ -491,11 +650,19 @@ async def add_reservation(
         cur = await _db().execute(
             """
             INSERT OR IGNORE INTO reservations
-                (request_id, keyword, chat_id, user_id, invite_link, status,
-                 created_at)
-            VALUES (?,?,?,?,?, 'pending', ?)
+                (request_id, order_id, keyword, chat_id, user_id, invite_link,
+                 status, created_at)
+            VALUES (?,?,?,?,?,?, 'pending', ?)
             """,
-            (request_id, keyword, chat_id, user_id, invite_link, time.time()),
+            (
+                request_id,
+                order_id,
+                keyword,
+                chat_id,
+                user_id,
+                invite_link,
+                time.time(),
+            ),
         )
         await _db().commit()
         return cur.rowcount == 1
@@ -507,6 +674,15 @@ async def reservation_for_request_group(
     return await _one(
         "SELECT * FROM reservations WHERE request_id=? AND keyword=? AND chat_id=?",
         (request_id, keyword, chat_id),
+    )
+
+
+async def set_reservation_order(
+    reservation_id: int, order_id: str
+) -> None:
+    await _run(
+        "UPDATE reservations SET order_id=? WHERE id=? AND order_id=''",
+        (order_id, reservation_id),
     )
 
 
@@ -602,6 +778,13 @@ async def reservations_for_request(request_id: str) -> list[aiosqlite.Row]:
     )
 
 
+async def reservations_for_order(order_id: str) -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM reservations WHERE order_id=? ORDER BY id",
+        (order_id,),
+    )
+
+
 async def pending_reservation_revocations(
     approving_before: float,
 ) -> list[aiosqlite.Row]:
@@ -627,7 +810,8 @@ async def pending_order_link_revocations() -> list[aiosqlite.Row]:
     return await _all(
         "SELECT ol.* FROM order_links ol "
         "JOIN orders o ON o.order_id=ol.order_id "
-        "WHERE ol.revoked=0 "
+        "WHERE (ol.revoked=0 OR "
+        "(ol.joined_user IS NOT NULL AND ol.buyer_removed=0)) "
         "AND (ol.joined_user IS NOT NULL OR o.status='revoke_pending') "
         "ORDER BY ol.created_at"
     )
@@ -640,15 +824,36 @@ async def reconcile_order_status(order_id: str) -> None:
         "EXISTS(SELECT 1 FROM order_links WHERE order_id=? AND revoked=0) AS has_open, "
         "EXISTS(SELECT 1 FROM order_links WHERE order_id=? "
         "AND joined_user IS NOT NULL AND revoked=0) AS has_spent_open "
+        ", EXISTS(SELECT 1 FROM order_links WHERE order_id=? "
+        "AND joined_user IS NOT NULL AND buyer_removed=0) AS has_buyer_cleanup "
         "FROM orders WHERE order_id=?",
-        (order_id, order_id, order_id),
+        (order_id, order_id, order_id, order_id),
     )
     if not row:
         return
-    if row["status"] == "revoke_pending" and not row["has_open"]:
+    if (
+        row["status"] == "revoke_pending"
+        and not row["has_open"]
+        and not row["has_buyer_cleanup"]
+    ):
         await set_order_status(order_id, "revoked")
     elif row["status"] == "joined_revoke_pending" and not row["has_spent_open"]:
         await set_order_status(order_id, "joined")
+
+
+async def reconcile_order_expiry(order_id: str) -> None:
+    """Aggregate per-link reservation expiry without hiding surviving links."""
+    row = await _one(
+        "SELECT "
+        "EXISTS(SELECT 1 FROM order_links "
+        "WHERE order_id=? AND revoked=0) AS has_open "
+        "FROM orders WHERE order_id=?",
+        (order_id, order_id),
+    )
+    if row:
+        await set_order_status(
+            order_id, "partially_expired" if row["has_open"] else "expired"
+        )
 
 
 # --- events ---------------------------------------------------------------

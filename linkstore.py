@@ -331,11 +331,33 @@ def _clean_queries(queries) -> list[str]:
     return clean
 
 
-def request_links(queries, user_id: int, request_key: str = "") -> str:
-    """Queue one batched bot request, reusing an existing caller identity."""
+def _clean_request_metadata(metadata) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    clean = {}
+    for key in ("order_id", "amount", "account_name", "keyword"):
+        value = str(metadata.get(key, "") or "").strip()
+        if value:
+            clean[key] = value[:300]
+    return clean
+
+
+def request_links(
+    queries,
+    user_id: int,
+    request_key: str = "",
+    metadata=None,
+) -> str:
+    """Queue one batched bot request, reusing an existing caller identity.
+
+    Payment metadata is committed with the first request. A retry with the same
+    ``request_key`` receives that same request and therefore the same canonical
+    order id.
+    """
     clean = _clean_queries(queries)
     if not clean:
         raise ValueError("at least one group keyword is required")
+    clean_metadata = _clean_request_metadata(metadata)
     rid = uuid.uuid4().hex
     request_key = str(request_key or "").strip()
     now = time.time()
@@ -363,6 +385,7 @@ def request_links(queries, user_id: int, request_key: str = "") -> str:
             "request_key": request_key,
             "queries": clean,
             "user_id": int(user_id),
+            "metadata": clean_metadata,
             "status": "pending",
             "attempts": 0,
             "lease_until": 0,
@@ -387,6 +410,20 @@ def pending_requests() -> list:
         req for req in reqs
         if req.get("status", "pending") not in {"completed", "cancelled"}
     ]
+
+
+def get_request_details(rid: str) -> Optional[dict]:
+    requests = _read_json(REQUESTS, [])
+    if not isinstance(requests, list):
+        return None
+    request = next(
+        (
+            item for item in requests
+            if isinstance(item, dict) and item.get("id") == rid
+        ),
+        None,
+    )
+    return dict(request) if request is not None else None
 
 
 def claim_requests(limit: int = 10, lease_seconds: int = _LEASE_SECONDS) -> list:
@@ -510,8 +547,22 @@ def cancel_request(rid: str, force: bool = False) -> bool:
             req["status"] = "cancelled"
             req["lease_until"] = 0
             req.pop("lease_token", None)
+            req.pop("cleanup_completed", None)
             changed = True
             break
+        if force and not any(req.get("id") == rid for req in reqs):
+            # Keep a fresh cancellation tombstone even if the original bridge
+            # request aged out. The bot can still locate its durable SQLite
+            # reservations by request id and finish revocation/removal.
+            reqs.append(
+                {
+                    "id": rid,
+                    "status": "cancelled",
+                    "lease_until": 0,
+                    "ts": time.time(),
+                }
+            )
+            changed = True
         if force and rid in results:
             results.pop(rid, None)
             _write_json(RESULTS, results)
@@ -539,7 +590,24 @@ def cancelled_request_ids() -> list[str]:
         if isinstance(req, dict)
         and req.get("id")
         and req.get("status") == "cancelled"
+        and not req.get("cleanup_completed")
     ]
+
+
+def complete_cancellation(rid: str) -> bool:
+    """Acknowledge that bot-side SQLite/link cleanup reached a terminal state."""
+    def update(reqs):
+        if not isinstance(reqs, list):
+            reqs = []
+        changed = False
+        for req in reqs:
+            if req.get("id") == rid and req.get("status") == "cancelled":
+                req["cleanup_completed"] = True
+                changed = True
+                break
+        return reqs, changed
+
+    return bool(_mutate(REQUESTS, [], update))
 
 
 def has_result(rid: str) -> bool:
