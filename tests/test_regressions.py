@@ -593,6 +593,58 @@ def test_exact_photo_add_renders_14_and_order_id_everywhere(
     asyncio.run(scenario())
 
 
+def test_payment_channel_survives_data_directory_replacement(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(quickreply.config, "PAYMENT_CHANNEL_RAW", "-1001234567890")
+
+    fresh = quickreply._default_pay()
+    loaded, _repairs = quickreply._normalize_pay_data(
+        {
+            "post_channel": None,
+            "done_template": quickreply.DEFAULT_DONE,
+            "channel_template": quickreply.DEFAULT_CHANNEL,
+            "payments": [],
+        }
+    )
+
+    assert fresh["post_channel"] == -1001234567890
+    assert loaded["post_channel"] == -1001234567890
+
+
+def test_setchannel_persists_runtime_and_environment(monkeypatch) -> None:
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        saved = []
+        replies = []
+        monkeypatch.setattr(
+            quickreply.config,
+            "save_env",
+            lambda values: saved.append(values),
+        )
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+
+        class Event:
+            is_channel = True
+            chat_id = -1009876543210
+
+            async def get_chat(self):
+                return SimpleNamespace(title="Payments")
+
+            async def edit(self, text, **_kwargs):
+                replies.append(text)
+
+        await quickreply.cmd_setchannel(Event())
+
+        assert quickreply._pay["post_channel"] == -1009876543210
+        assert saved == [{"PAYMENT_CHANNEL": "-1009876543210"}]
+        assert replies == [
+            "Post channel set here: Payments (-1009876543210)"
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_rendered_channel_post_can_be_reused_as_a_live_template() -> None:
     template = (
         "#NEW PAYMENT RECEIVED ! 🎉\n\n"

@@ -187,7 +187,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | reply to an image + `/add <amount> [name]` | record the payment (INR), message the user in that private chat, and auto-post the image + caption to your channel |
 | `/setdone <template>` | the message the paying user receives in the private chat |
 | `/setchannelpostofpayment <template>` | the caption used for the channel post |
-| `.setchannel` (typed in a channel) | set that channel as the post target |
+| `.setchannel` (typed in a channel) | set that channel as the post target and persist it as `PAYMENT_CHANNEL` in `.env` |
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
@@ -203,7 +203,9 @@ today). The `{orderid}` prefix and suffix length are set by `ORDER_PREFIX` and
 with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
 emoji verbatim. `pay.json` is validated and repaired at startup; malformed manual
 edits are backed up as `data/pay.recovery-*.json` instead of preventing every
-command from loading. Every new `/add` upload is linked to its payment record; replying
+command from loading. If `data/pay.json` is missing after a clean deployment,
+quickreply restores the upload target from `PAYMENT_CHANNEL` in `.env`.
+Every new `/add` upload is linked to its payment record; replying
 `/cancel` to that generated post marks it **FAKE PAYMENT** while retaining an
 audit record, and excludes it from `/stats` and all later daily-total template
 values. Posts generated before `/cancel` support cannot be matched retroactively.

@@ -539,12 +539,17 @@ async def _copy_to(peer, src):
 # --------------------------------------------------------------------------
 # Payment logger
 # --------------------------------------------------------------------------
-QUICKREPLY_BUILD = "payment-template-v2"
+QUICKREPLY_BUILD = "payment-template-v3"
+
+
+def _configured_post_channel() -> int | None:
+    value = config.payment_channel()
+    return value if isinstance(value, int) else None
 
 
 def _default_pay() -> dict:
     return {
-        "post_channel": None,
+        "post_channel": _configured_post_channel(),
         "done_template": DEFAULT_DONE,
         "channel_template": DEFAULT_CHANNEL,
         "payments": [],
@@ -580,6 +585,8 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
     post_channel = _optional_int(data.get("post_channel"))
     if data.get("post_channel") not in (None, "") and post_channel is None:
         repairs.append("invalid post_channel removed")
+    if post_channel is None:
+        post_channel = _configured_post_channel()
     data["post_channel"] = post_channel
 
     for key, default in (
@@ -2217,7 +2224,14 @@ async def cmd_setchannel(event) -> None:
     title = getattr(chat, "title", None) or "this chat"
     _pay["post_channel"] = chat_id
     _save_pay()
-    await _ack(event, f"Post channel set here: {title} ({chat_id})")
+    persisted = True
+    try:
+        config.save_env({"PAYMENT_CHANNEL": str(chat_id)})
+    except OSError as error:
+        persisted = False
+        ui.warn(f"Couldn't persist PAYMENT_CHANNEL in .env: {error}")
+    suffix = "" if persisted else " (saved for this data folder only)"
+    await _ack(event, f"Post channel set here: {title} ({chat_id}){suffix}")
 
 
 async def cmd_stats(event) -> None:
@@ -2798,9 +2812,12 @@ async def _handle_outgoing(event):
     # Messages) so the longer commands win.
     low_cmd = raw_text.strip().lower()
     if low_cmd in (".ping", "/ping"):
+        post_channel = _pay.get("post_channel")
+        channel_state = str(post_channel) if post_channel else "NOT SET"
         await _ack(
             event,
-            f"Quick-reply userbot is running ({QUICKREPLY_BUILD}).",
+            f"Quick-reply userbot is running ({QUICKREPLY_BUILD}). "
+            f"Payment channel: {channel_state}.",
         )
         return
     if low_cmd in (".help", "/help", "/commands", "/start"):
