@@ -910,6 +910,116 @@ def _canonicalize_template_tokens(text: str, entities):
     return _substitute(text, entities, aliases)
 
 
+_LEGACY_PAYMENT_FIELD_PATTERNS = (
+    (
+        re.compile(
+            r"(?im)\bpayment\s+of\s*"
+            r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
+        ),
+        "{amount}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*amount\s*:\s*"
+            r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
+        ),
+        "{amount}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*marco(?:'s)?\s+share\s*:\s*"
+            r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
+        ),
+        "{marco}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*rio(?:'s)?\s+share\s*:\s*"
+            r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
+        ),
+        "{rioshare}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*payment\s+count\s*:\s*#?\s*"
+            r"(?P<value>\d+)"
+        ),
+        "{total}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*total\s*:\s*"
+            r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
+        ),
+        "{todaytotal}",
+    ),
+    (
+        re.compile(
+            r"(?im)^\s*order\s+id\s*:\s*"
+            r"(?P<value>[A-Za-z][A-Za-z0-9_-]{3,})"
+        ),
+        "{orderid}",
+    ),
+)
+
+
+def _substitute_spans(text: str, entities, replacements: list[tuple]):
+    """Replace non-overlapping character spans while preserving entities."""
+    text = text or ""
+    entities = [copy.copy(entity) for entity in (entities or [])]
+    replacements = sorted(replacements, key=lambda item: (item[0], item[1]))
+    accepted = []
+    cursor = 0
+    for start, end, value in replacements:
+        if start < cursor or end <= start:
+            continue
+        accepted.append((start, end, str(value)))
+        cursor = end
+    if not accepted:
+        return text, entities
+
+    parts = []
+    cursor = 0
+    changes = []
+    for start, end, value in accepted:
+        parts.extend((text[cursor:start], value))
+        start_u16 = _u16(text[:start])
+        old_u16 = _u16(text[start:end])
+        changes.append(
+            (start_u16, start_u16 + old_u16, _u16(value) - old_u16)
+        )
+        cursor = end
+    parts.append(text[cursor:])
+
+    for entity in entities:
+        entity_start = entity.offset
+        entity_end = entity.offset + entity.length
+        offset_delta = length_delta = 0
+        for start, end, delta in changes:
+            if end <= entity_start:
+                offset_delta += delta
+            elif start < entity_end:
+                length_delta += delta
+        entity.offset += offset_delta
+        entity.length = max(0, entity.length + length_delta)
+    return "".join(parts), entities
+
+
+def _canonicalize_legacy_payment_fields(text: str, entities):
+    """Recover live tokens from templates saved from an old rendered receipt.
+
+    Owners commonly reply to a previous receipt with ``/setdone``. That receipt
+    already contains values such as ``₹1`` or ``#25`` instead of tokens. Known
+    payment labels make those values unambiguous, so convert them back to live
+    placeholders rather than carrying the old values into every future order.
+    """
+    replacements = []
+    for pattern, token in _LEGACY_PAYMENT_FIELD_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            replacements.append((*match.span("value"), token))
+    return _substitute_spans(text, entities, replacements)
+
+
 def _force_required_token_values(
     text: str, entities, amount: Decimal, order_id: str
 ):
@@ -996,6 +1106,7 @@ async def _render(kind: str, amount: Decimal, name: str, order_id: str = "",
     """
     text, ents = await _resolve_template(kind)
     text, ents = _canonicalize_template_tokens(text, ents)
+    text, ents = _canonicalize_legacy_payment_fields(text, ents)
     return _substitute(
         text,
         ents,
@@ -1134,6 +1245,7 @@ async def _render_multi(kind: str, amount: Decimal, name: str, order_id: str,
     {link} is (or append it if the template has no {link})."""
     text, ents = await _resolve_template(kind)
     text, ents = _canonicalize_template_tokens(text, ents)
+    text, ents = _canonicalize_legacy_payment_fields(text, ents)
     ents = [copy.copy(e) for e in ents]
     # Substitute every token EXCEPT {link}; we place the styled block by hand.
     mapping = _pay_mapping(amount, name, order_id=order_id,
@@ -2059,6 +2171,9 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
         template, entities = _canonicalize_template_tokens(
             reply.raw_text, reply.entities
         )
+        template, entities = _canonicalize_legacy_payment_fields(
+            template, entities
+        )
         _pay[f"{kind}_template"] = template
         # Store the formatting verbatim so it survives even if the post is gone.
         _pay[f"{kind}_entities"] = _serialize_entities(entities)
@@ -2074,6 +2189,7 @@ async def _set_template(event, kind: str, cmd: str, label: str) -> None:
         await _ack(event, f"Send the text after {cmd}, or reply to a formatted post with {cmd}.")
         return
     template, _ = _canonicalize_template_tokens(template, [])
+    template, _ = _canonicalize_legacy_payment_fields(template, [])
     _pay[f"{kind}_template"] = template
     _pay.pop(f"{kind}_ref", None)
     _pay.pop(f"{kind}_entities", None)

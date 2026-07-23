@@ -541,7 +541,7 @@ def test_exact_photo_add_renders_14_and_order_id_everywhere(
     async def scenario() -> None:
         template = (
             "Thanks For Paying 🎭\n"
-            "We Have Successfully Received Your Payment Of {amount}\n\n"
+            "We Have Successfully Received Your Payment Of ₹1\n\n"
             "Order ID : ❴ ORDER\u2060_ID ❵ 🔥\n\n"
             "Hold On ! We Are Preparing Your Links Now ♻️"
         )
@@ -583,13 +583,57 @@ def test_exact_photo_add_renders_14_and_order_id_everywhere(
         order_id = quickreply._pay["payments"][0]["order_id"]
         assert quickreply._pay["payments"][0]["amount"] == "14.00"
         for rendered in (private[0], channel[0]):
-            assert "₹14" in rendered
+            assert "Payment Of ₹14" in rendered
             assert order_id in rendered
             assert "{amount}" not in rendered.casefold()
             assert "orderid" not in rendered.casefold()
             assert "order_id" not in rendered.casefold()
+            assert "\n\nAmount: ₹14" not in rendered
 
     asyncio.run(scenario())
+
+
+def test_rendered_channel_post_can_be_reused_as_a_live_template() -> None:
+    template = (
+        "#NEW PAYMENT RECEIVED ! 🎉\n\n"
+        "AMOUNT : ₹599\n"
+        "MARCO SHARE : ₹2,298.60\n"
+        "RIO'S SHARE : ₹2,809.40\n"
+        "ORDER ID : {orderid}\n"
+        "AMOUNT CREDITED ON : airtel\n\n"
+        "PAYMENT COUNT : #25\n"
+        "TOTAL : ₹5,108"
+    )
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pay["channel_template"] = template
+
+    text, _entities = asyncio.run(
+        quickreply._safe_payment_output(
+            "channel",
+            quickreply.Decimal("14"),
+            "Amit",
+            "ANILIVE42",
+            [],
+            [],
+            include_current=True,
+        )
+    )
+    mapping = quickreply._pay_mapping(
+        quickreply.Decimal("14"),
+        "Amit",
+        order_id="ANILIVE42",
+        include_current=True,
+    )
+
+    assert "AMOUNT : ₹14" in text
+    assert f"MARCO SHARE : {mapping['{marco}']}" in text
+    assert f"RIO'S SHARE : {mapping['{rioshare}']}" in text
+    assert "ORDER ID : ANILIVE42" in text
+    assert f"PAYMENT COUNT : #{mapping['{total}']}" in text
+    assert f"TOTAL : {mapping['{todaytotal}']}" in text
+    assert "₹2,298.60" not in text
+    assert "₹2,809.40" not in text
+    assert "₹5,108" not in text
 
 
 def test_partial_group_failure_renders_values_privately_and_in_channel(
