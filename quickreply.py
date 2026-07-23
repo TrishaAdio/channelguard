@@ -34,7 +34,8 @@ Payment logger (send these yourself in ANY chat):
   .setchannel                    type it in a channel -> post media there
   /stats                         today's total (INR) + count + split
   /cancel                        in the upload channel, reply to a payment post
-                                 -> mark it fake and remove it from today's stats
+                                 -> mark it fake, remove it from today's stats,
+                                    and revoke/remove buyer-bound access
   /clear                         reset today's stats to zero
   .ping                          verify the quick-reply userbot is running
   .help                          show every command and template parameter
@@ -163,6 +164,7 @@ except (ImportError, KeyError):
 DEFAULT_DONE = "Payment of {amount} received - thank you, {name}!"
 DEFAULT_CHANNEL = (
     "New payment received\n"
+    "Order {orderid}\n"
     "{name} paid {amount}\n\n"
     "Rio {rioshare} - Marco {marco}\n"
     "Payments today: {total}\n"
@@ -726,6 +728,7 @@ _MAX_AMOUNT = Decimal("1000000000000000")
 def parse_amount(raw: str) -> Decimal:
     """Parse one positive, finite INR amount and round it to paise."""
     cleaned = str(raw).replace(",", "").replace("\u20b9", "").strip()
+    cleaned = re.sub(r"\s*INR\s*$", "", cleaned, flags=re.IGNORECASE)
     try:
         value = Decimal(cleaned)
     except InvalidOperation as error:
@@ -865,25 +868,39 @@ def _substitute(text: str, entities, mapping: dict):
     return new_text, entities
 
 
-_ORDER_ID_TOKEN_ALIAS_RE = re.compile(
-    r"[\{\uff5b][\s\u200b-\u200d\ufeff]*order"
-    r"[\s_\-\u200b-\u200d\ufeff]*id"
-    r"[\s\u200b-\u200d\ufeff]*[\}\uff5d]",
+_TEMPLATE_TOKEN_ALIAS_RE = re.compile(
+    r"[\{\uff5b]([^{}\uff5b\uff5d]{1,40})[\}\uff5d]",
     re.IGNORECASE,
 )
+_TEMPLATE_TOKEN_ALIASES = {
+    "amount": "{amount}",
+    "name": "{name}",
+    "orderid": "{orderid}",
+    "link": "{link}",
+    "rioshare": "{rioshare}",
+    "marco": "{marco}",
+    "total": "{total}",
+    "todaytotal": "{todaytotal}",
+}
 
 
 def _canonicalize_template_tokens(text: str, entities):
-    """Normalize visually equivalent order-id tokens before substitution.
+    """Normalize visually equivalent payment tokens before substitution.
 
     Telegram templates are often copied from styled posts and may contain
-    full-width braces, capitalization, spaces, or invisible joiners. Keep the
-    entity offsets correct while converting those forms to `{orderid}`.
+    full-width braces, capitalization, spaces, underscores, or invisible
+    joiners. Keep entity offsets correct while converting those forms to their
+    canonical tokens. This covers every supported payment value, not only
+    ``{orderid}``.
     """
-    aliases = {
-        match.group(0): "{orderid}"
-        for match in _ORDER_ID_TOKEN_ALIAS_RE.finditer(text or "")
-    }
+    aliases = {}
+    for match in _TEMPLATE_TOKEN_ALIAS_RE.finditer(text or ""):
+        key = re.sub(
+            r"[\s_\-\u200b-\u200d\ufeff]+", "", match.group(1)
+        ).casefold()
+        canonical = _TEMPLATE_TOKEN_ALIASES.get(key)
+        if canonical:
+            aliases[match.group(0)] = canonical
     if not aliases:
         return text or "", [copy.copy(entity) for entity in (entities or [])]
     return _substitute(text, entities, aliases)
@@ -990,21 +1007,40 @@ async def _revoke_and_delete_link(group, link: str | None) -> None:
 
 
 async def _reserve_links(
-    keywords, user_id: int, request_key: str, timeout: float = 45.0
+    keywords,
+    user_id: int,
+    request_key: str,
+    *,
+    metadata=None,
+    timeout: float = 45.0,
 ) -> dict:
     """Send one idempotent reservation request to the admin bot."""
-    empty = {"request_id": "", "entries": [], "failures": []}
+    empty = {
+        "request_id": "",
+        "metadata": dict(metadata or {}),
+        "entries": [],
+        "failures": [],
+    }
     if linkstore is None:
         return {
+            "request_id": "",
+            "metadata": dict(metadata or {}),
             "entries": [],
             "failures": [{"keyword": "bridge", "reason": "bridge unavailable"}],
         }
     try:
         rid = linkstore.request_links(
-            keywords, int(user_id), request_key=request_key
+            keywords,
+            int(user_id),
+            request_key=request_key,
+            metadata=metadata,
         )
+        request = linkstore.get_request_details(rid) or {}
+        canonical_metadata = dict(request.get("metadata") or metadata or {})
     except Exception as e:  # noqa: BLE001
         return {
+            "request_id": "",
+            "metadata": dict(metadata or {}),
             "entries": [],
             "failures": [{"keyword": "bridge", "reason": str(e)}],
         }
@@ -1015,12 +1051,14 @@ async def _reserve_links(
             if result is not None:
                 return {
                     "request_id": rid,
+                    "metadata": canonical_metadata,
                     "entries": list(result.get("entries") or []),
                     "failures": list(result.get("failures") or []),
                 }
         except Exception as e:  # noqa: BLE001
             return {
                 "request_id": rid,
+                "metadata": canonical_metadata,
                 "entries": [],
                 "failures": [{"keyword": "bridge", "reason": str(e)}],
             }
@@ -1032,12 +1070,14 @@ async def _reserve_links(
             if result is not None:
                 return {
                     "request_id": rid,
+                    "metadata": canonical_metadata,
                     "entries": list(result.get("entries") or []),
                     "failures": list(result.get("failures") or []),
                 }
     except Exception:  # noqa: BLE001
         pass
     empty["request_id"] = rid
+    empty["metadata"] = canonical_metadata
     empty["failures"].append({
         "keyword": "bridge", "reason": "bot response timed out"
     })
@@ -1109,6 +1149,266 @@ async def _render_multi(kind: str, amount: Decimal, name: str, order_id: str,
     return text, ents
 
 
+def _failure_detail(failures: list) -> str:
+    return "; ".join(
+        f"{item.get('keyword', 'group')}: "
+        f"{item.get('reason', 'unavailable')}"
+        for item in failures
+        if isinstance(item, dict)
+    )
+
+
+def _ensure_payment_metadata(
+    text: str, amount: Decimal, order_id: str
+) -> str:
+    """Guarantee that receipts retain the two canonical payment identifiers."""
+    text = text or ""
+    missing = []
+    if order_id and order_id not in text:
+        missing.append(f"Order ID: {order_id}")
+    rendered_amount = fmt_inr(amount)
+    if rendered_amount not in text:
+        missing.append(f"Amount: {rendered_amount}")
+    if missing:
+        separator = "\n\n" if text else ""
+        text += separator + "\n".join(missing)
+    return text
+
+
+def _decorate_payment_output(
+    text: str,
+    entities,
+    amount: Decimal,
+    order_id: str,
+    failures: list,
+):
+    text = _ensure_payment_metadata(text, amount, order_id)
+    detail = _failure_detail(failures)
+    if detail:
+        text += f"\n\nUnavailable: {detail}"
+    return text, list(entities or [])
+
+
+def _fallback_payment_output(
+    kind: str,
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+    include_current: bool,
+):
+    """Complete plain-text output used when a saved rich template is damaged."""
+    base = DEFAULT_DONE if kind == "done" else DEFAULT_CHANNEL
+    mapping = _pay_mapping(
+        amount,
+        name,
+        order_id=order_id,
+        include_current=include_current,
+        link="",
+    )
+    text, _entities = _substitute(base, [], mapping)
+    if entries:
+        links = "\n".join(
+            f"{index}. {entry.get('link', '')}"
+            for index, entry in enumerate(entries, 1)
+        )
+        text += f"\n\n{links}"
+    return _decorate_payment_output(
+        text, [], amount, order_id, failures
+    )
+
+
+async def _safe_payment_output(
+    kind: str,
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+    include_current: bool = False,
+):
+    """Render a complete message; damaged custom templates degrade to defaults."""
+    try:
+        if entries:
+            text, entities = await _render_multi(
+                kind,
+                amount,
+                name,
+                order_id,
+                entries,
+                include_current=include_current,
+            )
+        else:
+            text, entities = await _render(
+                kind,
+                amount,
+                name,
+                order_id=order_id,
+                include_current=include_current,
+                link="",
+            )
+        return _decorate_payment_output(
+            text, entities, amount, order_id, failures
+        )
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            f"{kind} template failed; using complete plain-text fallback: "
+            f"{type(error).__name__}: {error}"
+        )
+        return _fallback_payment_output(
+            kind,
+            amount,
+            name,
+            order_id,
+            entries,
+            failures,
+            include_current,
+        )
+
+
+def _required_payment_text(
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+    *,
+    include_current: bool,
+) -> str:
+    """Plain complete metadata used when Telegram requires message overflow."""
+    mapping = _pay_mapping(
+        amount,
+        name,
+        order_id=order_id,
+        include_current=include_current,
+    )
+    lines = [
+        f"Order ID: {order_id}",
+        f"Amount: {mapping['{amount}']}",
+        f"Name: {name}",
+        f"Rio: {mapping['{rioshare}']}",
+        f"Marco: {mapping['{marco}']}",
+        f"Payments today: {mapping['{total}']}",
+        f"Collected today: {mapping['{todaytotal}']}",
+    ]
+    if entries:
+        lines.append("")
+        lines.append("Links:")
+        lines.extend(
+            f"{index}. {entry.get('link', '')}"
+            for index, entry in enumerate(entries, 1)
+        )
+    detail = _failure_detail(failures)
+    if detail:
+        lines.extend(("", f"Unavailable: {detail}"))
+    return "\n".join(lines)
+
+
+def _split_plain_text(
+    text: str, *, header: str = "", limit: int = 4000
+) -> list[str]:
+    """Split at line boundaries and repeat canonical metadata on later chunks."""
+    chunks = []
+    current = ""
+    for line in (text or "").splitlines() or [""]:
+        candidate = line if not current else current + "\n" + line
+        if _u16(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if _u16(line) > limit:
+            # URLs and failure reasons are normally short. A corrupted/manual
+            # value must still be bounded rather than making every send fail.
+            line = line[:limit]
+        current = (header + "\n" + line) if header else line
+    if current:
+        chunks.append(current)
+    return chunks or [header or ""]
+
+
+async def _deliver_payment_receipt(
+    event,
+    text: str,
+    entities,
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+) -> bool:
+    if _u16(text) <= 4096:
+        try:
+            dropped = await _edit_rich(event, text, entities)
+            if dropped:
+                ui.warn(
+                    f"Done message: dropped {dropped} unsupported entity(ies)."
+                )
+            return True
+        except Exception as error:  # noqa: BLE001
+            ui.warn(
+                f"Rich receipt edit failed; sending plain text: "
+                f"{type(error).__name__}: {error}"
+            )
+            return await _ack(event, text)
+
+    fallback = _required_payment_text(
+        amount,
+        name,
+        order_id,
+        entries,
+        failures,
+        include_current=False,
+    )
+    chunks = _split_plain_text(
+        fallback, header=f"Order ID: {order_id}"
+    )
+    if not await _ack(event, chunks[0]):
+        return False
+    for chunk in chunks[1:]:
+        try:
+            await event.respond(chunk)
+        except Exception as error:  # noqa: BLE001
+            ui.warn(f"Receipt overflow send failed: {type(error).__name__}: {error}")
+            return False
+    return True
+
+
+async def _send_payment_overflow(
+    target_channel: int,
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+) -> str:
+    """Send complete required caption data; return an error string on failure."""
+    overflow = _required_payment_text(
+        amount,
+        name,
+        order_id,
+        entries,
+        failures,
+        include_current=True,
+    )
+    chunks = _split_plain_text(overflow, header=f"Order ID: {order_id}")
+    marker = None
+    try:
+        for chunk in chunks:
+            marker = _expect_automatic_outgoing(target_channel, [chunk])
+            sent = await client.send_message(
+                target_channel, chunk, link_preview=False
+            )
+            _finish_automatic_outgoing(target_channel, marker, sent)
+            marker = None
+    except Exception as error:  # noqa: BLE001
+        if marker is not None:
+            _cancel_automatic_outgoing(target_channel, marker)
+        return f"{type(error).__name__}: {error}"
+    return ""
+
+
 def _entity_fallbacks(ents):
     """Full entities, then custom-emoji-free entities, then plain text."""
     ents = list(ents or [])
@@ -1121,12 +1421,12 @@ def _entity_fallbacks(ents):
     return tries
 
 
-def _fit_media_caption(text: str, entities, preserve: str = "", limit: int = 1024):
+def _fit_media_caption(text: str, entities, preserve="", limit: int = 1024):
     """Fit a rendered caption to Telegram's UTF-16 limit.
 
-    If the requested order id would otherwise be cut from an oversized caption,
-    keep it at the front. Formatting entities are shifted/clipped to remain
-    valid, so a long template cannot make the channel upload fail.
+    If required metadata would otherwise be cut from an oversized caption, keep
+    it at the front. Formatting entities are shifted/clipped to remain valid,
+    so a long template cannot make the channel upload fail.
     """
     text = text or ""
     entities = [copy.copy(entity) for entity in (entities or [])]
@@ -1143,15 +1443,29 @@ def _fit_media_caption(text: str, entities, preserve: str = "", limit: int = 102
                 high = middle - 1
         return low
 
+    if isinstance(preserve, str):
+        required = [preserve] if preserve else []
+    else:
+        required = [str(value) for value in (preserve or []) if value]
+
     prefix = ""
     keep = prefix_length(limit)
-    preserve_at = text.find(preserve) if preserve else -1
-    if preserve_at >= 0 and preserve_at + len(preserve) > keep:
-        prefix = preserve + "\n"
+    positions = [(value, text.find(value)) for value in required]
+    clipped_required = [
+        (value, position)
+        for value, position in positions
+        if position < 0 or position + len(value) > keep
+    ]
+    if clipped_required:
+        prefix = " | ".join(required) + "\n"
         keep = prefix_length(max(0, limit - _u16(prefix)))
-        # Do not leave a partial duplicate of the preserved order id at the end.
-        if preserve_at < keep:
-            keep = preserve_at
+        # Do not leave a partial duplicate of required metadata at the end.
+        duplicate_positions = [
+            position for _value, position in positions
+            if 0 <= position < keep
+        ]
+        if duplicate_positions:
+            keep = min(duplicate_positions)
 
     clipped = prefix + text[:keep]
     final_length = _u16(clipped)
@@ -1198,17 +1512,21 @@ async def _edit_rich(event, text, ents):
     return 0
 
 
-async def _cancel_reserved_links(request_id: str) -> None:
+async def _cancel_reserved_links(request_id: str) -> bool:
     """Ask the admin bot to revoke every link minted for a failed payment."""
-    if not request_id or linkstore is None:
-        return
+    if not request_id:
+        return True
+    if linkstore is None:
+        return False
     try:
-        linkstore.cancel_request(request_id, force=True)
+        changed = linkstore.cancel_request(request_id, force=True)
+        return bool(changed or linkstore.is_request_cancelled(request_id))
     except Exception as error:  # noqa: BLE001
         ui.warn(
             f"Reservation cleanup could not be queued: "
             f"{type(error).__name__}: {error}"
         )
+        return False
 
 
 async def _fail_payment(event, payment: dict, request_id: str, message: str) -> None:
@@ -1220,18 +1538,54 @@ async def _fail_payment(event, payment: dict, request_id: str, message: str) -> 
 
 
 async def _recover_pending_payments() -> None:
-    """Fail closed after an interrupted /add and revoke its reserved links."""
+    """Fail closed after interrupted adds and resume cancellation cleanup."""
     changed = False
     for payment in _pay.get("payments", []):
-        if payment.get("status") != "pending":
-            continue
-        payment["status"] = "failed"
-        payment["error"] = "interrupted before receipt completion"
-        await _cancel_reserved_links(payment.get("reservation_request_id", ""))
-        changed = True
+        if payment.get("status") == "pending":
+            payment["status"] = "failed"
+            payment["error"] = "interrupted before receipt completion"
+            await _cancel_reserved_links(
+                payment.get("reservation_request_id", "")
+            )
+            changed = True
+        elif payment.get("status") in {"cancel_pending", "fake"}:
+            queued = await _cancel_reserved_links(
+                payment.get("reservation_request_id", "")
+            )
+            state = "queued" if queued else "retry_needed"
+            if payment.get("reservation_cleanup") != state:
+                payment["reservation_cleanup"] = state
+                changed = True
+        if (
+            payment.get("overflow_status") in {"posting", "failed"}
+            and payment.get("post_chat_id")
+            and payment.get("order_id")
+        ):
+            try:
+                amount = parse_amount(payment["amount"])
+                overflow_error = await _send_payment_overflow(
+                    int(payment["post_chat_id"]),
+                    amount,
+                    str(payment.get("name") or ""),
+                    str(payment["order_id"]),
+                    list(payment.get("reservation_entries") or []),
+                    list(payment.get("reservation_failures") or []),
+                )
+            except Exception as error:  # noqa: BLE001
+                overflow_error = f"{type(error).__name__}: {error}"
+            payment["overflow_status"] = (
+                "failed" if overflow_error else "posted"
+            )
+            if overflow_error:
+                payment["overflow_error"] = overflow_error
+            else:
+                payment.pop("overflow_error", None)
+            changed = True
     if changed:
         _save_pay()
-        ui.warn("Recovered interrupted payment command(s); reserved links queued for revocation.")
+        ui.warn(
+            "Recovered interrupted payment/cancellation/channel-delivery state."
+        )
 
 
 async def cmd_add(event) -> None:
@@ -1261,16 +1615,17 @@ async def cmd_add(event) -> None:
         (
             payment for payment in reversed(_pay.get("payments", []))
             if payment.get("command_key") == command_key
-            and payment.get("status") in {"pending", "valid", "untracked"}
         ),
         None,
     )
     if existing_payment:
         await _ack(
             event,
-            f"Payment already recorded — {existing_payment.get('order_id', '')}",
+            f"Payment already recorded — {existing_payment.get('order_id', '')} "
+            f"({existing_payment.get('status', 'valid')})",
         )
         return
+    order_id = _generate_order_id()
 
     reply = await event.get_reply_message()
     has_media = bool(reply and reply.media)
@@ -1300,9 +1655,20 @@ async def cmd_add(event) -> None:
             flush=True,
         )
         result = await _reserve_links(
-            keywords, int(payer_id), request_key=command_key
+            keywords,
+            int(payer_id),
+            request_key=command_key,
+            metadata={
+                "order_id": order_id,
+                "amount": format(amount, "f"),
+                "account_name": accname,
+                "keyword": " ".join(keywords),
+            },
         )
         request_id = result.get("request_id", "")
+        order_id = (
+            str((result.get("metadata") or {}).get("order_id") or order_id)
+        )
         failures = result["failures"]
         seen_links = set()
         for entry in result["entries"]:
@@ -1325,39 +1691,26 @@ async def cmd_add(event) -> None:
                           "or reply to an image to just log a payment.")
         return
 
-    order_id = _generate_order_id()
     channel_caption_truncated = False
-    try:
-        if entries:
-            us_text, us_ents = await _render_multi(
-                "done", amount, accname, order_id, entries
-            )
-        else:
-            us_text, us_ents = await _render(
-                "done", amount, accname, order_id=order_id, link=""
-            )
-        ch_text = ch_ents = None
-        if has_media and _pay.get("post_channel"):
-            if entries:
-                ch_text, ch_ents = await _render_multi(
-                    "channel", amount, accname, order_id, entries,
-                    include_current=True,
-                )
-            else:
-                ch_text, ch_ents = await _render(
-                    "channel", amount, accname, order_id=order_id,
-                    include_current=True, link="",
-                )
-            ch_text, ch_ents, channel_caption_truncated = _fit_media_caption(
-                ch_text, ch_ents, preserve=order_id
-            )
-    except Exception as error:  # noqa: BLE001
-        await _cancel_reserved_links(request_id)
-        await _ack(
-            event,
-            f"Could not prepare payment message: {type(error).__name__}: {error}",
+    us_text, us_ents = await _safe_payment_output(
+        "done", amount, accname, order_id, entries, failures
+    )
+    ch_text = ch_ents = None
+    if has_media and _pay.get("post_channel"):
+        ch_text, ch_ents = await _safe_payment_output(
+            "channel",
+            amount,
+            accname,
+            order_id,
+            entries,
+            failures,
+            include_current=True,
         )
-        return
+        ch_text, ch_ents, channel_caption_truncated = _fit_media_caption(
+            ch_text,
+            ch_ents,
+            preserve=(order_id, fmt_inr(amount)),
+        )
 
     payment = {
         "amount": format(amount, "f"),
@@ -1378,6 +1731,14 @@ async def cmd_add(event) -> None:
         payment.update({
             "invite_links": [e["link"] for e in entries],
             "payer_id": payer_id, "keywords": keywords,
+            "reservation_entries": [
+                {
+                    "link": e.get("link", ""),
+                    "title": e.get("title", ""),
+                    "keyword": e.get("keyword", ""),
+                }
+                for e in entries
+            ],
         })
         if failures:
             payment["reservation_failures"] = failures
@@ -1386,23 +1747,16 @@ async def cmd_add(event) -> None:
 
     # 2) Deliver the private receipt first. This is the authoritative commit:
     # startup recovery only compensates records that never reached this point.
-    if failures:
-        detail = "; ".join(
-            f"{item.get('keyword')}: {item.get('reason')}" for item in failures
-        )
-        us_text += f"\n\nUnavailable: {detail}"
-    receipt_sent = False
-    try:
-        dropped = await _edit_rich(event, us_text, us_ents)
-        receipt_sent = True
-        if dropped:
-            ui.warn(f"Done message: dropped {dropped} unsupported entity(ies).")
-    except Exception as error:  # noqa: BLE001
-        ui.warn(
-            f"Rich receipt edit failed; sending plain text: "
-            f"{type(error).__name__}: {error}"
-        )
-        receipt_sent = await _ack(event, us_text)
+    receipt_sent = await _deliver_payment_receipt(
+        event,
+        us_text,
+        us_ents,
+        amount,
+        accname,
+        order_id,
+        entries,
+        failures,
+    )
     if not receipt_sent:
         await _fail_payment(
             event, payment, request_id, "Could not deliver the payment receipt."
@@ -1450,6 +1804,29 @@ async def cmd_add(event) -> None:
             if not post_ids:
                 payment["post_error"] = "Telegram returned no posted message ID"
             _save_pay()
+
+            if channel_caption_truncated:
+                payment["overflow_status"] = "posting"
+                _save_pay()
+                overflow_error = await _send_payment_overflow(
+                    target_channel,
+                    amount,
+                    accname,
+                    order_id,
+                    entries,
+                    failures,
+                )
+                if overflow_error:
+                    payment["overflow_status"] = "failed"
+                    payment["overflow_error"] = overflow_error
+                    ui.warn(
+                        "Payment metadata overflow post failed: "
+                        + payment["overflow_error"]
+                    )
+                else:
+                    payment["overflow_status"] = "posted"
+                    payment.pop("overflow_error", None)
+                _save_pay()
 
     count = len(_todays_payments())
     print(ui.green("[pay] ")
@@ -1519,7 +1896,22 @@ async def cmd_cancel(event) -> None:
         )
         return
     if payment.get("status") == "fake":
-        await _ack(event, "Payment is already marked fake.")
+        cleanup = await _cancel_reserved_links(
+            payment.get("reservation_request_id", "")
+        )
+        payment["reservation_cleanup"] = (
+            "queued" if cleanup else "retry_needed"
+        )
+        _save_pay()
+        await _ack(
+            event,
+            "Payment is already marked fake. "
+            + (
+                "Access-link cleanup is queued."
+                if cleanup
+                else "Access-link cleanup still needs a retry."
+            ),
+        )
         return
 
     fake_text, fake_entities = _fake_caption(reply)
@@ -1527,6 +1919,17 @@ async def cmd_cancel(event) -> None:
         payment["cancel_previous_status"] = payment.get("status", "valid")
     payment["status"] = "cancel_pending"
     payment["cancel_command_message_id"] = int(event.id)
+    payment["reservation_cleanup"] = "pending"
+    _save_pay()
+
+    # Revoke buyer-bound access as soon as /cancel is accepted. Caption edits
+    # can be retried, but a fake payment must never retain a usable invite.
+    cleanup = await _cancel_reserved_links(
+        payment.get("reservation_request_id", "")
+    )
+    payment["reservation_cleanup"] = (
+        "queued" if cleanup else "retry_needed"
+    )
     _save_pay()
 
     peer = await event.get_input_chat()
@@ -1557,10 +1960,15 @@ async def cmd_cancel(event) -> None:
         if current_text.startswith("FAKE PAYMENT\n\n") or current_text == "FAKE PAYMENT":
             edit_succeeded = True
         elif fetch_succeeded:
-            payment["status"] = payment.pop("cancel_previous_status", "valid")
-            payment.pop("cancel_command_message_id", None)
+            # The access cancellation has already been committed. Keep the
+            # payment excluded and make the visual marker explicitly retryable.
+            payment["cancel_error"] = f"{type(e).__name__}: {e}"
             _save_pay()
-            await _ack(event, f"Could not mark payment fake: {type(e).__name__}: {e}")
+            await _ack(
+                event,
+                "Access cancellation is queued, but the channel marker failed: "
+                f"{type(e).__name__}: {e}. Reply /cancel again to retry it.",
+            )
             return
         else:
             # Telegram may have applied the edit before the response was lost.
@@ -1884,7 +2292,7 @@ HELP_TEXT = (
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
     "<code>/stats</code> - today's total, count, and split\n"
-    "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake and remove it from stats\n"
+    "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake, remove it from stats, and revoke buyer-bound access\n"
     "<code>/clear</code> - reset today's stats to zero\n\n"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "

@@ -30,8 +30,8 @@ A single-owner Telegram **bot** (bot token, not a login). What it does:
    **payment channel**. When the buyer joins, the bot ties them to the order
    and **revokes the spent link** automatically. Need another seat for the same
    group? Just run `/add` again — each order is an independent link.
-3. **`/revoke <orderid>`** kills every link in that order **and bans** the buyer
-   who joined through it.
+3. **`/revoke <orderid>`** kills every link in that order and removes any buyer
+   who joined through it (kick + unban, so no permanent ban is left behind).
 4. **Join requests -> owner.** Every join request (on the general approval
    link) is stored and forwarded with inline **Approve / Decline** buttons. On
    approve the link is **rotated** so the old one is dead.
@@ -189,7 +189,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `/setchannelpostofpayment <template>` | the caption used for the channel post |
 | `.setchannel` (typed in a channel) | set that channel as the post target |
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
-| reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT** and exclude that payment from today's count, total, and split |
+| reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
 | `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
 | `.help` | show every command and template parameter |
@@ -220,9 +220,34 @@ The revenue split, timezone, and share basis are configured via
 | `guard.py`      | Link rotation (DM owner) + auto-kick joiners                  |
 | `quickreply.py` | 2nd userbot: keep `/demo` quick reply = the latest link       |
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
+| `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`
 (auto-falls back to plain text if it isn't installed).
+
+## Run all three services
+
+Prepare both dependency sets and complete the first-login/configuration steps
+before using the combined launcher:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install -r bot/requirements.txt
+python3 setup.py
+cp bot/.env.example bot/.env   # fill BOT_TOKEN and OWNER_ID
+python3 quickreply.py           # first login for the second userbot; then stop it
+```
+
+Then launch the complete stack from the repository root:
+
+```bash
+python3 infra.py
+```
+
+`infra.py` starts exactly `guard.py`, `quickreply.py`, and `python -m bot`,
+prefixes each service's output with a distinct color, restarts unexpected exits
+with bounded backoff, and shuts all three down on Ctrl+C or SIGTERM. A
+host-wide lock prevents two infrastructure launchers from running at once.
 
 ## `.env`
 
