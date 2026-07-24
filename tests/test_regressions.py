@@ -1100,7 +1100,7 @@ def test_add_save_failure_cancels_every_reserved_link(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_fuzzy_group_lookup_resolves_typos_and_rejects_ties(
+def test_group_lookup_prefers_title_words_and_keeps_safe_typo_fallback(
     tmp_path, monkeypatch
 ) -> None:
     async def scenario() -> None:
@@ -1122,13 +1122,99 @@ def test_fuzzy_group_lookup_resolves_typos_and_rejects_ties(
             assert [group["title"] for group in groups] == ["LOLsi"]
 
             await db.upsert_group(
-                -1002, "LOLsa", "Llsa", "supergroup", "lolsa", None, True
+                -1002,
+                "sʟɪᴍɪᴘ ~ 💗",
+                "Indian",
+                "supergroup",
+                None,
+                None,
+                True,
+            )
+            await db.upsert_group(
+                -1003,
+                "ɪɴᴅɪᴀɴ ᴄᴜᴄ~ 💗",
+                "Ic",
+                "supergroup",
+                None,
+                None,
+                True,
+            )
+            await db.upsert_group(
+                -1004,
+                "ɪɴᴅɪᴀɴ ᴠɪᴘ ᴘᴠᴛ ~ 💗",
+                "Iv",
+                "supergroup",
+                None,
+                None,
+                True,
+            )
+            await db.upsert_group(
+                -1005,
+                "ᴊᴀᴡɴ ~ 💗",
+                "Jwn",
+                "supergroup",
+                None,
+                None,
+                True,
+            )
+
+            expected_indian = {
+                "ɪɴᴅɪᴀɴ ᴄᴜᴄ~ 💗",
+                "ɪɴᴅɪᴀɴ ᴠɪᴘ ᴘᴠᴛ ~ 💗",
+            }
+            for query in ("in", "ind", "indi", "indian"):
+                groups, reason = await app._groups_for_keyword(query)
+                assert reason == ""
+                assert {group["title"] for group in groups} == expected_indian
+
+            # Generated short codes stay available as an exact legacy lookup,
+            # but cannot pollute stronger human-readable title matches.
+            groups, reason = await app._groups_for_keyword("Llsi")
+            assert reason == ""
+            assert [group["title"] for group in groups] == ["LOLsi"]
+
+            await db.upsert_group(
+                -1006, "LOLsa", "Llsa", "supergroup", "lolsa", None, True
             )
             groups, reason = await app._groups_for_keyword("lolsz")
             assert groups == []
             assert "ambiguous" in reason
         finally:
             await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_quickreply_group_search_uses_the_same_title_prefix_tier(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        dialogs = [
+            SimpleNamespace(
+                is_group=True,
+                is_channel=False,
+                name=title,
+                entity=SimpleNamespace(username=None),
+            )
+            for title in (
+                "sʟɪᴍɪᴘ ~ 💗",
+                "ɪɴᴅɪᴀɴ ᴄᴜᴄ~ 💗",
+                "ɪɴᴅɪᴀɴ ᴠɪᴘ ᴘᴠᴛ ~ 💗",
+                "ᴊᴀᴡɴ ~ 💗",
+            )
+        ]
+
+        class Client:
+            async def iter_dialogs(self):
+                for dialog in dialogs:
+                    yield dialog
+
+        monkeypatch.setattr(quickreply, "client", Client())
+        matches = await quickreply._find_groups("indi")
+        assert {title for _entity, title in matches} == {
+            "ɪɴᴅɪᴀɴ ᴄᴜᴄ~ 💗",
+            "ɪɴᴅɪᴀɴ ᴠɪᴘ ᴘᴠᴛ ~ 💗",
+        }
 
     asyncio.run(scenario())
 

@@ -59,9 +59,12 @@ A single-owner Telegram **bot** (bot token, not a login). What it does:
    | send a short code / name / `all` | reply with the approval-required link(s) |
 
    Template tokens: `{link} {title} {short} {amount} {name} {keyword} {orderid}`.
-   Group lookup is font/case-insensitive and typo-tolerant (`Lolsia`/`lolsa`
-   can resolve `LOLsi`); close matches are rejected as ambiguous instead of
-   silently selecting the wrong group.
+   Group lookup is font/case-insensitive and prioritizes human title words:
+   `in`, `ind`, `indi`, or `indian` select titles containing a word beginning
+   with `Indian`. Exact title-word matches can intentionally select multiple
+   groups, while generated short codes never pollute those results. If no
+   title word/prefix matches, typo fallback still resolves `Lolsia`/`lolsa` to
+   `LOLsi` and rejects genuinely ambiguous typo matches.
 7. **Clean service.** Join/leave system messages in groups are deleted so the
    chat stays clean (needs the Delete Messages right).
 

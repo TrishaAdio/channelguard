@@ -325,8 +325,12 @@ async def all_groups(admin_only: bool = False) -> list[aiosqlite.Row]:
 
 
 async def find_groups(query: str) -> list[aiosqlite.Row]:
-    """Return ranked exact, substring, or typo-tolerant admin-group matches."""
-    from .utils import fuzzy_group_threshold, group_match_score
+    """Return the best title tier, or ranked title-only typo matches."""
+    from .utils import (
+        fuzzy_group_threshold,
+        group_fuzzy_score,
+        group_literal_rank,
+    )
 
     q = query.strip()
     if not q:
@@ -334,9 +338,20 @@ async def find_groups(query: str) -> list[aiosqlite.Row]:
     rows = await _all(
         "SELECT * FROM groups WHERE is_admin=1 ORDER BY title COLLATE NOCASE"
     )
+
+    literal = [(group_literal_rank(q, row), row) for row in rows]
+    literal = [(rank, row) for rank, row in literal if rank]
+    if literal:
+        best_rank = max(rank for rank, _row in literal)
+        return [
+            row
+            for rank, row in literal
+            if rank == best_rank
+        ]
+
     threshold = fuzzy_group_threshold(q)
     ranked = [
-        (group_match_score(q, row), row)
+        (group_fuzzy_score(q, row), row)
         for row in rows
     ]
     ranked = [

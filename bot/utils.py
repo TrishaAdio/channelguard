@@ -76,29 +76,83 @@ def normalized_group_key(text: str) -> str:
     )
 
 
-def group_match_score(query: str, group: Mapping) -> float:
-    """Score one group name/code safely, including small typing mistakes."""
+def normalized_group_words(text: str) -> tuple[str, ...]:
+    """Return human-readable title words after folding styled Unicode text."""
+    return tuple(
+        word.casefold() for word in _WORD_RE.findall(fold_fonts(text or ""))
+    )
+
+
+def _group_value(group: Mapping, key: str) -> str:
+    try:
+        return str(group[key] or "")
+    except (KeyError, TypeError):
+        return ""
+
+
+def group_literal_rank(query: str, group: Mapping) -> int:
+    """Rank non-fuzzy group matches.
+
+    Human-readable names always outrank the generated short code:
+
+    4. exact full title or public username
+    3. exact title word
+    2. prefix of a title word (``in``/``ind``/``indi`` -> ``Indian``)
+    1. exact legacy short code
+    """
     wanted = normalized_group_key(query)
     if not wanted:
-        return 0.0
-    values = [
-        normalized_group_key(group[key] or "")
-        for key in ("short_code", "title", "username")
-    ]
-    values = [value for value in values if value]
-    if wanted in values:
-        return 1.0
-    if any(wanted in value or value in wanted for value in values):
-        return 0.94
+        return 0
+
+    title = _group_value(group, "title")
+    title_key = normalized_group_key(title)
+    username_key = normalized_group_key(_group_value(group, "username"))
+    if wanted == title_key or (username_key and wanted == username_key):
+        return 4
+
+    query_words = normalized_group_words(query)
+    title_words = normalized_group_words(title)
+    if len(query_words) == 1:
+        query_word = query_words[0]
+        if query_word in title_words:
+            return 3
+        if len(query_word) >= 2 and any(
+            word.startswith(query_word) for word in title_words
+        ):
+            return 2
+
+    short_key = normalized_group_key(_group_value(group, "short_code"))
+    if short_key and wanted == short_key:
+        return 1
+    return 0
+
+
+def group_fuzzy_score(query: str, group: Mapping) -> float:
+    """Typo score using title text only, never generated short codes."""
+    wanted = normalized_group_key(query)
     if len(wanted) <= 2:
         return 0.0
+    title = _group_value(group, "title")
+    candidates = {
+        normalized_group_key(title),
+        *normalized_group_words(title),
+    }
+    candidates.discard("")
     return max(
         (
             SequenceMatcher(None, wanted, value, autojunk=False).ratio()
-            for value in values
+            for value in candidates
         ),
         default=0.0,
     )
+
+
+def group_match_score(query: str, group: Mapping) -> float:
+    """Compatibility score with literal title tiers above typo fallback."""
+    literal = group_literal_rank(query, group)
+    if literal:
+        return {4: 1.0, 3: 0.99, 2: 0.97, 1: 0.95}[literal]
+    return group_fuzzy_score(query, group)
 
 
 def fuzzy_group_threshold(query: str) -> float:
