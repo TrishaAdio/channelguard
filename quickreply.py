@@ -58,12 +58,12 @@ import time
 import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from difflib import SequenceMatcher
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.tl import types as tl_types
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
     DeleteExportedChatInviteRequest,
@@ -89,10 +89,14 @@ from telethon.tl.types import (
     UserStatusOnline,
 )
 from telethon.utils import get_peer_id
-from telethon.tl import types as tl_types
 
 import config
 import ui
+from bot.utils import (
+    fuzzy_group_threshold,
+    group_fuzzy_score,
+    group_literal_rank,
+)
 from runtime_lock import ProcessLock
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
@@ -106,27 +110,6 @@ except Exception:  # noqa: BLE001
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 # The link inside the saved post (may or may not include the scheme).
 FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
-
-# Unicode small-caps letters NFKD does NOT decompose. Group titles are often
-# styled (e.g. "ɴɪᴄᴇ ʙʀᴏ"); fold them so a normal typed query still matches.
-_SMALL_CAPS = {
-    "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ꜰ": "f", "ғ": "f",
-    "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l", "ᴍ": "m",
-    "ɴ": "n", "ᴏ": "o", "ᴘ": "p", "ǫ": "q", "ꞯ": "q", "ʀ": "r", "ꜱ": "s",
-    "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
-}
-
-
-def _fold_fonts(text: str) -> str:
-    """Fold fancy Unicode fonts back to plain letters so a normal typed query
-    matches a styled title, e.g. "ɴɪᴄᴇ ʙʀᴏ" / "𝐍𝐢𝐜𝐞 𝐁𝐫𝐨" -> "nice bro".
-    NFKD covers bold/italic/script/fraktur/double-struck/mono/sans/fullwidth/
-    circled; the small-caps table covers what NFKD leaves untouched."""
-    if not text:
-        return ""
-    folded = "".join(_SMALL_CAPS.get(ch, ch) for ch in text)
-    folded = unicodedata.normalize("NFKD", folded)
-    return "".join(c for c in folded if not unicodedata.combining(c))
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -2666,55 +2649,51 @@ async def cmd_clear(event) -> None:
 
 
 async def _find_groups(query: str) -> list[tuple[object, str]]:
-    """Return (entity, title) for every group/channel this account is in whose
-    (font-folded) title or @username contains the (font-folded) query.
+    """Return groups using title words/prefixes before title-only typo matching.
 
     Admin rights are deliberately NOT pre-checked: dialog entities frequently
     carry stale or empty admin_rights, which was silently dropping the exact
     group the account admins. Whether a link can actually be made is decided by
     TRYING (_export_invite) — the only reliable signal."""
-    q = "".join(
-        char for char in _fold_fonts(query).casefold() if char.isalnum()
-    )
-    ranked: list[tuple[float, object, str]] = []
+    literal: list[tuple[int, object, str]] = []
+    fuzzy: list[tuple[float, object, str]] = []
     async for dialog in client.iter_dialogs():
         if not (getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False)):
             continue
         name = dialog.name or ""
         uname = getattr(dialog.entity, "username", "") or ""
-        if not q:
-            ranked.append((1.0, dialog.entity, name))
+        if not query.strip():
+            literal.append((4, dialog.entity, name))
             continue
-        values = [
-            "".join(
-                char
-                for char in _fold_fonts(value).casefold()
-                if char.isalnum()
-            )
-            for value in (name, uname)
-            if value
-        ]
-        if q in values:
-            score = 1.0
-        elif any(q in value or value in q for value in values):
-            score = 0.94
-        elif len(q) > 2:
-            score = max(
-                (
-                    SequenceMatcher(None, q, value, autojunk=False).ratio()
-                    for value in values
-                ),
-                default=0.0,
-            )
-        else:
-            score = 0.0
-        threshold = 0.82 if len(q) == 3 else 0.74 if len(q) <= 5 else 0.70
+
+        candidate = {
+            "title": name,
+            "username": uname,
+            "short_code": "",
+        }
+        rank = group_literal_rank(query, candidate)
+        if rank:
+            literal.append((rank, dialog.entity, name))
+            continue
+        score = group_fuzzy_score(query, candidate)
+        threshold = fuzzy_group_threshold(query)
         if score >= threshold:
-            ranked.append((score, dialog.entity, name))
-    ranked.sort(key=lambda item: (-item[0], item[2].casefold()))
-    if q and len(ranked) > 1 and ranked[0][0] - ranked[1][0] >= 0.08:
-        ranked = ranked[:1]
-    return [(entity, name) for _score, entity, name in ranked]
+            fuzzy.append((score, dialog.entity, name))
+
+    if literal:
+        best_rank = max(rank for rank, _entity, _name in literal)
+        selected = [
+            (entity, name)
+            for rank, entity, name in literal
+            if rank == best_rank
+        ]
+        selected.sort(key=lambda item: item[1].casefold())
+        return selected
+
+    fuzzy.sort(key=lambda item: (-item[0], item[2].casefold()))
+    if len(fuzzy) > 1 and fuzzy[0][0] - fuzzy[1][0] >= 0.08:
+        fuzzy = fuzzy[:1]
+    return [(entity, name) for _score, entity, name in fuzzy]
 
 
 async def cmd_group_link(event) -> None:

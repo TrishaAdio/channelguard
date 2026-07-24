@@ -27,14 +27,16 @@ from aiogram.types import (
     Message,
 )
 
+from runtime_lock import ProcessLock, host_lock_path
+
 from . import config, db
 from .utils import (
-    group_match_score,
+    group_fuzzy_score,
+    group_literal_rank,
     render_template,
     truncate,
     unique_short_code,
 )
-from runtime_lock import ProcessLock, host_lock_path
 
 # Shared link store (repo root). The bot writes every link it generates here so
 # the userbot can paste it into the payment "Thanks for paying" message.
@@ -1843,20 +1845,33 @@ async def on_startup() -> None:
 
 
 async def _groups_for_keyword(query: str):
-    """Resolve one exact/typo keyword deterministically and reject ambiguity."""
+    """Resolve title words/prefixes first, then use a safe typo fallback."""
     query = query.strip()
     if query.lower() == "all":
         return await db.all_groups(admin_only=True), ""
     matches = await db.find_groups(query)
     if not matches:
         return [], "no matching admin group"
-    scored = [(group_match_score(query, group), group) for group in matches]
-    exact = [group for score, group in scored if score == 1.0]
-    if len(exact) == 1:
-        return exact, ""
-    if len(exact) > 1:
-        names = ", ".join(str(group["title"]) for group in exact[:4])
-        return [], f"ambiguous exact match: {names}"
+
+    literal_rank = max(
+        (group_literal_rank(query, group) for group in matches),
+        default=0,
+    )
+    if literal_rank >= 2:
+        # A natural title/word/prefix can intentionally select several groups:
+        # "indian", "indi", "ind", and "in" all select every title whose
+        # matching word begins with "indian". Lower-quality fuzzy candidates
+        # have already been excluded by db.find_groups().
+        return matches, ""
+    if literal_rank == 1:
+        if len(matches) == 1:
+            return matches, ""
+        names = ", ".join(str(group["title"]) for group in matches[:4])
+        return [], f"ambiguous short code: {names}"
+
+    scored = [
+        (group_fuzzy_score(query, group), group) for group in matches
+    ]
     if len(scored) == 1:
         return [scored[0][1]], ""
     if scored[0][0] - scored[1][0] >= 0.08:
