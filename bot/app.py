@@ -28,7 +28,13 @@ from aiogram.types import (
 )
 
 from . import config, db
-from .utils import fold_fonts, render_template, truncate, unique_short_code
+from .utils import (
+    group_match_score,
+    render_template,
+    truncate,
+    unique_short_code,
+)
+from runtime_lock import ProcessLock, host_lock_path
 
 # Shared link store (repo root). The bot writes every link it generates here so
 # the userbot can paste it into the payment "Thanks for paying" message.
@@ -65,6 +71,11 @@ bot = Bot(
 dp = Dispatcher()
 
 _GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
+_bot_user_id = 0
+_PRIVATE_INVITE_RE = re.compile(
+    r"https?://(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +186,91 @@ async def remove_buyer(chat_id: int, user_id: Optional[int]) -> bool:
     except Exception as error:  # noqa: BLE001
         log.warning("buyer removal failed for %s in %s: %s", user_id, chat_id, error)
         return False
+
+
+async def ban_buyer(chat_id: int, user_id: Optional[int]) -> bool:
+    """Permanently ban a buyer; unlike remove_buyer this never unbans."""
+    if not user_id:
+        return True
+    try:
+        await bot.ban_chat_member(chat_id, user_id)
+        return True
+    except Exception as error:  # noqa: BLE001
+        log.warning("permanent ban failed for %s in %s: %s", user_id, chat_id, error)
+        return False
+
+
+async def _queue_permanent_ban(
+    chat_id: int, user_id: int, reason: str
+) -> bool:
+    """Journal before Telegram mutation so a crash cannot lose enforcement."""
+    journaled = True
+    try:
+        await db.queue_member_ban(chat_id, user_id, reason)
+    except Exception as error:  # noqa: BLE001
+        journaled = False
+        log.error(
+            "Could not journal permanent ban for %s in %s: %s",
+            user_id,
+            chat_id,
+            error,
+        )
+    try:
+        completed = await ban_buyer(chat_id, user_id)
+    except Exception as error:  # noqa: BLE001
+        if journaled:
+            await db.set_member_ban_result(
+                chat_id, user_id, False, f"{type(error).__name__}: {error}"
+            )
+        return False
+    if journaled:
+        await db.set_member_ban_result(
+            chat_id,
+            user_id,
+            completed,
+            "" if completed else "Telegram ban failed; retry scheduled",
+        )
+    return completed
+
+
+async def _order_requires_permanent_ban(order_id: str) -> bool:
+    if not order_id:
+        return False
+    order = await db.get_order(order_id)
+    return bool(
+        order and order["status"] in {"remove_pending", "removed"}
+    )
+
+
+async def _cleanup_reserved_buyer(
+    reservation, invite_link: str
+) -> bool:
+    permanent = await _order_requires_permanent_ban(
+        str(reservation["order_id"] or "")
+    )
+    operation = ban_buyer if permanent else remove_buyer
+    cleaned = await operation(
+        reservation["chat_id"], reservation["user_id"]
+    )
+    if cleaned:
+        if permanent:
+            await db.set_order_link_buyer_banned_by_invite(invite_link)
+        else:
+            await db.set_order_link_buyer_removed_by_invite(invite_link)
+    return cleaned
+
+
+async def _set_order_cleanup_state(
+    order_id: str, ordinary_status: str
+) -> None:
+    if not order_id:
+        return
+    status = (
+        "remove_pending"
+        if await _order_requires_permanent_ban(order_id)
+        else ordinary_status
+    )
+    await db.set_order_status(order_id, status)
 
 
 async def get_or_create_link(chat_id: int) -> Optional[str]:
@@ -340,13 +436,12 @@ async def on_join_request(req: ChatJoinRequest) -> None:
             )
             await db.set_order_link_joined_by_invite(used_link, user.id)
             if reservation["order_id"]:
-                await db.set_order_status(
+                await _set_order_cleanup_state(
                     reservation["order_id"],
                     "revoke_pending" if cancellation_won else "joined_revoke_pending",
                 )
             if cancellation_won:
-                if await remove_buyer(chat.id, user.id):
-                    await db.set_order_link_buyer_removed_by_invite(used_link)
+                await _cleanup_reserved_buyer(reservation, used_link)
             if await revoke_link(chat.id, used_link):
                 await db.set_order_link_revoked_by_invite(used_link)
                 terminal = "cancelled" if cancellation_won else "completed"
@@ -371,7 +466,7 @@ async def on_join_request(req: ChatJoinRequest) -> None:
         await db.set_join_status(chat.id, user.id, "approved")
         await db.set_order_link_joined_by_invite(used_link, user.id)
         if reservation["order_id"]:
-            await db.set_order_status(reservation["order_id"], "joined")
+            await _set_order_cleanup_state(reservation["order_id"], "joined")
         still_valid = await db.claim_reservation_status(
             reservation["id"], {"approving"}, "approved_revoke_pending"
         )
@@ -388,9 +483,7 @@ async def on_join_request(req: ChatJoinRequest) -> None:
                 )
                 return
             # Payment cancellation won while Telegram approval was in flight.
-            removed = await remove_buyer(chat.id, user.id)
-            if removed:
-                await db.set_order_link_buyer_removed_by_invite(used_link)
+            await _cleanup_reserved_buyer(reservation, used_link)
             if await revoke_link(chat.id, used_link):
                 await db.set_order_link_revoked_by_invite(used_link)
                 await db.set_reservation_status(reservation["id"], "cancelled")
@@ -402,7 +495,7 @@ async def on_join_request(req: ChatJoinRequest) -> None:
                 )
             await db.set_join_status(chat.id, user.id, "declined")
             if reservation["order_id"]:
-                await db.set_order_status(
+                await _set_order_cleanup_state(
                     reservation["order_id"], "revoke_pending"
                 )
                 await db.reconcile_order_status(reservation["order_id"])
@@ -417,7 +510,7 @@ async def on_join_request(req: ChatJoinRequest) -> None:
             state = "link revoked"
         else:
             if reservation["order_id"]:
-                await db.set_order_status(
+                await _set_order_cleanup_state(
                     reservation["order_id"], "joined_revoke_pending"
                 )
             await db.claim_reservation_status(
@@ -536,29 +629,115 @@ _JOINED_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}
 async def on_chat_member(update: ChatMemberUpdated) -> None:
     old_status = update.old_chat_member.status
     new_status = update.new_chat_member.status
-    # Only care about a real join (was outside -> now inside) via a link.
+    # Only care about a real join (was outside -> now inside).
     if new_status not in _JOINED_STATUSES:
         return
     if old_status in _JOINED_STATUSES:
         return
-    if not update.invite_link:
-        return
-
-    link_row = await db.find_order_link_by_invite(update.invite_link.invite_link)
-    if not link_row:
-        return
-
     user = update.new_chat_member.user
+    if user.id in {config.OWNER_ID, _bot_user_id}:
+        return
+
+    used_link = update.invite_link.invite_link if update.invite_link else ""
+    link_row = (
+        await db.find_order_link_by_invite(used_link) if used_link else None
+    )
+    if not link_row:
+        request = await db.get_join_request(update.chat.id, user.id)
+        request_link = str(request["invite_link"] or "") if request else ""
+        if (
+            request is not None
+            and request["status"] in {"pending", "approved"}
+            and used_link
+            and request_link == used_link
+        ):
+            if request["status"] == "pending":
+                await db.set_join_status(update.chat.id, user.id, "approved")
+            await db.log_event(
+                "approved_member_join", update.chat.id, user.id, used_link
+            )
+            return
+
+        reason = (
+            "direct join without an approved request"
+            if not used_link
+            else "unrecognized invite join without an approved request"
+        )
+        banned = await _queue_permanent_ban(
+            update.chat.id, user.id, reason
+        )
+        await db.log_event(
+            "unauthorized_join_banned",
+            update.chat.id,
+            user.id,
+            f"{reason}; banned={banned}",
+        )
+        await tell_owner(
+            f"Unauthorized join — <b>{esc(update.chat.title or update.chat.id)}</b>\n"
+            f"<blockquote><code>{user.id}</code> — {esc(reason)}; "
+            f"{'permanently banned' if banned else 'ban retry queued'}</blockquote>"
+        )
+        return
+
     order_id = link_row["order_id"]
+    order = await db.get_order(order_id)
+    expected_buyer = int(order["buyer_id"]) if order and order["buyer_id"] else None
+    forbidden_state = order and order["status"] in {
+        "remove_pending",
+        "removed",
+        "revoke_pending",
+        "revoked",
+        "failed",
+    }
+    already_used = (
+        link_row["joined_user"] is not None
+        and int(link_row["joined_user"]) != user.id
+    )
+    if (
+        forbidden_state
+        or already_used
+        or (expected_buyer is not None and expected_buyer != user.id)
+    ):
+        reason = (
+            f"order {order_id} link used by unauthorized user"
+            if not forbidden_state
+            else f"order {order_id} is {order['status']}"
+        )
+        banned = await _queue_permanent_ban(
+            update.chat.id, user.id, reason
+        )
+        if await revoke_link(update.chat.id, used_link):
+            await db.set_order_link_revoked(link_row["id"])
+        if order and order["status"] not in {"remove_pending", "removed"}:
+            await db.set_order_status(order_id, "compromised")
+        await db.log_event(
+            "order_link_misuse",
+            update.chat.id,
+            user.id,
+            f"{order_id}; expected={expected_buyer}; banned={banned}",
+        )
+        await tell_owner(
+            f"Blocked misuse of order <code>{esc(order_id)}</code> in "
+            f"<b>{esc(update.chat.title or update.chat.id)}</b>\n"
+            f"<blockquote>User <code>{user.id}</code>"
+            + (
+                f"; expected <code>{expected_buyer}</code>"
+                if expected_buyer is not None
+                else ""
+            )
+            + f" — {'permanently banned' if banned else 'ban retry queued'}</blockquote>"
+        )
+        return
+
     await db.set_order_link_joined(link_row["id"], user.id)
-    await db.set_order_status(order_id, "joined")
+    await _set_order_cleanup_state(order_id, "joined")
     # Single-use link is spent. Keep it pending in SQLite until Telegram
     # confirms revocation so the retry loop can finish ambiguous failures.
     if await revoke_link(update.chat.id, update.invite_link.invite_link):
         await db.set_order_link_revoked(link_row["id"])
         revoke_state = "link revoked"
     else:
-        await db.set_order_status(order_id, "joined_revoke_pending")
+        await _set_order_cleanup_state(order_id, "joined_revoke_pending")
         revoke_state = "revocation pending"
     await db.log_event("order_joined", update.chat.id, user.id, order_id)
 
@@ -597,7 +776,8 @@ HELP = (
     "link, and report here.</blockquote>\n"
     "<b>Orders</b>\n"
     "<code>/add &lt;amount&gt; &lt;account&gt; &lt;keyword&gt;</code> mint a single-use link (one buyer) with an order id\n"
-    "<code>/revoke &lt;orderid&gt;</code> kill the order's link(s) and ban the buyer\n"
+    "<code>/revoke &lt;orderid&gt;</code> revoke links and remove joined buyers without a lasting ban\n"
+    "<code>/remove &lt;orderid&gt;</code> revoke links and permanently ban every joined buyer\n"
     "<code>/orders</code> recent orders\n"
     "<code>/tpl &lt;keyword&gt; [body]</code> set the order post format\n\n"
     "<b>Groups &amp; users</b>\n"
@@ -605,7 +785,7 @@ HELP = (
     "<code>/doctor</code> diagnose token, admin rights, link creation, shared store\n"
     "<code>/list</code> saved templates\n"
     "<code>/pending</code> pending join requests\n"
-    "<code>/remove &lt;keyword | @user | id&gt;</code> delete a template, or remove a user everywhere\n\n"
+    "<code>/remove &lt;keyword | @user | id&gt;</code> also deletes a template, or removes a user everywhere\n\n"
     "<b>Quick link</b>\n"
     "<blockquote>Send a short code / name / <code>all</code> to get the "
     "approval-required link(s).</blockquote>\n"
@@ -764,12 +944,16 @@ def _ensure_order_render(
 ) -> str:
     """Keep required values even when a custom template omits/breaks tokens."""
     rendered = rendered or ""
+    plain = html.unescape(re.sub(r"<[^>]*>", " ", rendered))
     missing = []
-    if order_id not in rendered:
+    if order_id.casefold() not in plain.casefold():
         missing.append(f"Order <code>{esc(order_id)}</code>")
-    if amount not in rendered:
+    amount_pattern = (
+        rf"(?<![A-Za-z0-9.]){re.escape(str(amount))}(?![A-Za-z0-9.])"
+    )
+    if re.search(amount_pattern, plain) is None:
         missing.append(f"Amount <code>{esc(amount)}</code>")
-    if account and account not in rendered:
+    if account and account.casefold() not in plain.casefold():
         missing.append(f"Account <code>{esc(account)}</code>")
     if link not in rendered:
         missing.append(esc(link))
@@ -778,7 +962,7 @@ def _ensure_order_render(
             missing
         ) + "</blockquote>"
     # Never let one oversized/broken custom template hide the successful link.
-    if len(rendered) > 3900:
+    if _telegram_units(rendered) > 3900:
         rendered = (
             f"<b>{esc(group['title'])}</b>\n"
             f"<blockquote>Order <code>{esc(order_id)}</code>   "
@@ -811,13 +995,90 @@ def _order_response_blocks(
     return blocks
 
 
+def _order_channel_blocks(
+    order_id: str,
+    amount: str,
+    account: str,
+    keyword: str,
+    generated: list,
+    failures: list,
+) -> list[str]:
+    """Payment-channel metadata with no reusable/private invite URLs."""
+    blocks = [_order_header(order_id, amount, account, keyword)]
+    if generated:
+        titles = ", ".join(esc(item[0]["title"]) for item in generated)
+        blocks.append(
+            f"<b>Private delivery</b>\n"
+            f"<blockquote>{len(generated)} buyer-bound link(s) delivered "
+            f"privately\nGroups: {titles}</blockquote>"
+        )
+    if failures:
+        detail = "; ".join(
+            f"{esc(item['title'])}: {esc(item['reason'])}" for item in failures
+        )
+        blocks.append(
+            f"<b>Unavailable</b>\n"
+            f"<blockquote>Order <code>{esc(order_id)}</code> — "
+            f"{detail}</blockquote>"
+        )
+    return [
+        _PRIVATE_INVITE_RE.sub("[private link delivered in DM]", block)
+        for block in blocks
+    ]
+
+
+async def _deliver_direct_order_channel(
+    order_id: str, blocks: Optional[list[str]] = None
+) -> bool:
+    order = await db.get_order(order_id)
+    if order is None or order["channel_sent"]:
+        return bool(order and order["channel_sent"])
+    if not config.PAYMENT_CHANNEL:
+        await db.set_order_channel_delivery(
+            order_id, False, "PAYMENT_CHANNEL is not configured"
+        )
+        return False
+    if blocks is None:
+        channel_html = str(order["channel_html"] or "")
+        if not channel_html:
+            await db.set_order_channel_delivery(
+                order_id, False, "channel summary is unavailable"
+            )
+            return False
+        blocks = channel_html.split("\n\n")
+    try:
+        await _send_html_blocks(
+            lambda text: bot.send_message(config.PAYMENT_CHANNEL, text),
+            blocks,
+        )
+    except Exception as error:  # noqa: BLE001
+        await db.set_order_channel_delivery(
+            order_id, False, f"{type(error).__name__}: {error}"
+        )
+        log.warning("payment channel post failed for %s: %s", order_id, error)
+        return False
+    await db.set_order_channel_delivery(order_id, True)
+    return True
+
+
 async def _send_html_blocks(send, blocks: list[str]) -> None:
     """Send complete HTML blocks without cutting tags at Telegram's limit."""
     chunks = []
     current = ""
+    safe_blocks = []
     for block in blocks:
+        if _telegram_units(block) <= 4000:
+            safe_blocks.append(block)
+            continue
+        # A single owner-authored HTML block can exceed Telegram's limit.
+        # Fall back to escaped plain-text fragments rather than slicing tags.
+        plain = html.unescape(re.sub(r"<[^>]*>", "", block))
+        safe_blocks.extend(
+            esc(fragment) for fragment in _split_utf16_text(plain, 3900)
+        )
+    for block in safe_blocks:
         candidate = block if not current else current + "\n\n" + block
-        if len(candidate) <= 4000:
+        if _telegram_units(candidate) <= 4000:
             current = candidate
             continue
         if current:
@@ -827,6 +1088,29 @@ async def _send_html_blocks(send, blocks: list[str]) -> None:
         chunks.append(current)
     for chunk in chunks:
         await send(chunk)
+
+
+def _telegram_units(text: str) -> int:
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _split_utf16_text(text: str, limit: int) -> list[str]:
+    chunks = []
+    current = ""
+    current_units = 0
+    for char in text or "":
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if current_units + char_units > limit:
+            if current:
+                chunks.append(current)
+            current = char
+            current_units = char_units
+        else:
+            current += char
+            current_units += char_units
+    if current:
+        chunks.append(current)
+    return chunks or [""]
 
 
 @dp.message(Command("add"), F.chat.type == ChatType.PRIVATE)
@@ -851,10 +1135,44 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
 
     command_key = f"bot:{message.chat.id}:{message.message_id}"
     existing_order = await db.get_order_by_command_key(command_key)
-    if existing_order is not None and (
-        existing_order["response_html"] or existing_order["status"] != "open"
+    non_deliverable = {
+        "failed",
+        "revoke_pending",
+        "revoked",
+        "remove_pending",
+        "removed",
+        "expired",
+        "partially_expired",
+        "compromised",
+    }
+    if (
+        existing_order is not None
+        and existing_order["response_html"]
+        and existing_order["status"] not in non_deliverable
     ):
-        response = existing_order["response_html"] or (
+        if not existing_order["private_sent"]:
+            await _send_html_blocks(
+                message.answer,
+                existing_order["response_html"].split("\n\n"),
+            )
+            await db.set_order_private_sent(existing_order["order_id"])
+        else:
+            await message.answer(
+                _order_header(
+                    existing_order["order_id"],
+                    existing_order["amount"],
+                    existing_order["account_name"],
+                    existing_order["keyword"],
+                )
+                + "\n\nAlready delivered; no duplicate links were created."
+            )
+        await _deliver_direct_order_channel(existing_order["order_id"])
+        return
+    if existing_order is not None and (
+        existing_order["status"] != "open"
+        or existing_order["status"] in non_deliverable
+    ):
+        response = (
             _order_header(
                 existing_order["order_id"],
                 existing_order["amount"],
@@ -866,13 +1184,12 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
         await _send_html_blocks(message.answer, response.split("\n\n"))
         return
 
-    groups = (
-        await db.all_groups(admin_only=True)
-        if keyword.strip().lower() == "all"
-        else await db.find_groups(keyword)
-    )
+    groups, match_error = await _groups_for_keyword(keyword)
     if not groups:
-        await message.answer(f"Nothing matches <code>{esc(keyword)}</code>.")
+        await message.answer(
+            f"Nothing matches <code>{esc(keyword)}</code>: "
+            f"{esc(match_error)}."
+        )
         return
 
     tpl = await db.get_template(keyword.lower())
@@ -897,6 +1214,12 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
     failures = []
     try:
         for group in groups:
+            current_order = await db.get_order(order_id)
+            if current_order is None or current_order["status"] != "open":
+                raise RuntimeError(
+                    f"order {order_id} stopped accepting new links "
+                    f"({current_order['status'] if current_order else 'missing'})"
+                )
             existing_link = existing_links.get(group["chat_id"])
             if existing_link is not None:
                 link = existing_link["invite_link"]
@@ -945,6 +1268,11 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
                 link=link,
             )
             generated.append((group, link_id, link, rendered))
+        current_order = await db.get_order(order_id)
+        if current_order is None or current_order["status"] != "open":
+            raise RuntimeError(
+                f"order {order_id} changed state during link generation"
+            )
     except Exception:
         await _compensate_order(order_id)
         raise
@@ -966,22 +1294,33 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
     blocks = _order_response_blocks(
         order_id, amount, account, keyword, generated, failures
     )
+    channel_blocks = _order_channel_blocks(
+        order_id, amount, account, keyword, generated, failures
+    )
     response = "\n\n".join(blocks)
-    await db.set_order_response(order_id, response)
     try:
+        await db.set_order_response(order_id, response)
+        await db.set_order_channel_html(
+            order_id, "\n\n".join(channel_blocks)
+        )
         await _send_html_blocks(message.answer, blocks)
+        await db.set_order_private_sent(order_id)
     except Exception:
-        await _compensate_order(order_id)
+        try:
+            await db.set_order_response(order_id, "")
+            await db.set_order_channel_html(order_id, "")
+        finally:
+            await _compensate_order(order_id)
         raise
 
-    if config.PAYMENT_CHANNEL:
-        try:
-            await _send_html_blocks(
-                lambda text: bot.send_message(config.PAYMENT_CHANNEL, text),
-                blocks,
-            )
-        except Exception as error:  # noqa: BLE001
-            log.warning("payment channel post failed: %s", error)
+    channel_sent = await _deliver_direct_order_channel(
+        order_id, channel_blocks
+    )
+    if not channel_sent and not config.PAYMENT_CHANNEL:
+        await message.answer(
+            "<b>Payment channel not configured.</b> The order is saved; set "
+            "<code>PAYMENT_CHANNEL</code> and restart so queued summaries retry."
+        )
 
     await db.log_event(
         "order_add", detail=f"{order_id} keyword={keyword} links={len(generated)}"
@@ -1084,17 +1423,98 @@ async def cmd_remove(message: Message, command: CommandObject) -> None:
         return await deny(message)
     arg = (command.args or "").strip()
     if not arg:
-        await message.answer("Usage: <code>/remove &lt;keyword | @user | id&gt;</code>")
+        await message.answer(
+            "Usage: <code>/remove &lt;orderid | keyword | @user | id&gt;</code>"
+        )
         return
 
-    # 1) A saved template keyword?
+    # 1) Canonical order id: revoke links and permanently ban every joined
+    # buyer in the specific group(s) represented by that order.
+    order = await db.get_order(arg)
+    if order is not None:
+        await _remove_order_permanently(message, order)
+        return
+
+    # 2) A saved template keyword?
     if await db.remove_template(arg):
         await db.log_event("template_remove", detail=arg.lower())
         await message.answer(f"Template <code>{esc(arg.lower())}</code> removed.")
         return
 
-    # 2) Otherwise treat it as a user: decline pending requests + kick everywhere.
+    # 3) Otherwise treat it as a user: decline requests + kick everywhere.
     await _remove_user(message, arg)
+
+
+async def _remove_order_permanently(message: Message, order) -> None:
+    order_id = str(order["order_id"])
+    await db.set_order_status(order_id, "remove_pending")
+
+    reservations = await db.reservations_for_order(order_id)
+    request_ids = {
+        str(row["request_id"]) for row in reservations if row["request_id"]
+    }
+    if order["request_id"]:
+        request_ids.add(str(order["request_id"]))
+    for request_id in request_ids:
+        if linkstore is not None:
+            try:
+                linkstore.cancel_request(request_id, force=True)
+            except Exception as error:  # noqa: BLE001
+                log.warning(
+                    "bridge permanent removal failed for %s: %s",
+                    request_id,
+                    error,
+                )
+        await _cancel_request_reservations(
+            request_id, permanent_ban=True
+        )
+
+    links = await db.order_links(order_id)
+    revoked = banned = pending = 0
+    for order_link in links:
+        cleanup_pending = False
+        if order_link["joined_user"] and not order_link["buyer_banned"]:
+            if await ban_buyer(
+                order_link["chat_id"], order_link["joined_user"]
+            ):
+                await db.set_order_link_buyer_banned(order_link["id"])
+                banned += 1
+            else:
+                cleanup_pending = True
+        elif order_link["joined_user"]:
+            banned += 1
+        if not order_link["revoked"]:
+            if await revoke_link(
+                order_link["chat_id"], order_link["invite_link"]
+            ):
+                await db.set_order_link_revoked(order_link["id"])
+                revoked += 1
+            else:
+                cleanup_pending = True
+        else:
+            revoked += 1
+        if cleanup_pending:
+            pending += 1
+
+    await db.reconcile_order_status(order_id)
+    current = await db.get_order(order_id)
+    status = str(current["status"]) if current else "remove_pending"
+    if pending:
+        await db.set_order_status(order_id, "remove_pending")
+        status = "remove_pending"
+    await db.log_event(
+        "order_remove",
+        detail=(
+            f"{order_id} revoked={revoked} banned={banned} "
+            f"pending={pending} status={status}"
+        ),
+    )
+    await message.answer(
+        f"Order <code>{esc(order_id)}</code> — "
+        f"{revoked}/{len(links)} link(s) revoked, "
+        f"{banned} joined buyer(s) permanently banned, "
+        f"{pending} cleanup pending. Status: <code>{esc(status)}</code>."
+    )
 
 
 async def _remove_user(message: Message, ident: str) -> None:
@@ -1155,8 +1575,21 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
         await message.answer(f"No order <code>{esc(oid)}</code>.")
         return
     order_id = order["order_id"]
+    if order["status"] in {"remove_pending", "removed"}:
+        await message.answer(
+            f"Order <code>{esc(order_id)}</code> is permanently removed; "
+            "<code>/revoke</code> will not unban its buyers."
+        )
+        return
 
     await db.set_order_status(order_id, "revoke_pending")
+    current = await db.get_order(order_id)
+    if current and current["status"] in {"remove_pending", "removed"}:
+        await message.answer(
+            f"Order <code>{esc(order_id)}</code> entered permanent removal "
+            "while /revoke was starting; no buyer will be unbanned."
+        )
+        return
     reservations = await db.reservations_for_order(order_id)
     for request_id in {
         str(row["request_id"]) for row in reservations if row["request_id"]
@@ -1173,10 +1606,13 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
     for order_link in links:
         cleanup_pending = False
         if order_link["joined_user"] and not order_link["buyer_removed"]:
-            if await remove_buyer(
-                order_link["chat_id"], order_link["joined_user"]
-            ):
-                await db.set_order_link_buyer_removed(order_link["id"])
+            permanent = await _order_requires_permanent_ban(order_id)
+            operation = ban_buyer if permanent else remove_buyer
+            if await operation(order_link["chat_id"], order_link["joined_user"]):
+                if permanent:
+                    await db.set_order_link_buyer_banned(order_link["id"])
+                else:
+                    await db.set_order_link_buyer_removed(order_link["id"])
                 removed += 1
             else:
                 cleanup_pending = True
@@ -1193,10 +1629,12 @@ async def cmd_revoke(message: Message, command: CommandObject) -> None:
     await db.reconcile_order_status(order_id)
     if pending:
         await db.set_order_status(order_id, "revoke_pending")
-        status = "revoke_pending"
     else:
         await db.set_order_status(order_id, "revoked")
-        status = "revoked"
+    current = await db.get_order(order_id)
+    status = str(current["status"]) if current else (
+        "revoke_pending" if pending else "revoked"
+    )
     await db.log_event(
         "order_revoke",
         detail=(
@@ -1256,14 +1694,11 @@ async def bind_user_to_group(message: Message, query: str, user_id: int) -> None
             "Usage: <code>&lt;group&gt;:&lt;userid&gt;</code>  e.g. <code>cp:7406804576</code>"
         )
         return
-    groups = (
-        (await db.all_groups(admin_only=True))
-        if query.lower() == "all"
-        else await db.find_groups(query)
-    )
+    groups, match_error = await _groups_for_keyword(query)
     if not groups:
         await message.answer(
-            f"No group matches <code>{esc(query)}</code>. Try <code>/groups</code>."
+            f"No group matches <code>{esc(query)}</code>: "
+            f"{esc(match_error)}. Try <code>/groups</code>."
         )
         return
     g = groups[0]
@@ -1310,14 +1745,12 @@ async def distribute(message: Message, query: str) -> None:
         amount, account = tpl["amount"], tpl["account_name"]
         selector = tpl["keyword"]
 
-    if selector.strip().lower() == "all":
-        groups = await db.all_groups(admin_only=True)
-    else:
-        groups = await db.find_groups(selector)
+    groups, match_error = await _groups_for_keyword(selector)
 
     if not groups:
         await message.answer(
-            f"Nothing matches <code>{esc(query)}</code>. "
+            f"Nothing matches <code>{esc(query)}</code>: "
+            f"{esc(match_error)}. "
             "Try <code>/groups</code> or <code>all</code>."
         )
         return
@@ -1385,12 +1818,14 @@ def _start_background(coro) -> None:
 
 
 async def on_startup() -> None:
+    global _bot_user_id
     await db.init()
     try:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception as e:  # noqa: BLE001
         log.debug("delete_webhook: %s", e)
     me = await bot.get_me()
+    _bot_user_id = int(me.id)
     log.info("Started as @%s (id %s). OWNER_ID=%s", me.username, me.id, config.OWNER_ID)
     log.info(
         "Commands are DM-only. If yours are ignored, DM the bot /id and "
@@ -1408,28 +1843,31 @@ async def on_startup() -> None:
 
 
 async def _groups_for_keyword(query: str):
-    """Resolve one keyword deterministically; reject ambiguous substring hits."""
+    """Resolve one exact/typo keyword deterministically and reject ambiguity."""
     query = query.strip()
     if query.lower() == "all":
         return await db.all_groups(admin_only=True), ""
     matches = await db.find_groups(query)
     if not matches:
         return [], "no matching admin group"
-    folded = fold_fonts(query).casefold()
-    exact = [
-        group
-        for group in matches
-        if fold_fonts(group["short_code"] or "").casefold() == folded
-    ]
+    scored = [(group_match_score(query, group), group) for group in matches]
+    exact = [group for score, group in scored if score == 1.0]
     if len(exact) == 1:
         return exact, ""
-    if len(matches) == 1:
-        return matches, ""
-    names = ", ".join(str(group["title"]) for group in matches[:4])
+    if len(exact) > 1:
+        names = ", ".join(str(group["title"]) for group in exact[:4])
+        return [], f"ambiguous exact match: {names}"
+    if len(scored) == 1:
+        return [scored[0][1]], ""
+    if scored[0][0] - scored[1][0] >= 0.08:
+        return [scored[0][1]], ""
+    names = ", ".join(str(group["title"]) for _score, group in scored[:4])
     return [], f"ambiguous match: {names}"
 
 
-async def _cancel_request_reservations(rid: str) -> None:
+async def _cancel_request_reservations(
+    rid: str, *, permanent_ban: bool = False
+) -> None:
     """Fence and revoke links minted for a cancelled payment request."""
     reservations = await db.reservations_for_request(rid)
     order_ids = {
@@ -1439,7 +1877,15 @@ async def _cancel_request_reservations(rid: str) -> None:
     if bridge_order is not None:
         order_ids.add(str(bridge_order["order_id"]))
     for order_id in order_ids:
-        await db.set_order_status(order_id, "revoke_pending")
+        current = await db.get_order(order_id)
+        if current is not None and current["status"] in {
+            "remove_pending", "removed"
+        }:
+            permanent_ban = True
+    for order_id in order_ids:
+        await db.set_order_status(
+            order_id, "remove_pending" if permanent_ban else "revoke_pending"
+        )
 
     for reservation in reservations:
         status = reservation["status"]
@@ -1473,13 +1919,19 @@ async def _cancel_request_reservations(rid: str) -> None:
             await db.set_order_link_joined_by_invite(
                 reservation["invite_link"], reservation["user_id"]
             )
-            removed = await remove_buyer(
+            operation = ban_buyer if permanent_ban else remove_buyer
+            removed = await operation(
                 reservation["chat_id"], reservation["user_id"]
             )
             if removed:
-                await db.set_order_link_buyer_removed_by_invite(
-                    reservation["invite_link"]
-                )
+                if permanent_ban:
+                    await db.set_order_link_buyer_banned_by_invite(
+                        reservation["invite_link"]
+                    )
+                else:
+                    await db.set_order_link_buyer_removed_by_invite(
+                        reservation["invite_link"]
+                    )
 
         if await revoke_link(reservation["chat_id"], reservation["invite_link"]):
             await db.set_order_link_revoked_by_invite(
@@ -1501,7 +1953,8 @@ async def _cancel_request_reservations(rid: str) -> None:
 
     for order_id in order_ids:
         await db.reconcile_order_status(order_id)
-        await db.delete_order_if_empty(order_id)
+        if not permanent_ban:
+            await db.delete_order_if_empty(order_id)
 
     remaining_reservations = await db.reservations_for_request(rid)
     terminal = all(
@@ -1512,7 +1965,13 @@ async def _cancel_request_reservations(rid: str) -> None:
             links = await db.order_links(order_id)
             if any(
                 not row["revoked"]
-                or (row["joined_user"] and not row["buyer_removed"])
+                or (
+                    row["joined_user"]
+                    and not (
+                        row["buyer_banned"]
+                        if permanent_ban else row["buyer_removed"]
+                    )
+                )
                 for row in links
             ):
                 terminal = False
@@ -1578,7 +2037,12 @@ async def _fulfill_reservation(
             existing_order = await db.get_order(order_id)
             if (
                 existing_order is None
-                or existing_order["request_id"] not in ("", rid)
+                or existing_order["request_id"] != rid
+                or existing_order["command_key"] != f"bridge:{rid}"
+                or str(existing_order["amount"]) != amount
+                or str(existing_order["account_name"]) != account_name
+                or str(existing_order["keyword"]) != keyword_text
+                or int(existing_order["buyer_id"] or 0) != int(user_id)
             ):
                 linkstore.put_result(
                     rid,
@@ -1756,6 +2220,12 @@ async def revocation_retry_loop() -> None:
     """Retry failed revocations and expire unused buyer reservations."""
     while True:
         try:
+            if config.PAYMENT_CHANNEL:
+                for pending_order in await db.pending_channel_orders():
+                    await _deliver_direct_order_channel(
+                        pending_order["order_id"]
+                    )
+
             if linkstore is not None:
                 for item in linkstore.pending_revokes():
                     if await revoke_link(item["chat_id"], item["link"]):
@@ -1811,24 +2281,39 @@ async def revocation_retry_loop() -> None:
                         reservation["invite_link"], reservation["user_id"]
                     )
                     if reservation["order_id"]:
-                        await db.set_order_status(
+                        await _set_order_cleanup_state(
                             reservation["order_id"], "joined_revoke_pending"
                         )
                 cancellation = reservation["status"] in {
                     "cancel_requested", "cancel_revoke_pending"
                 }
+                permanent_cancellation = False
+                if cancellation and reservation["order_id"]:
+                    parent = await db.get_order(reservation["order_id"])
+                    permanent_cancellation = bool(
+                        parent
+                        and parent["status"] in {"remove_pending", "removed"}
+                    )
                 removed = True
                 if cancellation:
                     await db.set_order_link_joined_by_invite(
                         reservation["invite_link"], reservation["user_id"]
                     )
-                    removed = await remove_buyer(
+                    operation = (
+                        ban_buyer if permanent_cancellation else remove_buyer
+                    )
+                    removed = await operation(
                         reservation["chat_id"], reservation["user_id"]
                     )
                     if removed:
-                        await db.set_order_link_buyer_removed_by_invite(
-                            reservation["invite_link"]
-                        )
+                        if permanent_cancellation:
+                            await db.set_order_link_buyer_banned_by_invite(
+                                reservation["invite_link"]
+                            )
+                        else:
+                            await db.set_order_link_buyer_removed_by_invite(
+                                reservation["invite_link"]
+                            )
                 if await revoke_link(
                     reservation["chat_id"], reservation["invite_link"]
                 ):
@@ -1868,15 +2353,34 @@ async def revocation_retry_loop() -> None:
 
             for order_link in await db.pending_order_link_revocations():
                 removed = True
+                current_order = await db.get_order(order_link["order_id"])
+                current_status = (
+                    str(current_order["status"])
+                    if current_order is not None
+                    else str(order_link["order_status"])
+                )
+                permanent = current_status in {
+                    "remove_pending", "removed"
+                }
+                should_remove = current_status == "revoke_pending"
+                cleanup_done = (
+                    order_link["buyer_banned"]
+                    if permanent else order_link["buyer_removed"]
+                )
                 if (
                     order_link["joined_user"]
-                    and not order_link["buyer_removed"]
+                    and (permanent or should_remove)
+                    and not cleanup_done
                 ):
-                    removed = await remove_buyer(
+                    operation = ban_buyer if permanent else remove_buyer
+                    removed = await operation(
                         order_link["chat_id"], order_link["joined_user"]
                     )
                     if removed:
-                        await db.set_order_link_buyer_removed(order_link["id"])
+                        if permanent:
+                            await db.set_order_link_buyer_banned(order_link["id"])
+                        else:
+                            await db.set_order_link_buyer_removed(order_link["id"])
                 revoked = bool(order_link["revoked"])
                 if not revoked:
                     revoked = await revoke_link(
@@ -1886,6 +2390,17 @@ async def revocation_retry_loop() -> None:
                     await db.set_order_link_revoked(order_link["id"])
                 if revoked and removed:
                     await db.reconcile_order_status(order_link["order_id"])
+
+            for pending_ban in await db.pending_member_bans():
+                completed = await ban_buyer(
+                    pending_ban["chat_id"], pending_ban["user_id"]
+                )
+                await db.set_member_ban_result(
+                    pending_ban["chat_id"],
+                    pending_ban["user_id"],
+                    completed,
+                    "" if completed else "Telegram ban failed; retry scheduled",
+                )
         except Exception as e:  # noqa: BLE001
             log.warning("revocation retry error: %s: %s", type(e).__name__, e)
         await asyncio.sleep(20)
@@ -1902,10 +2417,21 @@ async def on_shutdown() -> None:
 
 async def run() -> None:
     config.require()
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    log.info("Polling...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    lock = ProcessLock(host_lock_path("bot-account", config.BOT_TOKEN))
+    if not lock.acquire():
+        log.error(
+            "Another python -m bot process is already polling this bot token."
+        )
+        raise SystemExit(1)
+    try:
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+        log.info("Polling...")
+        await dp.start_polling(
+            bot, allowed_updates=dp.resolve_used_update_types()
+        )
+    finally:
+        lock.close()
 
 
 def main() -> None:

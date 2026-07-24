@@ -119,6 +119,7 @@ def test_order_allocation_reservation_fencing_and_reconciliation(
             await db.reconcile_order_status("ANI0001")
             assert (await db.get_order("ANI0001"))["status"] == "joined"
             assert len([row for row in await db.order_links("ANI0001") if not row["revoked"]]) == 1
+            assert await db.pending_order_link_revocations() == []
         finally:
             await db.close()
 
@@ -179,8 +180,17 @@ def test_database_migrates_existing_order_and_reservation_tables(
             link_columns = {row["name"] for row in await cur.fetchall()}
             cur = await db._db().execute("PRAGMA table_info(reservations)")
             reservation_columns = {row["name"] for row in await cur.fetchall()}
-            assert {"command_key", "source", "buyer_id", "request_id"} <= order_columns
-            assert "buyer_removed" in link_columns
+            assert {
+                "command_key",
+                "source",
+                "buyer_id",
+                "request_id",
+                "private_sent",
+                "channel_sent",
+                "channel_error",
+                "channel_html",
+            } <= order_columns
+            assert {"buyer_removed", "buyer_banned"} <= link_columns
             assert "order_id" in reservation_columns
         finally:
             await db.close()
@@ -188,31 +198,26 @@ def test_database_migrates_existing_order_and_reservation_tables(
     asyncio.run(scenario())
 
 
-def test_guard_unbans_every_page_without_skipping(monkeypatch) -> None:
+def test_guard_direct_join_removal_is_a_permanent_ban(monkeypatch) -> None:
     async def scenario() -> None:
-        banned = list(range(250))
-        offsets = []
+        requests = []
 
         class Client:
+            async def get_input_entity(self, user_id):
+                return f"peer:{user_id}"
+
             async def __call__(self, request):
-                if type(request).__name__ == "GetParticipantsRequest":
-                    offsets.append(request.offset)
-                    return SimpleNamespace(
-                        participants=[SimpleNamespace(peer=user) for user in banned[:100]]
-                    )
-                banned.remove(request.participant)
-                return None
+                requests.append(request)
 
         monkeypatch.setattr(guard, "client", Client())
         guard._state["channel"] = "channel"
-
-        async def no_sleep(*_args):
-            return None
-
-        monkeypatch.setattr(guard.asyncio, "sleep", no_sleep)
-        assert await guard.unban_all() == 250
-        assert banned == []
-        assert set(offsets) == {0}
+        guard._state["self_id"] = 1
+        guard._state["owner_id"] = 2
+        assert await guard.kick(42, announce=False)
+        assert len(requests) == 1
+        assert type(requests[0]).__name__ == "EditBannedRequest"
+        assert requests[0].participant == "peer:42"
+        assert requests[0].banned_rights.view_messages is True
 
     asyncio.run(scenario())
 
@@ -747,8 +752,10 @@ def test_partial_group_failure_renders_values_privately_and_in_channel(
         for rendered in (edits[0], posts[0]):
             assert "₹25" in rendered
             assert "ANIFIXED" in rendered
-            assert "https://t.me/+working" in rendered
             assert "Unavailable: bad: group unavailable" in rendered
+        assert "https://t.me/+working" in edits[0]
+        assert "https://t.me/+working" not in posts[0]
+        assert "1 buyer-bound link(s) sent privately" in posts[0]
 
     asyncio.run(scenario())
 
@@ -868,6 +875,7 @@ def test_admin_add_is_idempotent_and_posts_partial_failure_details(
             assert "Unavailable" in "\n".join(private)
             assert "Broken" in "\n".join(channel)
             assert orders[0]["order_id"] in "\n".join(channel)
+            assert "https://t.me/+working" not in "\n".join(channel)
         finally:
             await db.close()
 
@@ -900,3 +908,452 @@ def test_infra_has_fixed_services_host_lock_and_bounded_restarts(
         clock[0] += 0.1
     assert supervisor._stopping is True
     assert "exited too often" in supervisor._fatal
+
+
+def test_payment_accounting_counts_current_once_and_channel_hides_links() -> None:
+    now = quickreply._now_ts()
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pay["payments"] = [
+        {
+            "amount": "10.00",
+            "name": "First",
+            "order_id": "ANIFIRST",
+            "status": "valid",
+            "ts": now,
+        }
+    ]
+    before_commit = quickreply._pay_mapping(
+        quickreply.Decimal("14"),
+        "Second",
+        "ANISECOND",
+        include_current=True,
+    )
+    assert before_commit["{total}"] == "2"
+    assert before_commit["{todaytotal}"] == "₹24"
+
+    quickreply._pay["payments"].append(
+        {
+            "amount": "14.00",
+            "name": "Second",
+            "order_id": "ANISECOND",
+            "status": "valid",
+            "ts": now,
+        }
+    )
+    after_commit = quickreply._required_payment_text(
+        quickreply.Decimal("14"),
+        "Second",
+        "ANISECOND",
+        [
+            {
+                "link": "https://t.me/+private",
+                "title": "LOLsi",
+                "keyword": "lol",
+            }
+        ],
+        [],
+        include_current=False,
+        expose_links=False,
+    )
+    assert "Payments today: 2" in after_commit
+    assert "Collected today: ₹24" in after_commit
+    assert "https://t.me/+private" not in after_commit
+    assert "LOLsi" in after_commit
+    sanitized, entities = quickreply._sanitize_channel_invites(
+        "Proof https://t.me/+secret", []
+    )
+    assert "https://t.me/+secret" not in sanitized
+    assert entities == []
+
+    long_value = "😀" * 3000
+    chunks = quickreply._split_plain_text(
+        long_value, header="Order ID: ANISECOND", limit=4000
+    )
+    assert all(quickreply._u16(chunk) <= 4000 for chunk in chunks)
+    assert "".join(
+        chunk.removeprefix("Order ID: ANISECOND\n") for chunk in chunks
+    ) == long_value
+
+
+def test_failed_order_cleanup_deletes_only_truly_empty_orders(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "cleanup.db")
+        await db.init()
+        try:
+            assert await db.register_order(
+                "ANICLEAN", "14", "Amit", "lol"
+            )
+            assert await db.delete_order_if_empty("ANICLEAN")
+            assert await db.get_order("ANICLEAN") is None
+            assert await db.order_links("ANICLEAN") == []
+
+            assert await db.register_order(
+                "ANIAUDIT", "14", "Amit", "lol"
+            )
+            link_id = await db.add_order_link(
+                "ANIAUDIT", -1001, "https://t.me/+cleanup"
+            )
+            await db.set_order_link_revoked(link_id)
+            assert not await db.delete_order_if_empty("ANIAUDIT")
+            assert await db.get_order("ANIAUDIT") is not None
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_payment_post_reconciles_ambiguous_upload_without_duplicate(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["post_channel"] = -1001
+        payment = {
+            "amount": "14.00",
+            "name": "Amit",
+            "order_id": "ANIRECON",
+            "status": "valid",
+            "ts": quickreply._now_ts(),
+            "post_chat_id": -1001,
+            "post_status": "posting",
+            "source_chat_id": 42,
+            "source_message_id": 9,
+        }
+        quickreply._pay["payments"] = [payment]
+        uploads = []
+
+        class Client:
+            async def iter_messages(self, *_args, **_kwargs):
+                yield SimpleNamespace(
+                    id=777, message="Order ANIRECON", media=object()
+                )
+
+            async def send_file(self, *_args, **_kwargs):
+                uploads.append(True)
+
+        monkeypatch.setattr(quickreply, "client", Client())
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+
+        assert await quickreply._post_payment_to_channel(payment)
+        assert uploads == []
+        assert payment["post_status"] == "posted"
+        assert payment["post_message_id"] == 777
+
+    asyncio.run(scenario())
+
+
+def test_add_save_failure_cancels_every_reserved_link(monkeypatch) -> None:
+    async def scenario() -> None:
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        cancelled = []
+        replies = []
+
+        async def reserve(*_args, **_kwargs):
+            return {
+                "request_id": "durable-request",
+                "entries": [
+                    {
+                        "link": "https://t.me/+reserved",
+                        "title": "LOLsi",
+                        "keyword": "lol",
+                    }
+                ],
+                "failures": [],
+            }
+
+        async def cancel(request_id):
+            cancelled.append(request_id)
+            return True
+
+        def fail_save():
+            raise OSError("disk full")
+
+        monkeypatch.setattr(quickreply, "_reserve_links", reserve)
+        monkeypatch.setattr(quickreply, "_cancel_reserved_links", cancel)
+        monkeypatch.setattr(quickreply, "_save_pay", fail_save)
+
+        class Event:
+            raw_text = "/add 14 Amit lol"
+            chat_id = 42
+            id = 81
+            is_private = True
+
+            async def get_reply_message(self):
+                return None
+
+            async def edit(self, text, **_kwargs):
+                replies.append(text)
+
+            async def respond(self, text, **_kwargs):
+                replies.append(text)
+
+        await quickreply.cmd_add(Event())
+
+        assert cancelled == ["durable-request"]
+        assert quickreply._pay["payments"] == []
+        assert "could not be saved" in replies[0]
+
+    asyncio.run(scenario())
+
+
+def test_fuzzy_group_lookup_resolves_typos_and_rejects_ties(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "fuzzy.db")
+        await db.init()
+        try:
+            await db.upsert_group(
+                -1001, "LOLsi", "Llsi", "supergroup", "lolsi", None, True
+            )
+            groups, reason = await app._groups_for_keyword("Lolsia")
+            assert reason == ""
+            assert [group["title"] for group in groups] == ["LOLsi"]
+
+            groups, reason = await app._groups_for_keyword("lolsa")
+            assert reason == ""
+            assert [group["title"] for group in groups] == ["LOLsi"]
+
+            await db.upsert_group(
+                -1002, "LOLsa", "Llsa", "supergroup", "lolsa", None, True
+            )
+            groups, reason = await app._groups_for_keyword("lolsz")
+            assert groups == []
+            assert "ambiguous" in reason
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_remove_order_permanently_bans_joined_buyers_without_unban(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "remove.db")
+        await db.init()
+        calls = []
+        answers = []
+        try:
+            assert await db.register_order(
+                "ANIREMOVE", "14", "Amit", "all"
+            )
+            first = await db.add_order_link(
+                "ANIREMOVE", -1001, "https://t.me/+one"
+            )
+            second = await db.add_order_link(
+                "ANIREMOVE", -1002, "https://t.me/+two"
+            )
+            await db.set_order_link_joined(first, 41)
+            await db.set_order_link_joined(second, 42)
+
+            async def ban(chat_id, user_id):
+                calls.append(("ban", chat_id, user_id))
+
+            async def unban(chat_id, user_id, **_kwargs):
+                calls.append(("unban", chat_id, user_id))
+
+            async def revoke(*_args):
+                return True
+
+            monkeypatch.setattr(app, "owner_only", lambda _message: True)
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+            monkeypatch.setattr(app, "revoke_link", revoke)
+            monkeypatch.setattr(app, "linkstore", None)
+
+            class Message:
+                async def answer(self, text, **_kwargs):
+                    answers.append(text)
+
+            await app.cmd_remove(
+                Message(), SimpleNamespace(args="aniremove")
+            )
+            links = await db.order_links("ANIREMOVE")
+            assert calls == [
+                ("ban", -1001, 41),
+                ("ban", -1002, 42),
+            ]
+            assert all(row["buyer_banned"] for row in links)
+            assert all(row["revoked"] for row in links)
+            assert (await db.get_order("ANIREMOVE"))["status"] == "removed"
+            assert "permanently banned" in answers[0]
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_direct_and_wrong_buyer_joins_are_permanently_banned(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "joins.db")
+        await db.init()
+        banned = []
+        notices = []
+        try:
+            async def ban(chat_id, user_id):
+                banned.append((chat_id, user_id))
+
+            async def notify(text, **_kwargs):
+                notices.append(text)
+
+            async def revoke(*_args):
+                return True
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app, "tell_owner", notify)
+            monkeypatch.setattr(app, "revoke_link", revoke)
+            monkeypatch.setattr(app, "_bot_user_id", 999)
+
+            direct = SimpleNamespace(
+                old_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.LEFT
+                ),
+                new_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.MEMBER,
+                    user=SimpleNamespace(
+                        id=51, username=None, full_name="Direct"
+                    ),
+                ),
+                invite_link=None,
+                chat=SimpleNamespace(id=-1001, title="LOLsi"),
+            )
+            await app.on_chat_member(direct)
+
+            assert await db.register_order(
+                "ANIBOUND",
+                "14",
+                "Amit",
+                "lol",
+                buyer_id=42,
+            )
+            link_id = await db.add_order_link(
+                "ANIBOUND", -1001, "https://t.me/+bound"
+            )
+            wrong = SimpleNamespace(
+                old_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.LEFT
+                ),
+                new_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.MEMBER,
+                    user=SimpleNamespace(
+                        id=52, username=None, full_name="Wrong"
+                    ),
+                ),
+                invite_link=SimpleNamespace(
+                    invite_link="https://t.me/+bound"
+                ),
+                chat=SimpleNamespace(id=-1001, title="LOLsi"),
+            )
+            await app.on_chat_member(wrong)
+
+            assert banned == [(-1001, 51), (-1001, 52)]
+            assert (await db.order_links("ANIBOUND"))[0]["joined_user"] is None
+            assert (await db.order_links("ANIBOUND"))[0]["revoked"] == 1
+            assert (await db.get_order("ANIBOUND"))["status"] == "compromised"
+            assert len(notices) == 2
+            ban_rows = await db._all(
+                "SELECT * FROM member_bans ORDER BY user_id"
+            )
+            assert [row["status"] for row in ban_rows] == [
+                "completed",
+                "completed",
+            ]
+            assert link_id
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_approved_exact_join_request_is_not_banned(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "approved.db")
+        await db.init()
+        banned = []
+        try:
+            await db.add_join_request(
+                -1001,
+                61,
+                None,
+                "Approved",
+                "https://t.me/+approved",
+            )
+            await db.set_join_status(-1001, 61, "approved")
+
+            async def ban(*args):
+                banned.append(args)
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app, "_bot_user_id", 999)
+            update = SimpleNamespace(
+                old_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.LEFT
+                ),
+                new_chat_member=SimpleNamespace(
+                    status=app.ChatMemberStatus.MEMBER,
+                    user=SimpleNamespace(
+                        id=61, username=None, full_name="Approved"
+                    ),
+                ),
+                invite_link=SimpleNamespace(
+                    invite_link="https://t.me/+approved"
+                ),
+                chat=SimpleNamespace(id=-1001, title="LOLsi"),
+            )
+            await app.on_chat_member(update)
+            assert banned == []
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_exact_amount_detection_and_utf16_html_splitting() -> None:
+    from bot import app
+
+    group = {"title": "LOLsi"}
+    rendered = app._ensure_order_render(
+        "Order ANI1 Amount 14 Account Amit https://t.me/+one",
+        order_id="ANI1",
+        amount="1",
+        account="Amit",
+        group=group,
+        link="https://t.me/+one",
+    )
+    assert "Amount <code>1</code>" in rendered
+
+    chunks = []
+
+    async def scenario() -> None:
+        await app._send_html_blocks(
+            lambda text: _collect(chunks, text), ["😀" * 2100]
+        )
+
+    async def _collect(target, text):
+        target.append(text)
+
+    asyncio.run(scenario())
+    assert len(chunks) == 2
+    assert all(app._telegram_units(chunk) <= 4000 for chunk in chunks)
+    assert "".join(chunks) == "😀" * 2100

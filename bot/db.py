@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS orders (
     buyer_id     INTEGER,
     request_id   TEXT NOT NULL DEFAULT '',
     response_html TEXT NOT NULL DEFAULT '',
+    private_sent INTEGER NOT NULL DEFAULT 0,
+    channel_sent INTEGER NOT NULL DEFAULT 0,
+    channel_error TEXT NOT NULL DEFAULT '',
+    channel_html TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL DEFAULT 0,
     updated_at   REAL NOT NULL DEFAULT 0
 );
@@ -78,6 +82,7 @@ CREATE TABLE IF NOT EXISTS order_links (
     joined_user INTEGER,
     revoked     INTEGER NOT NULL DEFAULT 0,
     buyer_removed INTEGER NOT NULL DEFAULT 0,
+    buyer_banned INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL DEFAULT 0
 );
 
@@ -115,6 +120,17 @@ CREATE TABLE IF NOT EXISTS events (
     ts       REAL NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS member_bans (
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    last_error  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_groups_short ON groups(short_code);
 CREATE INDEX IF NOT EXISTS idx_jr_status ON join_requests(status);
 CREATE INDEX IF NOT EXISTS idx_ol_order ON order_links(order_id);
@@ -126,6 +142,8 @@ CREATE INDEX IF NOT EXISTS idx_reservation_link
     ON reservations(invite_link, status);
 CREATE INDEX IF NOT EXISTS idx_reservation_revoke
     ON reservations(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_member_bans_status
+    ON member_bans(status, updated_at);
 """
 
 _conn: Optional[aiosqlite.Connection] = None
@@ -150,9 +168,24 @@ async def init() -> None:
     await _ensure_column("orders", "buyer_id", "INTEGER")
     await _ensure_column("orders", "request_id", "TEXT NOT NULL DEFAULT ''")
     await _ensure_column("orders", "response_html", "TEXT NOT NULL DEFAULT ''")
+    await _ensure_column(
+        "orders", "private_sent", "INTEGER NOT NULL DEFAULT 0"
+    )
+    await _ensure_column(
+        "orders", "channel_sent", "INTEGER NOT NULL DEFAULT 0"
+    )
+    await _ensure_column(
+        "orders", "channel_error", "TEXT NOT NULL DEFAULT ''"
+    )
+    await _ensure_column(
+        "orders", "channel_html", "TEXT NOT NULL DEFAULT ''"
+    )
     await _ensure_column("reservations", "order_id", "TEXT NOT NULL DEFAULT ''")
     await _ensure_column(
         "order_links", "buyer_removed", "INTEGER NOT NULL DEFAULT 0"
+    )
+    await _ensure_column(
+        "order_links", "buyer_banned", "INTEGER NOT NULL DEFAULT 0"
     )
     await _conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_command_key "
@@ -292,27 +325,31 @@ async def all_groups(admin_only: bool = False) -> list[aiosqlite.Row]:
 
 
 async def find_groups(query: str) -> list[aiosqlite.Row]:
-    """Match a query against short code (exact) or title/username (substring),
-    folding fancy Unicode fonts on BOTH sides so typing "nice bro" matches a
-    title like "ɴɪᴄᴇ ʙʀᴏ". Exact short-code hits come first."""
-    from .utils import fold_fonts
+    """Return ranked exact, substring, or typo-tolerant admin-group matches."""
+    from .utils import fuzzy_group_threshold, group_match_score
 
-    q = fold_fonts(query.strip()).lower()
+    q = query.strip()
     if not q:
         return []
     rows = await _all(
         "SELECT * FROM groups WHERE is_admin=1 ORDER BY title COLLATE NOCASE"
     )
-    exact, subs = [], []
-    for r in rows:
-        short = fold_fonts(r["short_code"] or "").lower()
-        title = fold_fonts(r["title"] or "").lower()
-        uname = fold_fonts(r["username"] or "").lower()
-        if short == q:
-            exact.append(r)
-        elif q in title or q in short or (uname and q in uname):
-            subs.append(r)
-    return exact + subs
+    threshold = fuzzy_group_threshold(q)
+    ranked = [
+        (group_match_score(q, row), row)
+        for row in rows
+    ]
+    ranked = [
+        (score, row) for score, row in ranked if score >= threshold
+    ]
+    ranked.sort(
+        key=lambda item: (
+            -item[0],
+            str(item[1]["title"] or "").casefold(),
+            int(item[1]["chat_id"]),
+        )
+    )
+    return [row for _score, row in ranked]
 
 
 async def remove_group(chat_id: int) -> None:
@@ -383,6 +420,15 @@ async def set_join_status(chat_id: int, user_id: int, status: str) -> None:
     await _run(
         "UPDATE join_requests SET status=?, handled_at=? WHERE chat_id=? AND user_id=?",
         (status, time.time(), chat_id, user_id),
+    )
+
+
+async def get_join_request(
+    chat_id: int, user_id: int
+) -> Optional[aiosqlite.Row]:
+    return await _one(
+        "SELECT * FROM join_requests WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
     )
 
 
@@ -516,7 +562,7 @@ async def register_order(
 
 
 async def delete_order_if_empty(order_id: str) -> bool:
-    """Remove a failed order only when it has no surviving invite links."""
+    """Remove a failed order only when it never created any access records."""
     async with _write_lock:
         cur = await _db().execute(
             "DELETE FROM orders WHERE order_id=? "
@@ -576,8 +622,19 @@ async def order_links(order_id: str) -> list[aiosqlite.Row]:
 
 async def set_order_status(order_id: str, status: str) -> None:
     await _run(
-        "UPDATE orders SET status=?, updated_at=? WHERE order_id=?",
-        (status, time.time(), order_id),
+        """
+        UPDATE orders SET
+            status=CASE
+                WHEN status='removed' THEN 'removed'
+                WHEN status='remove_pending'
+                     AND ? NOT IN ('remove_pending', 'removed')
+                    THEN status
+                ELSE ?
+            END,
+            updated_at=?
+        WHERE order_id=?
+        """,
+        (status, status, time.time(), order_id),
     )
 
 
@@ -585,6 +642,40 @@ async def set_order_response(order_id: str, response_html: str) -> None:
     await _run(
         "UPDATE orders SET response_html=?, updated_at=? WHERE order_id=?",
         (response_html, time.time(), order_id),
+    )
+
+
+async def set_order_private_sent(order_id: str, sent: bool = True) -> None:
+    await _run(
+        "UPDATE orders SET private_sent=?, updated_at=? WHERE order_id=?",
+        (int(sent), time.time(), order_id),
+    )
+
+
+async def set_order_channel_delivery(
+    order_id: str, sent: bool, error: str = ""
+) -> None:
+    await _run(
+        "UPDATE orders SET channel_sent=?, channel_error=?, updated_at=? "
+        "WHERE order_id=?",
+        (int(sent), error[:500], time.time(), order_id),
+    )
+
+
+async def set_order_channel_html(order_id: str, channel_html: str) -> None:
+    await _run(
+        "UPDATE orders SET channel_html=?, updated_at=? WHERE order_id=?",
+        (channel_html, time.time(), order_id),
+    )
+
+
+async def pending_channel_orders() -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM orders WHERE source='bot' AND private_sent=1 "
+        "AND channel_sent=0 AND channel_html!='' "
+        "AND status IN ('open', 'joined', 'joined_revoke_pending', "
+        "'partially_expired') "
+        "ORDER BY updated_at LIMIT 20"
     )
 
 
@@ -614,6 +705,19 @@ async def set_order_link_buyer_removed(link_id: int) -> None:
 async def set_order_link_buyer_removed_by_invite(invite_link: str) -> None:
     await _run(
         "UPDATE order_links SET buyer_removed=1 WHERE invite_link=?",
+        (invite_link,),
+    )
+
+
+async def set_order_link_buyer_banned(link_id: int) -> None:
+    await _run(
+        "UPDATE order_links SET buyer_banned=1 WHERE id=?", (link_id,)
+    )
+
+
+async def set_order_link_buyer_banned_by_invite(invite_link: str) -> None:
+    await _run(
+        "UPDATE order_links SET buyer_banned=1 WHERE invite_link=?",
         (invite_link,),
     )
 
@@ -808,11 +912,20 @@ async def expired_pending_reservations(cutoff: float) -> list[aiosqlite.Row]:
 
 async def pending_order_link_revocations() -> list[aiosqlite.Row]:
     return await _all(
-        "SELECT ol.* FROM order_links ol "
+        "SELECT ol.*, o.status AS order_status FROM order_links ol "
         "JOIN orders o ON o.order_id=ol.order_id "
-        "WHERE (ol.revoked=0 OR "
-        "(ol.joined_user IS NOT NULL AND ol.buyer_removed=0)) "
-        "AND (ol.joined_user IS NOT NULL OR o.status='revoke_pending') "
+        "WHERE ("
+        "  (o.status='remove_pending' AND "
+        "   (ol.revoked=0 OR "
+        "    (ol.joined_user IS NOT NULL AND ol.buyer_banned=0))) "
+        "  OR "
+        "  (o.status='revoke_pending' AND "
+        "   (ol.revoked=0 OR "
+        "    (ol.joined_user IS NOT NULL AND ol.buyer_removed=0))) "
+        "  OR "
+        "  (o.status='joined_revoke_pending' AND "
+        "   ol.joined_user IS NOT NULL AND ol.revoked=0)"
+        ") "
         "ORDER BY ol.created_at"
     )
 
@@ -826,8 +939,10 @@ async def reconcile_order_status(order_id: str) -> None:
         "AND joined_user IS NOT NULL AND revoked=0) AS has_spent_open "
         ", EXISTS(SELECT 1 FROM order_links WHERE order_id=? "
         "AND joined_user IS NOT NULL AND buyer_removed=0) AS has_buyer_cleanup "
+        ", EXISTS(SELECT 1 FROM order_links WHERE order_id=? "
+        "AND joined_user IS NOT NULL AND buyer_banned=0) AS has_ban_cleanup "
         "FROM orders WHERE order_id=?",
-        (order_id, order_id, order_id, order_id),
+        (order_id, order_id, order_id, order_id, order_id),
     )
     if not row:
         return
@@ -839,6 +954,12 @@ async def reconcile_order_status(order_id: str) -> None:
         await set_order_status(order_id, "revoked")
     elif row["status"] == "joined_revoke_pending" and not row["has_spent_open"]:
         await set_order_status(order_id, "joined")
+    elif (
+        row["status"] == "remove_pending"
+        and not row["has_open"]
+        and not row["has_ban_cleanup"]
+    ):
+        await set_order_status(order_id, "removed")
 
 
 async def reconcile_order_expiry(order_id: str) -> None:
@@ -866,4 +987,47 @@ async def log_event(
     await _run(
         "INSERT INTO events (kind, chat_id, user_id, detail, ts) VALUES (?,?,?,?,?)",
         (kind, chat_id, user_id, detail, time.time()),
+    )
+
+
+# --- durable permanent member bans ---------------------------------------
+async def queue_member_ban(
+    chat_id: int, user_id: int, reason: str
+) -> None:
+    now = time.time()
+    await _run(
+        """
+        INSERT INTO member_bans
+            (chat_id, user_id, reason, status, last_error, created_at, updated_at)
+        VALUES (?,?,?, 'pending', '', ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            reason=excluded.reason,
+            status=CASE WHEN member_bans.status='completed'
+                        THEN member_bans.status ELSE 'pending' END,
+            updated_at=excluded.updated_at
+        """,
+        (chat_id, user_id, reason[:500], now, now),
+    )
+
+
+async def pending_member_bans() -> list[aiosqlite.Row]:
+    return await _all(
+        "SELECT * FROM member_bans WHERE status='pending' "
+        "ORDER BY updated_at"
+    )
+
+
+async def set_member_ban_result(
+    chat_id: int, user_id: int, completed: bool, error: str = ""
+) -> None:
+    await _run(
+        "UPDATE member_bans SET status=?, last_error=?, updated_at=? "
+        "WHERE chat_id=? AND user_id=?",
+        (
+            "completed" if completed else "pending",
+            error[:500],
+            time.time(),
+            chat_id,
+            user_id,
+        ),
     )

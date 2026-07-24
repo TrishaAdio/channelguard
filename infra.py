@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import ui
+from runtime_lock import ProcessLock
 
 ROOT = Path(__file__).resolve().parent
 LOCK_PATH = Path(tempfile.gettempdir()) / "channelguard-infra.lock"
@@ -57,50 +58,11 @@ class ServiceState:
     failures: int = 0
 
 
-class InstanceLock:
-    """Non-blocking host-wide process lock retained for this object's lifetime."""
+class InstanceLock(ProcessLock):
+    """Backwards-compatible name for the shared process-lock implementation."""
 
     def __init__(self, path: Path = LOCK_PATH):
-        self.path = Path(path)
-        self.handle = None
-
-    def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = open(self.path, "a+", encoding="utf-8")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.handle.seek(0, os.SEEK_END)
-                if self.handle.tell() == 0:
-                    self.handle.write("\0")
-                    self.handle.flush()
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(
-                    self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-        except (OSError, BlockingIOError):
-            self.handle.close()
-            self.handle = None
-            return False
-
-        try:
-            self.handle.seek(0)
-            self.handle.truncate()
-            self.handle.write(f"pid={os.getpid()} cwd={ROOT}\n")
-            self.handle.flush()
-        except OSError:
-            pass
-        return True
-
-    def close(self) -> None:
-        if self.handle is not None:
-            self.handle.close()
-            self.handle = None
+        super().__init__(path)
 
 
 class Supervisor:
@@ -260,7 +222,9 @@ class Supervisor:
 
         for state in running:
             ui.warn(f"Force-stopping {state.spec.name}.")
-            self._signal_process(state.process, signal.SIGKILL)
+            self._signal_process(
+                state.process, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
 
         for state in self.states:
             if state.process is not None:

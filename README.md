@@ -27,30 +27,42 @@ A single-owner Telegram **bot** (bot token, not a login). What it does:
    mints a **single-use** invite link (`member_limit=1`) for each matched group
    — only one buyer can use it. Each `/add` gets an **order id** (`ANI0001`,
    `ANI0002`, ...) and the post is sent to you and (optionally) to a
-   **payment channel**. When the buyer joins, the bot ties them to the order
-   and **revokes the spent link** automatically. Need another seat for the same
-   group? Just run `/add` again — each order is an independent link.
+   **payment channel**. Invite URLs are delivered only in the owner's private
+   chat; the payment channel receives metadata, group names/counts, and
+   unavailable details without reusable invite URLs. When the buyer joins, the
+   bot ties them to the order and **revokes the spent link** automatically.
+   Need another seat for the same group? Just run `/add` again — each order is
+   an independent link.
 3. **`/revoke <orderid>`** kills every link in that order and removes any buyer
    who joined through it (kick + unban, so no permanent ban is left behind).
-4. **Join requests -> owner.** Every join request (on the general approval
-   link) is stored and forwarded with inline **Approve / Decline** buttons. On
-   approve the link is **rotated** so the old one is dead.
-5. **Owner control from DM** (owner id only):
+4. **`/remove <orderid>`** kills every link and permanently bans each buyer
+   who joined a group through that order. Failed cleanup is retried from
+   SQLite.
+5. **Join enforcement.** Every join request (on the general approval
+   link) is stored and forwarded with inline **Approve / Decline** buttons.
+   General-link rotation after approval is optional (`ROTATE_ON_JOIN`). Direct joins without
+   the matching approved request/order link, and use of a buyer-bound link by
+   the wrong account, are permanently banned with durable retry state.
+6. **Owner control from DM** (owner id only):
 
    | Command | Effect |
    |---------|--------|
-   | `/add <amount> <account> <keyword>` | mint a single-use link per matched group + an order id, posted here and to the payment channel |
-   | `/revoke <orderid>` | revoke the order's link(s) and ban the buyer(s) |
+   | `/add <amount> <account> <keyword>` | mint a single-use link per matched group + one order id; private chat gets URLs, payment channel gets a safe summary |
+   | `/revoke <orderid>` | revoke links and remove joined buyers without a lasting ban |
+   | `/remove <orderid>` | revoke links and permanently ban joined buyers in those groups |
    | `/orders` | list recent orders and their status |
    | `/tpl <keyword> [body]` | set the post format for a keyword (reply to a formatted message to keep its HTML) |
    | `/groups` | list registered groups + short codes + admin/link status |
    | `/list` | list saved templates |
    | `/pending` | list pending join requests with Approve/Decline |
-   | `/remove <keyword \| @user \| id>` | delete a template, **or** decline that user's requests and remove them from every group |
+   | `/remove <keyword \| @user \| id>` | also delete a template, **or** decline that user's requests and remove them from every group |
    | send a short code / name / `all` | reply with the approval-required link(s) |
 
    Template tokens: `{link} {title} {short} {amount} {name} {keyword} {orderid}`.
-6. **Clean service.** Join/leave system messages in groups are deleted so the
+   Group lookup is font/case-insensitive and typo-tolerant (`Lolsia`/`lolsa`
+   can resolve `LOLsi`); close matches are rejected as ambiguous instead of
+   silently selecting the wrong group.
+7. **Clean service.** Join/leave system messages in groups are deleted so the
    chat stays clean (needs the Delete Messages right).
 
 ### Run
@@ -75,12 +87,11 @@ Locks down a channel's access:
 
 1. Every **`ROTATE_MINUTES`** (default 5) it **revokes** the channel's invite
    link, issues a **fresh** one, and **DMs it to the owner**.
-2. Anyone who **joins** the channel is **kicked and immediately unbanned** —
-   removed but free to rejoin later, never a lasting ban (owner and admins are
-   exempt). On startup it also **clears every existing ban** in the channel.
+2. Anyone who **joins directly** is **permanently banned** (owner and admins
+   are exempt). Existing bans are preserved across restarts.
 
-So a leaked link dies within minutes, nobody who slips in stays, and your
-channel never accumulates a banned-users list.
+So a leaked link dies within minutes, and an account that slips in cannot
+immediately reuse another leaked link.
 
 ## Setup
 
@@ -103,7 +114,7 @@ python guard.py
 ```
 
 Leave it running. The owner starts getting a fresh invite link every few
-minutes, and joiners get removed.
+minutes, and direct joiners are permanently banned.
 
 ## Quick-reply userbot (`quickreply.py`) — optional second account
 
@@ -184,7 +195,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 
 | Command | Effect |
 |---------|--------|
-| reply to an image + `/add <amount> [name]` | record the payment (INR), message the user in that private chat, and auto-post the image + caption to your channel |
+| reply to an image + `/add <amount> <name> [group ... \| all]` | record the payment (INR), privately deliver buyer-bound links, and auto-post the image + safe metadata caption to your channel |
 | `/setdone <template>` | the message the paying user receives in the private chat |
 | `/setchannelpostofpayment <template>` | the caption used for the channel post |
 | `.setchannel` (typed in a channel) | set that channel as the post target and persist it as `PAYMENT_CHANNEL` in `.env` |
@@ -209,6 +220,10 @@ Every new `/add` upload is linked to its payment record; replying
 `/cancel` to that generated post marks it **FAKE PAYMENT** while retaining an
 audit record, and excludes it from `/stats` and all later daily-total template
 values. Posts generated before `/cancel` support cannot be matched retroactively.
+Buyer-bound invite URLs are intentionally private: even when `/add ... all`
+creates many links, the payment channel receives only the delivery count/group
+names and unavailable details. Failed/ambiguous channel uploads are reconciled
+by order id and retried from `pay.json`.
 The revenue split, timezone, and share basis are configured via
 `RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
 
@@ -264,6 +279,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
 | `ORDER_PREFIX`   | (payment logger) `{orderid}` prefix (default `ANI`) |
 | `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |
+| `PAYMENT_CHANNEL`| (payment logger/admin bot) numeric target channel id |
 | `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
 | `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
@@ -274,11 +290,10 @@ host-wide lock prevents two infrastructure launchers from running at once.
 - The owner is resolved by `get_entity` — a **@username** always works. A bare
   user id works only if the account already shares a chat with the userbot
   (e.g. the owner is in the channel).
-- Kicks are ban-then-unban, so removed users are **not** left banned and can
-  rejoin (via a future link). Startup clears any pre-existing bans too.
 - **Security sweep**: on startup and every `SWEEP_MINUTES` (default 5), all
-  non-admin members are kicked — this catches anyone who joined while the guard
-  was offline (the live handler only sees new joins). `SWEEP_MINUTES=0` runs the
-  sweep only at startup.
-- Admins can't be kicked (Telegram restriction); those attempts are ignored.
+  non-admin members are permanently banned — this catches anyone who joined
+  while the guard was offline. `SWEEP_MINUTES=0` runs the sweep only at
+  startup.
+- Admins cannot be banned by another admin (Telegram restriction); those
+  attempts are ignored.
 - `.env` and `*.session` are gitignored — never commit them.
