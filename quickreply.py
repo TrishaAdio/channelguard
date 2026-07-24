@@ -59,6 +59,7 @@ import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -92,6 +93,7 @@ from telethon.tl import types as tl_types
 
 import config
 import ui
+from runtime_lock import ProcessLock
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -212,20 +214,9 @@ def _acquire_single_instance_lock(lock_path=None) -> bool:
     temp directory prevents another checkout from handling the same Telegram
     account and overwriting command results a moment later.
     """
-    try:
-        import fcntl
-    except ImportError:
-        return True  # non-POSIX platform: skip the guard rather than block
-
     lock_path = Path(lock_path or (config.PAY_FILE.parent / "quickreply.lock"))
-    handle = None
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(lock_path, "r+" if lock_path.exists() else "w+")
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, BlockingIOError):
-        if handle is not None:
-            handle.close()
+    lock = ProcessLock(lock_path)
+    if not lock.acquire():
         holder = ""
         try:
             with open(lock_path, encoding="utf-8") as existing:
@@ -236,14 +227,7 @@ def _acquire_single_instance_lock(lock_path=None) -> bool:
         ui.error(f"Another quickreply.py owns {lock_path}{detail}.")
         return False
 
-    _instance_locks.append(handle)
-    try:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"pid={os.getpid()} cwd={Path.cwd()}")
-        handle.flush()
-    except OSError:
-        pass
+    _instance_locks.append(lock)
     return True
 
 
@@ -539,7 +523,7 @@ async def _copy_to(peer, src):
 # --------------------------------------------------------------------------
 # Payment logger
 # --------------------------------------------------------------------------
-QUICKREPLY_BUILD = "payment-template-v3"
+QUICKREPLY_BUILD = "secure-payment-v4"
 
 
 def _configured_post_channel() -> int | None:
@@ -642,7 +626,11 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
             status = "quarantined"
         payment["status"] = status
         for key in (
-            "post_chat_id", "post_message_id", "cancel_command_message_id"
+            "post_chat_id",
+            "post_message_id",
+            "source_chat_id",
+            "source_message_id",
+            "cancel_command_message_id",
         ):
             if key in payment:
                 converted = _optional_int(payment.get(key))
@@ -1421,6 +1409,7 @@ def _required_payment_text(
     failures: list,
     *,
     include_current: bool,
+    expose_links: bool = True,
 ) -> str:
     """Plain complete metadata used when Telegram requires message overflow."""
     mapping = _pay_mapping(
@@ -1440,15 +1429,70 @@ def _required_payment_text(
     ]
     if entries:
         lines.append("")
-        lines.append("Links:")
-        lines.extend(
-            f"{index}. {entry.get('link', '')}"
-            for index, entry in enumerate(entries, 1)
-        )
+        if expose_links:
+            lines.append("Links:")
+            lines.extend(
+                f"{index}. {entry.get('link', '')}"
+                for index, entry in enumerate(entries, 1)
+            )
+        else:
+            lines.append(
+                f"Delivery: {len(entries)} buyer-bound link(s) sent privately"
+            )
+            titles = [
+                str(entry.get("title") or entry.get("keyword") or "group")
+                for entry in entries
+            ]
+            lines.append("Groups: " + ", ".join(titles))
     detail = _failure_detail(failures)
     if detail:
         lines.extend(("", f"Unavailable: {detail}"))
     return "\n".join(lines)
+
+
+def _channel_delivery_summary(entries: list) -> str:
+    """Describe successful delivery without exposing private invite URLs."""
+    if not entries:
+        return ""
+    titles = [
+        str(entry.get("title") or entry.get("keyword") or "group")
+        for entry in entries
+    ]
+    return (
+        f"Delivery: {len(entries)} buyer-bound link(s) sent privately\n"
+        f"Groups: {', '.join(titles)}"
+    )
+
+
+def _decorate_channel_output(text: str, entries: list) -> str:
+    summary = _channel_delivery_summary(entries)
+    if not summary:
+        return text
+    return (text.rstrip() + "\n\n" + summary).strip()
+
+
+_PRIVATE_INVITE_RE = re.compile(
+    r"https?://(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_channel_invites(text: str, entities):
+    """Remove visible/entity-only private invites from a channel template."""
+    matches = list(dict.fromkeys(_PRIVATE_INVITE_RE.findall(text or "")))
+    if matches:
+        text, entities = _substitute(
+            text,
+            entities,
+            {match: "[private link delivered in DM]" for match in matches},
+        )
+    safe_entities = []
+    for entity in entities or []:
+        target = str(getattr(entity, "url", "") or "")
+        if target and _PRIVATE_INVITE_RE.search(target):
+            continue
+        safe_entities.append(entity)
+    return text, safe_entities
 
 
 def _split_plain_text(
@@ -1457,6 +1501,27 @@ def _split_plain_text(
     """Split at line boundaries and repeat canonical metadata on later chunks."""
     chunks = []
     current = ""
+    continued_prefix = (header + "\n") if header else ""
+    available = max(1, limit - _u16(continued_prefix))
+
+    def split_units(value: str, max_units: int) -> list[str]:
+        pieces = []
+        piece = ""
+        piece_units = 0
+        for char in value:
+            char_units = 2 if ord(char) > 0xFFFF else 1
+            if piece_units + char_units > max_units:
+                if piece:
+                    pieces.append(piece)
+                piece = char
+                piece_units = char_units
+            else:
+                piece += char
+                piece_units += char_units
+        if piece or not pieces:
+            pieces.append(piece)
+        return pieces
+
     for line in (text or "").splitlines() or [""]:
         candidate = line if not current else current + "\n" + line
         if _u16(candidate) <= limit:
@@ -1464,11 +1529,10 @@ def _split_plain_text(
             continue
         if current:
             chunks.append(current)
-        if _u16(line) > limit:
-            # URLs and failure reasons are normally short. A corrupted/manual
-            # value must still be bounded rather than making every send fail.
-            line = line[:limit]
-        current = (header + "\n" + line) if header else line
+        pieces = split_units(line, available)
+        for piece in pieces[:-1]:
+            chunks.append(continued_prefix + piece)
+        current = continued_prefix + pieces[-1]
     if current:
         chunks.append(current)
     return chunks or [header or ""]
@@ -1505,7 +1569,7 @@ async def _deliver_payment_receipt(
         order_id,
         entries,
         failures,
-        include_current=False,
+        include_current=True,
     )
     chunks = _split_plain_text(
         fallback, header=f"Order ID: {order_id}"
@@ -1536,15 +1600,25 @@ async def _send_payment_overflow(
         order_id,
         entries,
         failures,
-        include_current=True,
+        include_current=False,
+        expose_links=False,
     )
-    chunks = _split_plain_text(overflow, header=f"Order ID: {order_id}")
+    overflow = _PRIVATE_INVITE_RE.sub(
+        "[private link delivered in DM]", overflow
+    )
+    chunks = _split_plain_text(overflow, limit=3800)
     marker = None
     try:
-        for chunk in chunks:
-            marker = _expect_automatic_outgoing(target_channel, [chunk])
+        for index, chunk in enumerate(chunks, 1):
+            label = (
+                f"Payment details {index}/{len(chunks)} — Order {order_id}"
+            )
+            if await _find_existing_channel_text(target_channel, label):
+                continue
+            payload = f"{label}\n{chunk}"
+            marker = _expect_automatic_outgoing(target_channel, [payload])
             sent = await client.send_message(
-                target_channel, chunk, link_preview=False
+                target_channel, payload, link_preview=False
             )
             _finish_automatic_outgoing(target_channel, marker, sent)
             marker = None
@@ -1553,6 +1627,250 @@ async def _send_payment_overflow(
             _cancel_automatic_outgoing(target_channel, marker)
         return f"{type(error).__name__}: {error}"
     return ""
+
+
+async def _find_existing_channel_text(
+    target_channel: int, marker: str
+) -> int | None:
+    iterator = getattr(client, "iter_messages", None)
+    if iterator is None:
+        return None
+    try:
+        async for message in iterator(
+            target_channel, search=marker, limit=50
+        ):
+            text = str(
+                getattr(message, "message", "")
+                or getattr(message, "raw_text", "")
+                or ""
+            )
+            if marker in text and getattr(message, "id", None):
+                return int(message.id)
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            "Payment overflow reconciliation failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    return None
+
+
+async def _find_existing_channel_post(
+    target_channel: int, order_id: str
+) -> int | None:
+    """Reconcile an ambiguous upload by locating its order-bearing media post."""
+    iterator = getattr(client, "iter_messages", None)
+    if iterator is None:
+        return None
+    try:
+        async for message in iterator(
+            target_channel, search=order_id, limit=50
+        ):
+            text = str(
+                getattr(message, "message", "")
+                or getattr(message, "raw_text", "")
+                or ""
+            )
+            if (
+                order_id.casefold() in text.casefold()
+                and getattr(message, "media", None) is not None
+                and getattr(message, "id", None)
+            ):
+                return int(message.id)
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            "Payment-channel reconciliation failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    return None
+
+
+def _post_retry_delay(attempts: int) -> float:
+    return float(min(300, max(5, 5 * (2 ** min(max(attempts - 1, 0), 6)))))
+
+
+async def _post_payment_to_channel(
+    payment: dict,
+    *,
+    source_message=None,
+    notify_failure: bool = True,
+) -> bool:
+    """Post or reconcile one committed payment without leaking invite links."""
+    if payment.get("status") != "valid":
+        return False
+    if payment.get("post_status") == "posted" and payment.get("post_message_id"):
+        return True
+
+    target = _optional_int(
+        payment.get("post_chat_id") or _pay.get("post_channel")
+    )
+    if target is None:
+        payment["post_status"] = "not_configured"
+        payment["post_error"] = "PAYMENT_CHANNEL is not configured"
+        payment["next_post_retry"] = _now_ts() + 60
+        _save_pay()
+        if notify_failure and not payment.get("post_failure_notified"):
+            payment["post_failure_notified"] = True
+            _save_pay()
+            await _notify_owner(
+                f"Payment {payment.get('order_id', '')} was recorded, but "
+                "PAYMENT_CHANNEL is not set. Run .setchannel in the target "
+                "channel; delivery will retry automatically."
+            )
+        return False
+
+    payment["post_chat_id"] = int(target)
+    order_id = str(payment.get("order_id") or "")
+
+    # A send may have reached Telegram just before the process lost its reply.
+    # Search first so retries converge on the accepted media post.
+    if payment.get("post_status") in {"posting", "untracked", "failed"}:
+        existing_id = await _find_existing_channel_post(target, order_id)
+        if existing_id:
+            payment["post_message_id"] = existing_id
+            payment["post_status"] = "posted"
+            payment.pop("post_error", None)
+            payment.pop("next_post_retry", None)
+            _save_pay()
+            return True
+
+    if source_message is None:
+        source_chat_id = _optional_int(payment.get("source_chat_id"))
+        source_message_id = _optional_int(payment.get("source_message_id"))
+        if source_chat_id is not None and source_message_id is not None:
+            try:
+                source_message = await client.get_messages(
+                    source_chat_id, ids=source_message_id
+                )
+            except Exception as error:  # noqa: BLE001
+                payment["post_error"] = (
+                    f"source fetch failed: {type(error).__name__}: {error}"
+                )
+
+    if source_message is None or not getattr(source_message, "media", None):
+        attempts = int(payment.get("post_attempts") or 0)
+        payment["post_attempts"] = attempts + 1
+        payment["post_status"] = "failed"
+        payment.setdefault("post_error", "source payment image is unavailable")
+        payment["next_post_retry"] = (
+            _now_ts() + _post_retry_delay(payment["post_attempts"])
+        )
+        _save_pay()
+        if notify_failure and not payment.get("post_failure_notified"):
+            payment["post_failure_notified"] = True
+            _save_pay()
+            await _notify_owner(
+                f"Payment-channel delivery failed for {order_id}: "
+                f"{payment['post_error']}. It remains queued for retry."
+            )
+        return False
+
+    amount = parse_amount(payment["amount"])
+    name = str(payment.get("name") or "")
+    entries = [
+        entry
+        for entry in (payment.get("reservation_entries") or [])
+        if isinstance(entry, dict)
+    ]
+    failures = [
+        failure
+        for failure in (payment.get("reservation_failures") or [])
+        if isinstance(failure, dict)
+    ]
+    text, entities = await _safe_payment_output(
+        "channel",
+        amount,
+        name,
+        order_id,
+        [],
+        failures,
+        include_current=False,
+    )
+    text = _decorate_channel_output(text, entries)
+    text, entities = _sanitize_channel_invites(text, entities)
+    text, entities, truncated = _fit_media_caption(
+        text, entities, preserve=(order_id, fmt_inr(amount))
+    )
+
+    payment["channel_caption_truncated"] = bool(truncated)
+    payment["post_status"] = "posting"
+    payment["post_attempts"] = int(payment.get("post_attempts") or 0) + 1
+    payment.pop("next_post_retry", None)
+    # Persist the intent before the network call. If this write fails, do not
+    # upload an untracked post.
+    _save_pay()
+
+    marker = _expect_automatic_outgoing(target, [text])
+    post_result = None
+    last_error = None
+    for attempt in _entity_fallbacks(entities):
+        try:
+            post_result = await client.send_file(
+                target,
+                file=source_message.media,
+                caption=text,
+                formatting_entities=attempt or None,
+            )
+            break
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            if not _is_entity_error(error):
+                break
+
+    if post_result is None:
+        _cancel_automatic_outgoing(target, marker)
+        existing_id = await _find_existing_channel_post(target, order_id)
+        if existing_id:
+            payment["post_message_id"] = existing_id
+            payment["post_status"] = "posted"
+            payment.pop("post_error", None)
+            payment.pop("next_post_retry", None)
+            _save_pay()
+            return True
+        payment["post_status"] = "failed"
+        payment["post_error"] = f"{type(last_error).__name__}: {last_error}"
+        payment["next_post_retry"] = (
+            _now_ts() + _post_retry_delay(payment["post_attempts"])
+        )
+        _save_pay()
+        ui.warn(f"Payment channel post failed: {payment['post_error']}")
+        if notify_failure and not payment.get("post_failure_notified"):
+            payment["post_failure_notified"] = True
+            _save_pay()
+            await _notify_owner(
+                f"Payment-channel delivery failed for {order_id}: "
+                f"{payment['post_error']}. It remains queued for retry."
+            )
+        return False
+
+    _finish_automatic_outgoing(target, marker, post_result)
+    post_ids = sorted(_sent_message_ids(post_result))
+    payment["post_message_id"] = post_ids[0] if post_ids else None
+    payment["post_status"] = "posted" if post_ids else "untracked"
+    payment.pop("post_failure_notified", None)
+    if post_ids:
+        payment.pop("post_error", None)
+        payment.pop("next_post_retry", None)
+    else:
+        payment["post_error"] = "Telegram returned no posted message ID"
+        payment["next_post_retry"] = (
+            _now_ts() + _post_retry_delay(payment["post_attempts"])
+        )
+    _save_pay()
+
+    if truncated and payment.get("overflow_status") != "posted":
+        payment["overflow_status"] = "posting"
+        _save_pay()
+        overflow_error = await _send_payment_overflow(
+            target, amount, name, order_id, entries, failures
+        )
+        payment["overflow_status"] = "failed" if overflow_error else "posted"
+        if overflow_error:
+            payment["overflow_error"] = overflow_error
+            ui.warn("Payment metadata overflow post failed: " + overflow_error)
+        else:
+            payment.pop("overflow_error", None)
+        _save_pay()
+    return bool(post_ids)
 
 
 def _entity_fallbacks(ents):
@@ -1678,16 +1996,32 @@ async def _cancel_reserved_links(request_id: str) -> bool:
 async def _fail_payment(event, payment: dict, request_id: str, message: str) -> None:
     payment["status"] = "failed"
     payment["error"] = message[:500]
-    _save_pay()
-    await _cancel_reserved_links(request_id)
+    save_error = None
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        save_error = error
+    cleanup = await _cancel_reserved_links(request_id)
+    payment["reservation_cleanup"] = "queued" if cleanup else "retry_needed"
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        save_error = save_error or error
+    if save_error is not None:
+        message += (
+            "\nPayment state could not be saved; access cleanup was still "
+            f"attempted ({type(save_error).__name__})."
+        )
     await _ack(event, message)
 
 
-async def _recover_pending_payments() -> None:
-    """Fail closed after interrupted adds and resume cancellation cleanup."""
+async def _recover_pending_payments(
+    *, recover_interrupted_adds: bool = True
+) -> None:
+    """Recover interrupted adds and retry durable cleanup/channel delivery."""
     changed = False
     for payment in _pay.get("payments", []):
-        if payment.get("status") == "pending":
+        if recover_interrupted_adds and payment.get("status") == "pending":
             payment["status"] = "failed"
             payment["error"] = "interrupted before receipt completion"
             await _cancel_reserved_links(
@@ -1703,6 +2037,29 @@ async def _recover_pending_payments() -> None:
                 payment["reservation_cleanup"] = state
                 changed = True
         if (
+            payment.get("status") == "valid"
+            and payment.get("source_message_id")
+            and payment.get("post_status")
+            in {
+                "queued",
+                "posting",
+                "failed",
+                "untracked",
+                "not_configured",
+                None,
+            }
+            and float(payment.get("next_post_retry") or 0) <= _now_ts()
+        ):
+            try:
+                await _post_payment_to_channel(
+                    payment, notify_failure=False
+                )
+            except Exception as error:  # noqa: BLE001
+                payment["post_status"] = "failed"
+                payment["post_error"] = f"{type(error).__name__}: {error}"
+                payment["next_post_retry"] = _now_ts() + 30
+                changed = True
+        if (
             payment.get("overflow_status") in {"posting", "failed"}
             and payment.get("post_chat_id")
             and payment.get("order_id")
@@ -1714,8 +2071,20 @@ async def _recover_pending_payments() -> None:
                     amount,
                     str(payment.get("name") or ""),
                     str(payment["order_id"]),
-                    list(payment.get("reservation_entries") or []),
-                    list(payment.get("reservation_failures") or []),
+                    [
+                        entry
+                        for entry in (
+                            payment.get("reservation_entries") or []
+                        )
+                        if isinstance(entry, dict)
+                    ],
+                    [
+                        failure
+                        for failure in (
+                            payment.get("reservation_failures") or []
+                        )
+                        if isinstance(failure, dict)
+                    ],
                 )
             except Exception as error:  # noqa: BLE001
                 overflow_error = f"{type(error).__name__}: {error}"
@@ -1732,6 +2101,21 @@ async def _recover_pending_payments() -> None:
         ui.warn(
             "Recovered interrupted payment/cancellation/channel-delivery state."
         )
+
+
+async def _payment_recovery_loop() -> None:
+    while True:
+        try:
+            async with _payment_lock:
+                await _recover_pending_payments(
+                    recover_interrupted_adds=False
+                )
+        except Exception as error:  # noqa: BLE001
+            ui.warn(
+                "Payment recovery loop failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        await asyncio.sleep(20)
 
 
 async def cmd_add(event) -> None:
@@ -1837,26 +2221,15 @@ async def cmd_add(event) -> None:
                           "or reply to an image to just log a payment.")
         return
 
-    channel_caption_truncated = False
     us_text, us_ents = await _safe_payment_output(
-        "done", amount, accname, order_id, entries, failures
+        "done",
+        amount,
+        accname,
+        order_id,
+        entries,
+        failures,
+        include_current=True,
     )
-    ch_text = ch_ents = None
-    if has_media and _pay.get("post_channel"):
-        ch_text, ch_ents = await _safe_payment_output(
-            "channel",
-            amount,
-            accname,
-            order_id,
-            entries,
-            failures,
-            include_current=True,
-        )
-        ch_text, ch_ents, channel_caption_truncated = _fit_media_caption(
-            ch_text,
-            ch_ents,
-            preserve=(order_id, fmt_inr(amount)),
-        )
 
     payment = {
         "amount": format(amount, "f"),
@@ -1867,11 +2240,16 @@ async def cmd_add(event) -> None:
         "ts": _now_ts(),
         "status": "pending",
     }
-    if channel_caption_truncated:
-        payment["channel_caption_truncated"] = True
-        ui.warn(
-            f"Payment channel caption exceeded Telegram's 1024-unit limit; "
-            f"trimmed it while preserving order id {order_id}."
+    if has_media:
+        payment["source_chat_id"] = int(
+            getattr(reply, "chat_id", None) or event.chat_id
+        )
+        source_id = getattr(reply, "id", None)
+        if source_id is not None:
+            payment["source_message_id"] = int(source_id)
+        payment["post_chat_id"] = _optional_int(_pay.get("post_channel"))
+        payment["post_status"] = (
+            "queued" if payment["post_chat_id"] is not None else "not_configured"
         )
     if entries:
         payment.update({
@@ -1889,7 +2267,18 @@ async def cmd_add(event) -> None:
         if failures:
             payment["reservation_failures"] = failures
     _pay.setdefault("payments", []).append(payment)
-    _save_pay()
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        _pay["payments"].remove(payment)
+        await _cancel_reserved_links(request_id)
+        await _ack(
+            event,
+            "Payment was not recorded because its state could not be saved. "
+            "Reserved links were cancelled. "
+            f"({type(error).__name__}: {error})",
+        )
+        return
 
     # 2) Deliver the private receipt first. This is the authoritative commit:
     # startup recovery only compensates records that never reached this point.
@@ -1911,68 +2300,32 @@ async def cmd_add(event) -> None:
 
     payment["status"] = "valid"
     payment.pop("error", None)
-    _save_pay()
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        await _fail_payment(
+            event,
+            payment,
+            request_id,
+            "The receipt was delivered, but durable payment commit failed. "
+            f"Reserved access was cancelled ({type(error).__name__}: {error}).",
+        )
+        return
 
     # 3) Channel posting is secondary. The valid receipt is persisted first, so
     # a crash after Telegram accepts this upload never invalidates its links.
-    if has_media and _pay.get("post_channel"):
-        target_channel = int(_pay["post_channel"])
-        payment["post_chat_id"] = target_channel
-        payment["post_message_id"] = None
-        payment["post_status"] = "posting"
-        _save_pay()
-
-        marker = _expect_automatic_outgoing(target_channel, [ch_text])
-        post_result = None
-        last_err = None
-        for attempt in _entity_fallbacks(ch_ents):
-            try:
-                post_result = await client.send_file(
-                    target_channel, file=reply.media, caption=ch_text,
-                    formatting_entities=attempt or None,
-                )
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                if not _is_entity_error(e):
-                    break
-        if post_result is None:
-            _cancel_automatic_outgoing(target_channel, marker)
-            payment["post_status"] = "failed"
-            payment["post_error"] = f"{type(last_err).__name__}: {last_err}"
-            _save_pay()
-            ui.warn(f"Payment channel post failed: {payment['post_error']}")
-        else:
-            _finish_automatic_outgoing(target_channel, marker, post_result)
-            post_ids = sorted(_sent_message_ids(post_result))
-            payment["post_message_id"] = post_ids[0] if post_ids else None
-            payment["post_status"] = "posted" if post_ids else "untracked"
-            if not post_ids:
-                payment["post_error"] = "Telegram returned no posted message ID"
-            _save_pay()
-
-            if channel_caption_truncated:
-                payment["overflow_status"] = "posting"
-                _save_pay()
-                overflow_error = await _send_payment_overflow(
-                    target_channel,
-                    amount,
-                    accname,
-                    order_id,
-                    entries,
-                    failures,
-                )
-                if overflow_error:
-                    payment["overflow_status"] = "failed"
-                    payment["overflow_error"] = overflow_error
-                    ui.warn(
-                        "Payment metadata overflow post failed: "
-                        + payment["overflow_error"]
-                    )
-                else:
-                    payment["overflow_status"] = "posted"
-                    payment.pop("overflow_error", None)
-                _save_pay()
+    if has_media:
+        try:
+            await _post_payment_to_channel(payment, source_message=reply)
+        except Exception as error:  # noqa: BLE001
+            ui.warn(
+                "Payment was committed, but channel delivery state failed: "
+                f"{type(error).__name__}: {error}"
+            )
+            await _notify_owner(
+                f"Payment {order_id} is committed, but payment-channel "
+                f"delivery needs attention: {type(error).__name__}: {error}"
+            )
 
     count = len(_todays_payments())
     print(ui.green("[pay] ")
@@ -2048,7 +2401,11 @@ async def cmd_cancel(event) -> None:
         payment["reservation_cleanup"] = (
             "queued" if cleanup else "retry_needed"
         )
-        _save_pay()
+        save_error = ""
+        try:
+            _save_pay()
+        except Exception as error:  # noqa: BLE001
+            save_error = f" State save failed: {type(error).__name__}: {error}."
         await _ack(
             event,
             "Payment is already marked fake. "
@@ -2056,7 +2413,8 @@ async def cmd_cancel(event) -> None:
                 "Access-link cleanup is queued."
                 if cleanup
                 else "Access-link cleanup still needs a retry."
-            ),
+            )
+            + save_error,
         )
         return
 
@@ -2066,7 +2424,11 @@ async def cmd_cancel(event) -> None:
     payment["status"] = "cancel_pending"
     payment["cancel_command_message_id"] = int(event.id)
     payment["reservation_cleanup"] = "pending"
-    _save_pay()
+    transition_save_error = None
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        transition_save_error = error
 
     # Revoke buyer-bound access as soon as /cancel is accepted. Caption edits
     # can be retried, but a fake payment must never retain a usable invite.
@@ -2076,7 +2438,11 @@ async def cmd_cancel(event) -> None:
     payment["reservation_cleanup"] = (
         "queued" if cleanup else "retry_needed"
     )
-    _save_pay()
+    try:
+        _save_pay()
+        transition_save_error = None
+    except Exception as error:  # noqa: BLE001
+        transition_save_error = transition_save_error or error
 
     peer = await event.get_input_chat()
     edit_succeeded = False
@@ -2109,7 +2475,13 @@ async def cmd_cancel(event) -> None:
             # The access cancellation has already been committed. Keep the
             # payment excluded and make the visual marker explicitly retryable.
             payment["cancel_error"] = f"{type(e).__name__}: {e}"
-            _save_pay()
+            try:
+                _save_pay()
+            except Exception as save_error:  # noqa: BLE001
+                ui.warn(
+                    "Cancellation error state could not be saved: "
+                    f"{type(save_error).__name__}: {save_error}"
+                )
             await _ack(
                 event,
                 "Access cancellation is queued, but the channel marker failed: "
@@ -2121,7 +2493,13 @@ async def cmd_cancel(event) -> None:
             # Keep this record excluded from stats until /cancel is retried and
             # the post can be reconciled; restoring it could count a visible fake.
             payment["cancel_error"] = f"{type(e).__name__}: {e}"
-            _save_pay()
+            try:
+                _save_pay()
+            except Exception as save_error:  # noqa: BLE001
+                ui.warn(
+                    "Unverified cancellation state could not be saved: "
+                    f"{type(save_error).__name__}: {save_error}"
+                )
             await _ack(
                 event,
                 "Cancellation could not be verified. Payment is excluded from "
@@ -2135,17 +2513,31 @@ async def cmd_cancel(event) -> None:
         payment.pop("cancel_previous_status", None)
         payment.pop("cancel_error", None)
         payment.pop("error", None)
-        _save_pay()
+        try:
+            _save_pay()
+            transition_save_error = None
+        except Exception as error:  # noqa: BLE001
+            transition_save_error = transition_save_error or error
 
     day = _todays_payments()
     total = _payment_total(day)
-    try:
-        await event.delete()
-    except Exception:  # noqa: BLE001
+    if transition_save_error is not None:
         await _ack(
             event,
-            f"Payment marked fake. Today: {fmt_inr(total)} / {len(day)} payment(s)."
+            "Access cancellation/marker was attempted, but payment state "
+            f"could not be saved: {type(transition_save_error).__name__}: "
+            f"{transition_save_error}. Do not restart until storage is fixed "
+            "and /cancel is retried."
         )
+    else:
+        try:
+            await event.delete()
+        except Exception:  # noqa: BLE001
+            await _ack(
+                event,
+                f"Payment marked fake. Today: {fmt_inr(total)} / "
+                f"{len(day)} payment(s)."
+            )
     print(
         ui.yellow("[pay fake] ")
         + f"{fmt_inr(payment['amount'])} {payment.get('name', '')} -> "
@@ -2232,6 +2624,12 @@ async def cmd_setchannel(event) -> None:
         ui.warn(f"Couldn't persist PAYMENT_CHANNEL in .env: {error}")
     suffix = "" if persisted else " (saved for this data folder only)"
     await _ack(event, f"Post channel set here: {title} ({chat_id}){suffix}")
+    for payment in _pay.get("payments", []):
+        if payment.get("post_status") == "not_configured":
+            payment["post_chat_id"] = int(chat_id)
+            payment["next_post_retry"] = 0
+    _save_pay()
+    await _recover_pending_payments(recover_interrupted_adds=False)
 
 
 async def cmd_stats(event) -> None:
@@ -2275,17 +2673,48 @@ async def _find_groups(query: str) -> list[tuple[object, str]]:
     carry stale or empty admin_rights, which was silently dropping the exact
     group the account admins. Whether a link can actually be made is decided by
     TRYING (_export_invite) — the only reliable signal."""
-    q = _fold_fonts(query).casefold()
-    matches: list[tuple[object, str]] = []
+    q = "".join(
+        char for char in _fold_fonts(query).casefold() if char.isalnum()
+    )
+    ranked: list[tuple[float, object, str]] = []
     async for dialog in client.iter_dialogs():
         if not (getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False)):
             continue
         name = dialog.name or ""
         uname = getattr(dialog.entity, "username", "") or ""
-        if q and q not in _fold_fonts(name).casefold() and q not in uname.casefold():
+        if not q:
+            ranked.append((1.0, dialog.entity, name))
             continue
-        matches.append((dialog.entity, name))
-    return matches
+        values = [
+            "".join(
+                char
+                for char in _fold_fonts(value).casefold()
+                if char.isalnum()
+            )
+            for value in (name, uname)
+            if value
+        ]
+        if q in values:
+            score = 1.0
+        elif any(q in value or value in q for value in values):
+            score = 0.94
+        elif len(q) > 2:
+            score = max(
+                (
+                    SequenceMatcher(None, q, value, autojunk=False).ratio()
+                    for value in values
+                ),
+                default=0.0,
+            )
+        else:
+            score = 0.0
+        threshold = 0.82 if len(q) == 3 else 0.74 if len(q) <= 5 else 0.70
+        if score >= threshold:
+            ranked.append((score, dialog.entity, name))
+    ranked.sort(key=lambda item: (-item[0], item[2].casefold()))
+    if q and len(ranked) > 1 and ranked[0][0] - ranked[1][0] >= 0.08:
+        ranked = ranked[:1]
+    return [(entity, name) for _score, entity, name in ranked]
 
 
 async def cmd_group_link(event) -> None:
@@ -2450,7 +2879,7 @@ HELP_TEXT = (
     "<code>.ping</code> - verify the quick-reply userbot is running\n"
     "<code>/add &lt;amount&gt; &lt;name&gt; &lt;kw...&gt;</code> - in the payer's DM: the BOT reserves a link per keyword (or <code>all</code>) for that user; links go where {link} is, numbered/bold/blockquoted\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
-    "<code>/setchannelpostofpayment &lt;template&gt;</code> - caption for the channel post\n"
+    "<code>/setchannelpostofpayment &lt;template&gt;</code> - safe caption for the channel post (private invite URLs are never copied there)\n"
     "<code>.setchannel</code> - type it in a channel to post media there\n"
     "<code>/stats</code> - today's total, count, and split\n"
     "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake, remove it from stats, and revoke buyer-bound access\n"
@@ -2458,7 +2887,7 @@ HELP_TEXT = (
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
-    "<code>{link}</code> current invite link - "
+    "<code>{link}</code> buyer-bound invite link(s), private receipt only - "
     "<code>{rioshare}</code> Rio's share - <code>{marco}</code> Marco's share - "
     "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today\n"
     "<blockquote>Reply to a formatted post with /setdone or "
@@ -3066,7 +3495,7 @@ async def main() -> None:
             "first, e.g.  pkill -f quickreply.py  (check screen/tmux/systemd "
             "too). Two copies make commands randomly show 'saved' then 'failed'."
         )
-        return
+        raise SystemExit(1)
 
     client = TelegramClient(config.QR_SESSION, config.API_ID, config.API_HASH)
     await client.start()  # prompts phone + OTP for THIS account on first run
@@ -3077,7 +3506,7 @@ async def main() -> None:
             "account. Stop every stale quickreply.py process, then start one copy."
         )
         await client.disconnect()
-        return
+        raise SystemExit(1)
     _state["self_id"] = me.id
 
     global _greeted, _pay
@@ -3131,7 +3560,14 @@ async def main() -> None:
         ui.warn("Bot link bridge: NOT loaded — run this from the repo root so "
                 "'import linkstore' works, or /add <keyword> can't reach the bot.")
     print(ui.dim("Ctrl+C to stop."))
-    await client.run_until_disconnected()
+    recovery_task = asyncio.create_task(
+        _payment_recovery_loop(), name="payment-channel-recovery"
+    )
+    try:
+        await client.run_until_disconnected()
+    finally:
+        recovery_task.cancel()
+        await asyncio.gather(recovery_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

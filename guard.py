@@ -1,11 +1,10 @@
 """Channel guard userbot.
 
 Every ROTATE_MINUTES it revokes the channel's primary invite link, issues a
-fresh one, and DMs it to the owner. Anyone who joins the channel is immediately
-kicked AND unbanned (removed but free to rejoin — never a lasting ban); the
-owner and admins are exempt. On startup it clears every existing ban and runs a
-security sweep (kick all non-admin members), then re-sweeps every SWEEP_MINUTES
-to catch anyone the live handler missed.
+fresh one, and DMs it to the owner. Anyone who joins the channel directly is
+permanently banned; the owner and admins are exempt. On startup it preserves
+existing bans and runs a security sweep (ban all non-admin members), then
+re-sweeps every SWEEP_MINUTES to catch anyone the live handler missed.
 
 The logged-in account must be an ADMIN of the channel with "Invite users via
 link" and "Ban users" rights.
@@ -15,17 +14,17 @@ Run:  python guard.py    (Ctrl+C to stop)
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
-from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsRequest
+from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import (
     ChannelParticipantAdmin,
     ChannelParticipantBanned,
     ChannelParticipantCreator,
     ChannelParticipantLeft,
-    ChannelParticipantsKicked,
     ChatBannedRights,
     UpdateChannelParticipant,
 )
@@ -33,15 +32,29 @@ from telethon.tl.types import (
 import config
 import linkstore
 import ui
+from runtime_lock import ProcessLock, host_lock_path
 
-# Remove-from-channel rights (ban), and cleared rights (unban).
+# Permanent remove-from-channel rights.
 _KICK_RIGHTS = ChatBannedRights(until_date=None, view_messages=True)
-_UNBAN_RIGHTS = ChatBannedRights(until_date=None)
 
 client: TelegramClient | None = None
 _state = {"self_id": 0, "channel": None, "channel_id": 0, "owner": None, "owner_id": 0}
 _kicks_in_flight: set[int] = set()
 _background_tasks: set[asyncio.Task] = set()
+_instance_locks: list[ProcessLock] = []
+
+
+def _acquire_guard_lock(path: Path) -> bool:
+    lock = ProcessLock(path)
+    if not lock.acquire():
+        return False
+    _instance_locks.append(lock)
+    return True
+
+
+def _close_guard_locks() -> None:
+    while _instance_locks:
+        _instance_locks.pop().close()
 
 
 async def notify(text: str) -> None:
@@ -92,18 +105,16 @@ async def _resolve_user(user):
 
 
 async def kick(user, announce: bool = True) -> bool:
-    """Remove the user via kick_participant (ban+unban, no lasting ban). Returns
-    True if removed. `user` may be an entity (preferred) or a raw id."""
+    """Permanently ban a direct joiner. Returns True when Telegram accepted it."""
     uid = user if isinstance(user, int) else getattr(user, "id", user)
     if uid in (_state["self_id"], _state["owner_id"]):
         return False
     try:
         target = await _resolve_user(user)
-        # kick_participant bans then immediately unbans -> removed, not banned.
-        await client.kick_participant(_state["channel"], target)
-        print(ui.yellow("[kick] ") + f"removed {uid}")
+        await client(EditBannedRequest(_state["channel"], target, _KICK_RIGHTS))
+        print(ui.yellow("[ban] ") + f"permanently banned {uid}")
         if announce:
-            await notify(f"Kicked <code>{uid}</code>")
+            await notify(f"Permanently banned <code>{uid}</code>")
         return True
     except Exception as e:  # noqa: BLE001 - e.g. admins can't be kicked
         print(ui.red("[kick] ") + f"{uid} failed: {type(e).__name__}: {e}")
@@ -134,8 +145,7 @@ async def _set_banned(user, rights) -> bool:
 
 
 async def sweep_members() -> int:
-    """Security sweep in two phases: BAN every non-admin member first (that is
-    what actually removes them), THEN unban them all so nobody is left banned."""
+    """Permanently ban every non-admin member found by the security sweep."""
     channel = _state["channel"]
     before = await _member_count()
 
@@ -152,20 +162,13 @@ async def sweep_members() -> int:
     except Exception as e:  # noqa: BLE001
         print(ui.red("[sweep] ") + f"list failed: {type(e).__name__}: {e}")
 
-    # Phase 1 — ban everyone (removes them from the channel).
+    # Ban everyone (removes them and prevents the same account rejoining).
     banned = []
     for user in targets:
         if await _set_banned(user, _KICK_RIGHTS):
             banned.append(user)
             print(ui.yellow("[ban] ") + f"removed {user.id}")
             await asyncio.sleep(0.2)
-
-    # Phase 2 — unban them all (kick, not a lasting ban).
-    for user in banned:
-        await _set_banned(user, _UNBAN_RIGHTS)
-        await asyncio.sleep(0.2)
-    if banned:
-        print(ui.green("[unban] ") + f"cleared {len(banned)} ban(s)")
 
     after = await _member_count()
     if before is not None and after is not None:
@@ -189,39 +192,6 @@ async def sweep_loop() -> None:
                 await notify(f"Security sweep removed <b>{n}</b> member(s).")
         except Exception as error:  # noqa: BLE001
             ui.error(f"security sweep failed: {type(error).__name__}: {error}")
-
-
-async def unban_all() -> int:
-    """Clear every existing ban in the channel (so nobody stays banned)."""
-    channel = _state["channel"]
-    cleared = 0
-    while True:
-        try:
-            # Always read the first page because successful unbans remove rows
-            # from this filtered list and shift every later page toward zero.
-            res = await client(GetParticipantsRequest(
-                channel, ChannelParticipantsKicked(q=""), 0, 100, hash=0,
-            ))
-        except Exception as e:  # noqa: BLE001
-            print(ui.red("[unban] ") + f"list failed: {type(e).__name__}")
-            break
-        if not res.participants:
-            break
-        page_cleared = 0
-        for p in res.participants:
-            peer = getattr(p, "peer", None)
-            if peer is None:
-                continue
-            try:
-                await client(EditBannedRequest(channel, peer, _UNBAN_RIGHTS))
-                cleared += 1
-                page_cleared += 1
-                await asyncio.sleep(0.2)
-            except Exception:
-                pass
-        if page_cleared == 0:
-            break
-    return cleared
 
 
 def _can_ban(channel) -> bool:
@@ -291,11 +261,26 @@ async def on_chat_action(event):
 async def main() -> None:
     global client
     config.require("API_ID", "API_HASH")
+    session_lock = host_lock_path(
+        "guard-session", str(Path(config.SESSION).resolve())
+    )
+    if not _acquire_guard_lock(session_lock):
+        ui.error(f"Another guard.py owns the session lock {session_lock}.")
+        raise SystemExit(1)
 
     client = TelegramClient(config.SESSION, config.API_ID, config.API_HASH)
     await client.start()  # prompts phone + OTP on first run
 
     me = await client.get_me()
+    account_lock = host_lock_path("guard-account", str(me.id))
+    if not _acquire_guard_lock(account_lock):
+        ui.error(
+            "Another checkout is already running guard.py for this Telegram "
+            "account."
+        )
+        await client.disconnect()
+        _close_guard_locks()
+        raise SystemExit(1)
     _state["self_id"] = me.id
 
     from resolve import choose_channel, resolve_channel
@@ -335,14 +320,10 @@ async def main() -> None:
         ui.info("Use a @username, or make sure the account has a chat with the "
                 "userbot (or is in the channel).")
         await client.disconnect()
+        _close_guard_locks()
         return
     _state["owner"] = owner
     _state["owner_id"] = owner.id
-
-    # --- clear any existing bans up front -----------------------------------
-    cleared = await unban_all()
-    if cleared:
-        ui.success(f"Unbanned {cleared} previously-banned user(s).")
 
     # --- startup security sweep (catch offline joins) -----------------------
     swept = await sweep_members()
@@ -366,7 +347,7 @@ async def main() -> None:
     ui.success(f"Guarding: {ui.bold(str(title))}")
     ui.info(f"Owner: {getattr(owner, 'first_name', owner.id)} (id {owner.id})")
     ui.info(f"Rotating invite link every {ui.bold(f'{config.ROTATE_MINUTES:g}')} min; "
-            f"{sweep_note}joiners are kicked + unbanned (no lasting ban). "
+            f"{sweep_note}unauthorized joiners are permanently banned. "
             + ui.dim("Ctrl+C to stop."))
     try:
         await client.run_until_disconnected()
@@ -375,6 +356,7 @@ async def main() -> None:
             task.cancel()
         if _background_tasks:
             await asyncio.gather(*_background_tasks, return_exceptions=True)
+        _close_guard_locks()
 
 
 if __name__ == "__main__":

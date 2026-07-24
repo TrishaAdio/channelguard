@@ -7,6 +7,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from typing import Iterable, Mapping
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
@@ -64,6 +65,51 @@ def unique_short_code(title: str, taken: Iterable[str]) -> str:
     while f"{base}{n}".lower() in lowered:
         n += 1
     return f"{base}{n}"
+
+
+def normalized_group_key(text: str) -> str:
+    """A font/case/punctuation-insensitive key used by group lookup."""
+    return "".join(
+        char
+        for char in fold_fonts(text or "").casefold()
+        if char.isalnum()
+    )
+
+
+def group_match_score(query: str, group: Mapping) -> float:
+    """Score one group name/code safely, including small typing mistakes."""
+    wanted = normalized_group_key(query)
+    if not wanted:
+        return 0.0
+    values = [
+        normalized_group_key(group[key] or "")
+        for key in ("short_code", "title", "username")
+    ]
+    values = [value for value in values if value]
+    if wanted in values:
+        return 1.0
+    if any(wanted in value or value in wanted for value in values):
+        return 0.94
+    if len(wanted) <= 2:
+        return 0.0
+    return max(
+        (
+            SequenceMatcher(None, wanted, value, autojunk=False).ratio()
+            for value in values
+        ),
+        default=0.0,
+    )
+
+
+def fuzzy_group_threshold(query: str) -> float:
+    length = len(normalized_group_key(query))
+    if length <= 2:
+        return 1.0
+    if length == 3:
+        return 0.82
+    if length <= 5:
+        return 0.74
+    return 0.70
 
 
 # Tokens the owner can use inside a template body.
