@@ -202,6 +202,57 @@ async def ban_buyer(chat_id: int, user_id: Optional[int]) -> bool:
         return False
 
 
+async def unban_member(chat_id: int, user_id: int) -> bool:
+    """Lift a ban so the user can be invited again."""
+    if not user_id:
+        return True
+    try:
+        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        return True
+    except Exception as error:  # noqa: BLE001
+        log.warning("unban failed for %s in %s: %s", user_id, chat_id, error)
+        return False
+
+
+async def _drain_unban_journal() -> None:
+    """Apply the userbot's `.unban` requests to this bot's groups and journal.
+
+    The userbot already lifted the ban with its own admin account. This side
+    exists so the durable ban records stop being enforced — otherwise the retry
+    loops below would simply ban the user again on the next pass.
+    """
+    if linkstore is None:
+        return
+    for item in linkstore.pending_unbans():
+        user_id = int(item.get("user_id") or 0)
+        if not user_id:
+            continue
+        failures = []
+        for group in await db.all_groups(admin_only=True):
+            if not await unban_member(group["chat_id"], user_id):
+                failures.append(str(group["title"] or group["chat_id"]))
+        cancelled = await db.cancel_member_bans(user_id)
+        released = await db.release_order_link_bans(user_id)
+        linkstore.complete_unban(user_id)
+        await db.log_event(
+            "member_unban",
+            user_id=user_id,
+            detail=f"cancelled={cancelled} released={released}",
+        )
+        if cancelled or released or failures:
+            detail = (
+                f"<b>Unbanned</b> <code>{user_id}</code>\n"
+                f"<blockquote>Ban records cleared: {cancelled}\n"
+                f"Order links released: {released}</blockquote>"
+            )
+            if failures:
+                detail += (
+                    "\n<blockquote>Still banned in: "
+                    f"{esc(', '.join(failures[:10]))}</blockquote>"
+                )
+            await tell_owner(detail)
+
+
 async def _queue_permanent_ban(
     chat_id: int, user_id: int, reason: str
 ) -> bool:
@@ -1035,7 +1086,10 @@ async def _deliver_direct_order_channel(
     order = await db.get_order(order_id)
     if order is None or order["channel_sent"]:
         return bool(order and order["channel_sent"])
-    if not config.PAYMENT_CHANNEL:
+    # Read fresh: `.setchannel` on the userbot may have moved the target since
+    # this process started, and queued summaries must follow it.
+    target = config.payment_channel()
+    if not target:
         await db.set_order_channel_delivery(
             order_id, False, "PAYMENT_CHANNEL is not configured"
         )
@@ -1050,7 +1104,7 @@ async def _deliver_direct_order_channel(
         blocks = channel_html.split("\n\n")
     try:
         await _send_html_blocks(
-            lambda text: bot.send_message(config.PAYMENT_CHANNEL, text),
+            lambda text: bot.send_message(target, text),
             blocks,
         )
     except Exception as error:  # noqa: BLE001
@@ -1318,10 +1372,12 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
     channel_sent = await _deliver_direct_order_channel(
         order_id, channel_blocks
     )
-    if not channel_sent and not config.PAYMENT_CHANNEL:
+    if not channel_sent and not config.payment_channel():
         await message.answer(
             "<b>Payment channel not configured.</b> The order is saved; set "
-            "<code>PAYMENT_CHANNEL</code> and restart so queued summaries retry."
+            "<code>PAYMENT_CHANNEL</code> in <code>.env</code> (or run "
+            "<code>.setchannel</code> on the userbot) and queued summaries "
+            "retry on their own."
         )
 
     await db.log_event(
@@ -2235,13 +2291,15 @@ async def revocation_retry_loop() -> None:
     """Retry failed revocations and expire unused buyer reservations."""
     while True:
         try:
-            if config.PAYMENT_CHANNEL:
+            if config.payment_channel():
                 for pending_order in await db.pending_channel_orders():
                     await _deliver_direct_order_channel(
                         pending_order["order_id"]
                     )
 
             if linkstore is not None:
+                # Release requested users before the ban retries below run.
+                await _drain_unban_journal()
                 for item in linkstore.pending_revokes():
                     if await revoke_link(item["chat_id"], item["link"]):
                         linkstore.complete_revoke(item["chat_id"], item["link"])

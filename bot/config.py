@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 BOT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BOT_DIR.parent
@@ -61,6 +61,26 @@ ORDER_PREFIX = (os.getenv("ORDER_PREFIX", "ANI") or "ANI").strip()
 # Optional chat to also post each order to (numeric id like -100123... or a
 # public @username). Leave empty to disable channel posting.
 PAYMENT_CHANNEL = (os.getenv("PAYMENT_CHANNEL", "") or "").strip()
+
+
+def payment_channel() -> str:
+    """The upload channel, re-read from .env on every use.
+
+    The userbot's ``.setchannel`` rewrites ``PAYMENT_CHANNEL`` in ``.env`` while
+    this process is running. Reading it fresh keeps both halves of the system
+    posting to the same place instead of needing a restart to agree.
+    """
+    for path in (BOT_DIR / ".env", ROOT_DIR / ".env"):
+        if not path.exists():
+            continue
+        try:
+            value = (dotenv_values(path).get("PAYMENT_CHANNEL") or "").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return (os.getenv("PAYMENT_CHANNEL", "") or "").strip() or PAYMENT_CHANNEL
+
 
 # --- Storage ---------------------------------------------------------------
 DATA_DIR = BOT_DIR / "data"

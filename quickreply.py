@@ -31,7 +31,11 @@ Payment logger (send these yourself in ANY chat):
                                  optionally post a replied proof image
   /setdone <template>            message sent to the user in the private chat
   /setchannelpostofpayment <t>   caption for the channel post
-  .setchannel                    type it in a channel -> post media there
+  .setchannel [id|@username]     the payment upload channel: type it inside the
+                                 channel, or name one from any chat. Receipts
+                                 that never posted follow the new target.
+  .unban <id|@username>          lift that user's ban in every group this
+                                 account admins (or reply to the user)
   /stats                         today's total (INR) + count + split
   /cancel                        in the upload channel, reply to a payment post
                                  -> mark it fake, remove it from today's stats,
@@ -62,8 +66,13 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import (
+    FloodWaitError,
+    MessageNotModifiedError,
+    UserNotParticipantError,
+)
 from telethon.tl import types as tl_types
+from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
     DeleteExportedChatInviteRequest,
@@ -79,6 +88,9 @@ from telethon.tl.functions.messages import (
 )
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
+    ChannelParticipantsBanned,
+    ChannelParticipantsKicked,
+    ChatBannedRights,
     InputPeerSelf,
     InputQuickReplyShortcut,
     InputUserSelf,
@@ -110,6 +122,12 @@ except Exception:  # noqa: BLE001
 LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
 # The link inside the saved post (may or may not include the scheme).
 FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNORECASE)
+
+# Dot commands accept a leading "." or "/" (both are typed in practice). The
+# patterns are anchored so `.setchannel` can never swallow the much longer
+# `/setchannelpostofpayment`.
+_SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -515,8 +533,13 @@ def _configured_post_channel() -> int | None:
 
 
 def _default_pay() -> dict:
+    channel = _configured_post_channel()
     return {
-        "post_channel": _configured_post_channel(),
+        "post_channel": channel,
+        # The PAYMENT_CHANNEL value this store was last reconciled with. It is
+        # what makes an operator's manual .env edit distinguishable from a .env
+        # write that never landed; see _sync_env_post_channel().
+        "post_channel_env": channel,
         "done_template": DEFAULT_DONE,
         "channel_template": DEFAULT_CHANNEL,
         "payments": [],
@@ -555,6 +578,8 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
     if post_channel is None:
         post_channel = _configured_post_channel()
     data["post_channel"] = post_channel
+    if "post_channel_env" in data:
+        data["post_channel_env"] = _optional_int(data.get("post_channel_env"))
 
     for key, default in (
         ("done_template", DEFAULT_DONE),
@@ -652,6 +677,44 @@ def _write_pay_data(data: dict) -> None:
         os.close(descriptor)
 
 
+def _sync_env_post_channel(data: dict) -> tuple[bool, str]:
+    """Reconcile the runtime upload target with the PAYMENT_CHANNEL parameter.
+
+    ``.setchannel`` keeps .env and pay.json in step, so the two normally agree.
+    When they disagree the operator edited the parameter by hand (or restored an
+    older pay.json), and the declared parameter has to win — otherwise the
+    setting reads as applied while every receipt keeps going somewhere else.
+
+    The one case where .env must NOT win is a ``.setchannel`` whose .env write
+    failed: ``post_channel_env`` still records the value .env actually holds, so
+    a stale parameter cannot quietly move deliveries back.
+
+    Returns ``(changed, note)`` where ``changed`` means the store needs saving.
+    """
+    env_channel = _configured_post_channel()
+    current = _optional_int(data.get("post_channel"))
+    known_env = "post_channel_env" in data
+    seen_env = _optional_int(data.get("post_channel_env"))
+
+    note = ""
+    if env_channel is not None and env_channel != current:
+        if current is None:
+            data["post_channel"] = env_channel
+            note = f"upload channel restored from PAYMENT_CHANNEL ({env_channel})"
+        elif not known_env or env_channel != seen_env:
+            data["post_channel"] = env_channel
+            note = (
+                f"upload channel moved to PAYMENT_CHANNEL ({env_channel}); "
+                f"pay.json still pointed at {current}"
+            )
+
+    changed = bool(note)
+    if not known_env or seen_env != env_channel:
+        data["post_channel_env"] = env_channel
+        changed = True
+    return changed, note
+
+
 def _load_pay() -> dict:
     if not config.PAY_FILE.exists():
         return _default_pay()
@@ -667,6 +730,10 @@ def _load_pay() -> dict:
         data = _default_pay()
         repairs = [f"pay.json could not be read ({type(e).__name__})"]
 
+    # A parameter change is normal operator input, not damage: reconcile it
+    # before the repair write so it lands without a bogus recovery backup.
+    env_changed, env_note = _sync_env_post_channel(data)
+
     if repairs:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = config.PAY_FILE.with_name(f"pay.recovery-{stamp}.json")
@@ -678,6 +745,13 @@ def _load_pay() -> dict:
             ui.warn(f"Repaired payment data ({'; '.join(repairs)}).{backup_note}")
         except OSError as e:
             ui.warn(f"Payment data was repaired in memory but could not be saved: {e}")
+    elif env_changed:
+        try:
+            _write_pay_data(data)
+        except OSError as e:
+            ui.warn(f"Payment channel parameter could not be persisted: {e}")
+    if env_note:
+        ui.info(env_note)
     return data
 
 
@@ -1683,9 +1757,13 @@ async def _post_payment_to_channel(
     if payment.get("post_status") == "posted" and payment.get("post_message_id"):
         return True
 
-    target = _optional_int(
-        payment.get("post_chat_id") or _pay.get("post_channel")
-    )
+    # The live setting wins over the snapshot taken when the payment was
+    # recorded: a receipt queued against an older channel (or against none at
+    # all) has to follow `.setchannel`, not the channel that was configured
+    # minutes ago. The snapshot is kept only to reconcile an in-flight upload.
+    snapshot = _optional_int(payment.get("post_chat_id"))
+    configured = _optional_int(_pay.get("post_channel"))
+    target = configured if configured is not None else snapshot
     if target is None:
         payment["post_status"] = "not_configured"
         payment["post_error"] = "PAYMENT_CHANNEL is not configured"
@@ -1701,20 +1779,26 @@ async def _post_payment_to_channel(
             )
         return False
 
-    payment["post_chat_id"] = int(target)
     order_id = str(payment.get("order_id") or "")
 
     # A send may have reached Telegram just before the process lost its reply.
-    # Search first so retries converge on the accepted media post.
+    # Search first so retries converge on the accepted media post. Both the old
+    # and the new chat are checked, so moving the channel mid-flight cannot
+    # duplicate a receipt that already landed in the previous one.
     if payment.get("post_status") in {"posting", "untracked", "failed"}:
-        existing_id = await _find_existing_channel_post(target, order_id)
-        if existing_id:
-            payment["post_message_id"] = existing_id
-            payment["post_status"] = "posted"
-            payment.pop("post_error", None)
-            payment.pop("next_post_retry", None)
-            _save_pay()
-            return True
+        candidates = [chat for chat in (snapshot, target) if chat is not None]
+        for candidate in dict.fromkeys(candidates):
+            existing_id = await _find_existing_channel_post(candidate, order_id)
+            if existing_id:
+                payment["post_chat_id"] = int(candidate)
+                payment["post_message_id"] = existing_id
+                payment["post_status"] = "posted"
+                payment.pop("post_error", None)
+                payment.pop("next_post_retry", None)
+                _save_pay()
+                return True
+
+    payment["post_chat_id"] = int(target)
 
     if source_message is None:
         source_chat_id = _optional_int(payment.get("source_chat_id"))
@@ -2589,29 +2673,121 @@ async def cmd_setchannelpost(event) -> None:
     await _set_template(event, "channel", "/setchannelpostofpayment", "Channel post caption")
 
 
+def _pending_channel_payments() -> list:
+    """Committed payments whose proof image has not reached the channel yet."""
+    return [
+        payment
+        for payment in _pay.get("payments", [])
+        if payment.get("status") == "valid"
+        and payment.get("source_message_id")
+        and payment.get("post_status") != "posted"
+    ]
+
+
+def _runtime_status_text() -> str:
+    """`.ping`: the build plus the target deliveries actually use."""
+    target = _optional_int(_pay.get("post_channel"))
+    parts = [
+        f"Quick-reply userbot is running ({QUICKREPLY_BUILD}).",
+        f"Payment channel: {target if target is not None else 'NOT SET'}.",
+    ]
+    declared = _configured_post_channel()
+    if declared != target:
+        # Only reachable when a `.setchannel` could not write .env, and the two
+        # would diverge again after a restart. Surface it instead of hiding it.
+        parts.append(
+            "PAYMENT_CHANNEL in .env: "
+            f"{declared if declared is not None else 'NOT SET'}."
+        )
+    pending = len(_pending_channel_payments())
+    if pending:
+        parts.append(f"Pending deliveries: {pending}.")
+    return " ".join(parts)
+
+
+async def _resolve_post_target(argument: str) -> tuple[int, str]:
+    """Resolve a `.setchannel <target>` argument to ``(chat_id, title)``."""
+    value = argument.split()[0] if argument.split() else ""
+    private = re.match(r"^(?:https?://)?t\.me/c/(\d+)(?:/\d+)?/?$", value, re.I)
+    public = re.match(r"^(?:https?://)?t\.me/([A-Za-z][\w]{3,})/?$", value, re.I)
+    if private:
+        value = f"-100{private.group(1)}"
+    elif public:
+        value = f"@{public.group(1)}"
+    entity = await client.get_entity(config.coerce(value))
+    if isinstance(entity, tl_types.User):
+        raise ValueError(f"{value} is a user, not a channel or group.")
+    try:
+        chat_id = get_peer_id(entity)
+    except (TypeError, ValueError):
+        chat_id = _optional_int(value)
+    if chat_id is None:
+        raise ValueError(f"Couldn't determine the chat id for {value}.")
+    return chat_id, getattr(entity, "title", None) or value
+
+
 async def cmd_setchannel(event) -> None:
-    """Set the current Telegram channel/supergroup as the post target."""
-    if not getattr(event, "is_channel", False):
-        await _ack(event, "Run .setchannel inside the target channel.")
-        return
-    chat_id = event.chat_id
-    chat = await event.get_chat()
-    title = getattr(chat, "title", None) or "this chat"
-    _pay["post_channel"] = chat_id
-    _save_pay()
+    """Set the payment upload channel: here, or by id/@username/t.me link."""
+    match = _SETCHANNEL_RE.match((getattr(event, "raw_text", "") or "").strip())
+    argument = (match.group(1).strip() if match and match.group(1) else "")
+
+    if argument.casefold() in ("", "here", "this"):
+        if not getattr(event, "is_channel", False):
+            await _ack(
+                event,
+                "Run .setchannel inside the target channel, or name it: "
+                ".setchannel <id|@username>",
+            )
+            return
+        chat_id = event.chat_id
+        chat = await event.get_chat()
+        title = getattr(chat, "title", None) or "this chat"
+        where = "here: "
+    else:
+        try:
+            chat_id, title = await _resolve_post_target(argument)
+        except ValueError as error:
+            await _ack(event, str(error))
+            return
+        except Exception as error:  # noqa: BLE001
+            await _ack(
+                event,
+                f"Couldn't resolve {argument}: {type(error).__name__}: {error}",
+            )
+            return
+        where = ""
+
+    # Captured before save_env(), which refreshes the live value: on a failed
+    # .env write this is what .env still holds, and remembering it keeps the
+    # next start from "adopting" that stale parameter over this new target.
+    previous_env = _configured_post_channel()
+    _pay["post_channel"] = int(chat_id)
+    _pay["post_channel_env"] = int(chat_id)
     persisted = True
     try:
         config.save_env({"PAYMENT_CHANNEL": str(chat_id)})
     except OSError as error:
         persisted = False
+        _pay["post_channel_env"] = previous_env
         ui.warn(f"Couldn't persist PAYMENT_CHANNEL in .env: {error}")
-    suffix = "" if persisted else " (saved for this data folder only)"
-    await _ack(event, f"Post channel set here: {title} ({chat_id}){suffix}")
-    for payment in _pay.get("payments", []):
+
+    # Every receipt that never reached a channel follows the new target, not
+    # just the ones recorded while no channel was configured at all.
+    requeued = 0
+    for payment in _pending_channel_payments():
+        payment["next_post_retry"] = 0
+        payment.pop("post_failure_notified", None)
         if payment.get("post_status") == "not_configured":
-            payment["post_chat_id"] = int(chat_id)
-            payment["next_post_retry"] = 0
+            payment["post_status"] = "queued"
+            payment.pop("post_error", None)
+        requeued += 1
     _save_pay()
+
+    suffix = "" if persisted else " (saved for this data folder only)"
+    message = f"Post channel set {where}{title} ({chat_id}){suffix}"
+    if requeued:
+        message += f"\nRe-queued {requeued} pending delivery(s)."
+    await _ack(event, message)
     await _recover_pending_payments(recover_interrupted_adds=False)
 
 
@@ -2774,6 +2950,229 @@ async def cmd_remove(event) -> None:
                       + (" and user banned." if banned else "."))
 
 
+# Every restriction lifted: an all-false ChatBannedRights drops the user from
+# the chat's banned list instead of re-adding them as a member.
+_UNBAN_RIGHTS = ChatBannedRights(until_date=None, view_messages=False)
+
+
+def _user_label(entity, user_id: int) -> str:
+    username = getattr(entity, "username", "") or ""
+    if username:
+        return f"@{username} ({user_id})"
+    name = " ".join(
+        part
+        for part in (
+            getattr(entity, "first_name", "") or "",
+            getattr(entity, "last_name", "") or "",
+        )
+        if part
+    ).strip()
+    return f"{name} ({user_id})" if name else str(user_id)
+
+
+async def _resolve_unban_target(event, argument: str) -> tuple[int, str]:
+    """Return ``(user_id, label)`` for a `.unban` argument or replied message."""
+    parts = argument.split()
+    value = parts[0] if parts else ""
+    if not value:
+        reply = None
+        if hasattr(event, "get_reply_message"):
+            reply = await event.get_reply_message()
+        sender_id = _optional_int(getattr(reply, "sender_id", None))
+        if sender_id is None:
+            raise ValueError(
+                "Usage: .unban <user id|@username> - or reply to the user."
+            )
+        return sender_id, str(sender_id)
+
+    link = re.match(r"^(?:https?://)?t\.me/([A-Za-z][\w]{3,})/?$", value, re.I)
+    if link:
+        value = f"@{link.group(1)}"
+    numeric = _optional_int(value)
+    if numeric is not None:
+        # A raw id needs no lookup: the banned lists below carry the full user
+        # object, so this works for ids the account has never had a chat with.
+        return numeric, str(numeric)
+    try:
+        entity = await client.get_entity(value)
+    except Exception as error:  # noqa: BLE001
+        raise ValueError(
+            f"Couldn't resolve {value}: {type(error).__name__}: {error}"
+        ) from error
+    user_id = _optional_int(getattr(entity, "id", None))
+    if user_id is None or not isinstance(entity, tl_types.User):
+        raise ValueError(f"{value} is not a user.")
+    return user_id, _user_label(entity, user_id)
+
+
+def _is_guarded_channel(entity, chat_id: int) -> bool:
+    """guard.py permanently bans every non-admin in CHANNEL by design."""
+    guarded = config.channel()
+    if not guarded:
+        return False
+    if isinstance(guarded, int):
+        return chat_id == guarded or getattr(entity, "id", None) == abs(guarded)
+    username = (getattr(entity, "username", "") or "").casefold()
+    return bool(username) and username == str(guarded).lstrip("@").casefold()
+
+
+async def _ban_state(chat, user_id: int) -> tuple[bool, object]:
+    """Return ``(is_banned, target)`` for ``user_id`` in ``chat``.
+
+    ``target`` is what EditBannedRequest should be handed: the id itself when
+    Telethon can resolve it, or the full user recovered from the chat's ban list
+    when it cannot.
+    """
+    try:
+        permissions = await client.get_permissions(chat, user_id)
+    except FloodWaitError as error:
+        await asyncio.sleep(min(int(error.seconds), 60) + 1)
+        return False, None
+    except UserNotParticipantError:
+        return False, None          # definitively not banned in this chat
+    except (AttributeError, TypeError, ValueError):
+        pass                        # unknown id: recover it from the ban list
+    except Exception:  # noqa: BLE001 - no admin rights, not a channel, ...
+        return False, None
+    else:
+        return bool(getattr(permissions, "is_banned", False)), user_id
+
+    member = await _banned_participant(chat, user_id)
+    return member is not None, member
+
+
+async def _banned_participant(chat, user_id: int):
+    """Return the banned/restricted user object for ``user_id`` in ``chat``.
+
+    Reading the ban lists (instead of asking for one participant) resolves the
+    full user — access hash included — which is what makes `.unban <raw id>`
+    work in chats the account has no cached entity for.
+    """
+    for participant_filter in (
+        ChannelParticipantsKicked(q=""),
+        ChannelParticipantsBanned(q=""),
+    ):
+        try:
+            async for user in client.iter_participants(
+                chat, filter=participant_filter
+            ):
+                if user.id == user_id:
+                    return user
+        except FloodWaitError as error:
+            await asyncio.sleep(min(int(error.seconds), 60) + 1)
+        except Exception:  # noqa: BLE001 - not a channel, or no admin rights
+            continue
+    return None
+
+
+async def _lift_ban(chat, member) -> tuple[bool, str]:
+    for _ in range(2):
+        try:
+            await client(EditBannedRequest(chat, member, _UNBAN_RIGHTS))
+            return True, ""
+        except FloodWaitError as error:
+            await asyncio.sleep(min(int(error.seconds), 60) + 1)
+        except Exception as error:  # noqa: BLE001
+            return False, f"{type(error).__name__}: {error}"
+    return False, "flood limited"
+
+
+def _clear_removed_orders(user_id: int) -> int:
+    """Retire this account's own "removed" markers for an unbanned buyer."""
+    cleared = 0
+    for payment in _pay.get("payments", []):
+        if (
+            _optional_int(payment.get("payer_id")) == user_id
+            and payment.get("join_status") == "removed"
+        ):
+            payment["join_status"] = "unbanned"
+            cleared += 1
+    if cleared:
+        try:
+            _save_pay()
+        except Exception as error:  # noqa: BLE001
+            ui.warn(f"Couldn't record the unban in pay.json: {error}")
+    return cleared
+
+
+def _queue_bot_unban(user_id: int) -> bool:
+    """Have the admin bot drop its durable ban records for this user too.
+
+    The bot retries permanent bans from its own SQLite journal, so without this
+    handoff its next sweep would simply re-ban whoever was just unbanned.
+    """
+    if linkstore is None:
+        return False
+    try:
+        linkstore.queue_unban(user_id)
+        return True
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            "Couldn't hand the unban to the admin bot: "
+            f"{type(error).__name__}: {error}"
+        )
+        return False
+
+
+async def cmd_unban(event) -> None:
+    """`.unban <id|@username>` (or reply): lift the ban in every group."""
+    match = _UNBAN_RE.match((getattr(event, "raw_text", "") or "").strip())
+    argument = (match.group(1).strip() if match and match.group(1) else "")
+    try:
+        user_id, label = await _resolve_unban_target(event, argument)
+    except ValueError as error:
+        await _ack(event, str(error))
+        return
+
+    try:
+        chats = []
+        async for dialog in client.iter_dialogs():
+            if not (
+                getattr(dialog, "is_group", False)
+                or getattr(dialog, "is_channel", False)
+            ):
+                continue
+            entity = dialog.entity
+            chats.append((entity, dialog.name or "", get_peer_id(entity)))
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Chat list failed: {type(error).__name__}: {error}")
+        return
+
+    unbanned, failed, guarded = [], [], []
+    for entity, name, chat_id in chats:
+        title = name or str(chat_id)
+        if _is_guarded_channel(entity, chat_id):
+            guarded.append(title)
+            continue
+        is_banned, member = await _ban_state(entity, user_id)
+        if not is_banned or member is None:
+            continue
+        ok, error = await _lift_ban(entity, member)
+        if ok:
+            unbanned.append(title)
+            print(ui.green("[unban] ") + f"{user_id} in {title}", flush=True)
+        else:
+            failed.append(f"{title}: {error}")
+
+    async with _payment_lock:
+        _clear_removed_orders(user_id)
+    _queue_bot_unban(user_id)
+
+    if not unbanned and not failed:
+        lines = [f"No ban found for {label} in {len(chats)} chat(s)."]
+    else:
+        lines = [f"Unbanned {label} in {len(unbanned)} of {len(chats)} chat(s)."]
+        if unbanned:
+            lines.append("\n".join(unbanned[:20]))
+            if len(unbanned) > 20:
+                lines.append(f"+{len(unbanned) - 20} more")
+    if failed:
+        lines.append("Failed:\n" + "\n".join(failed[:10]))
+    if guarded:
+        lines.append("Skipped, guard.py enforces it: " + ", ".join(guarded))
+    await _ack(event, "\n\n".join(lines))
+
+
 async def _notify_owner(text: str) -> None:
     """Send a note to the configured OWNER (falls back to Saved Messages)."""
     target = config.owner() or _state.get("self_id") or "me"
@@ -2859,7 +3258,11 @@ HELP_TEXT = (
     "<code>/add &lt;amount&gt; &lt;name&gt; &lt;kw...&gt;</code> - in the payer's DM: the BOT reserves a link per keyword (or <code>all</code>) for that user; links go where {link} is, numbered/bold/blockquoted\n"
     "<code>/setdone &lt;template&gt;</code> - message sent to the user in the private chat\n"
     "<code>/setchannelpostofpayment &lt;template&gt;</code> - safe caption for the channel post (private invite URLs are never copied there)\n"
-    "<code>.setchannel</code> - type it in a channel to post media there\n"
+    "<code>.setchannel</code> - type it in the target channel, or "
+    "<code>.setchannel &lt;id|@username&gt;</code> from anywhere; pending "
+    "deliveries follow the new target\n"
+    "<code>.unban &lt;id|@username&gt;</code> - lift that user's ban in every "
+    "group this account admins (or reply to them)\n"
     "<code>/stats</code> - today's total, count, and split\n"
     "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake, remove it from stats, and revoke buyer-bound access\n"
     "<code>/clear</code> - reset today's stats to zero\n\n"
@@ -3220,13 +3623,7 @@ async def _handle_outgoing(event):
     # Messages) so the longer commands win.
     low_cmd = raw_text.strip().lower()
     if low_cmd in (".ping", "/ping"):
-        post_channel = _pay.get("post_channel")
-        channel_state = str(post_channel) if post_channel else "NOT SET"
-        await _ack(
-            event,
-            f"Quick-reply userbot is running ({QUICKREPLY_BUILD}). "
-            f"Payment channel: {channel_state}.",
-        )
+        await _ack(event, _runtime_status_text())
         return
     if low_cmd in (".help", "/help", "/commands", "/start"):
         await _ack(event, HELP_TEXT, parse_mode="html")
@@ -3248,9 +3645,12 @@ async def _handle_outgoing(event):
             await cmd_setdone(event)
         return
     # /link, /groups, /remove and group-access live in the BOT (bot/), not here.
-    if low_cmd == ".setchannel":
+    if _SETCHANNEL_RE.match(raw_text.strip()):
         async with _payment_lock:
             await cmd_setchannel(event)
+        return
+    if _UNBAN_RE.match(raw_text.strip()):
+        await cmd_unban(event)
         return
     if low_cmd == "/stats":
         async with _payment_lock:
@@ -3529,9 +3929,14 @@ async def main() -> None:
     pc = _pay.get("post_channel")
     day = _todays_payments()
     total = _payment_total(day)
-    pc_state = str(pc) if pc else ui.yellow("not set - type .setchannel in a channel")
+    pc_state = str(pc) if pc else ui.yellow(
+        "not set - .setchannel in the channel, or .setchannel <id|@username>"
+    )
+    pending = len(_pending_channel_payments())
     ui.info(f"Payment logger: post channel [{pc_state}]. "
             + ui.dim(f"today {fmt_inr(total)} / {len(day)} payment(s). '.help' for commands."))
+    if pending:
+        ui.warn(f"{pending} payment(s) still waiting for channel delivery.")
     if linkstore is not None:
         ui.info("Bot link bridge: " + ui.bold("ready")
                 + ui.dim(f" ({linkstore.REQUESTS}) — the bot must run from the same folder."))

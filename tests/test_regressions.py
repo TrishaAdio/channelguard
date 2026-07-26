@@ -1443,3 +1443,276 @@ def test_exact_amount_detection_and_utf16_html_splitting() -> None:
     assert len(chunks) == 2
     assert all(app._telegram_units(chunk) <= 4000 for chunk in chunks)
     assert "".join(chunks) == "😀" * 2100
+
+
+
+def test_edited_payment_channel_parameter_overrides_stale_runtime_target(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(quickreply.config, "PAYMENT_CHANNEL_RAW", "-1002")
+
+    # The operator edited PAYMENT_CHANNEL by hand: the declared parameter wins,
+    # otherwise .ping keeps reporting a channel nothing is delivered to.
+    moved, note = quickreply._sync_env_post_channel(
+        {"post_channel": -1001, "post_channel_env": -1001}
+    )
+    assert moved is True
+    assert "-1002" in note
+
+    # A `.setchannel` whose .env write failed recorded the value .env still
+    # holds, so the stale parameter must not drag deliveries back.
+    monkeypatch.setattr(quickreply.config, "PAYMENT_CHANNEL_RAW", "-1001")
+    kept = {"post_channel": -1002, "post_channel_env": -1001}
+    changed, note = quickreply._sync_env_post_channel(kept)
+    assert kept["post_channel"] == -1002
+    assert (changed, note) == (False, "")
+
+
+async def _noop_recovery(**_kwargs) -> None:
+    return None
+
+
+def test_setchannel_accepts_a_named_target_and_requeues_pending_posts(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["post_channel"] = -1001
+        stranded = {
+            "amount": "14.00",
+            "name": "Amit",
+            "order_id": "ANIWAITING",
+            "status": "valid",
+            "ts": quickreply._now_ts(),
+            "source_chat_id": 42,
+            "source_message_id": 9,
+            "post_status": "not_configured",
+            "post_failure_notified": True,
+            "next_post_retry": quickreply._now_ts() + 600,
+        }
+        quickreply._pay["payments"] = [stranded]
+        saved, replies = [], []
+
+        class Client:
+            async def get_entity(self, value):
+                assert value == -1009876543210
+                return SimpleNamespace(title="Payments", id=9876543210)
+
+        monkeypatch.setattr(quickreply, "client", Client())
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        monkeypatch.setattr(
+            quickreply.config, "save_env", lambda values: saved.append(values)
+        )
+        monkeypatch.setattr(
+            quickreply, "_recover_pending_payments", _noop_recovery
+        )
+
+        class Event:
+            raw_text = ".setchannel -1009876543210"
+            is_channel = False
+
+            async def edit(self, text, **_kwargs):
+                replies.append(text)
+
+        await quickreply.cmd_setchannel(Event())
+
+        assert quickreply._pay["post_channel"] == -1009876543210
+        assert quickreply._pay["post_channel_env"] == -1009876543210
+        assert saved == [{"PAYMENT_CHANNEL": "-1009876543210"}]
+        assert "Payments (-1009876543210)" in replies[0]
+        assert "Re-queued 1 pending delivery(s)." in replies[0]
+        assert stranded["post_status"] == "queued"
+        assert stranded["next_post_retry"] == 0
+        assert "post_failure_notified" not in stranded
+
+    asyncio.run(scenario())
+
+
+def test_pending_payment_follows_the_current_channel_without_duplicating(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["post_channel"] = -1002
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+
+        def record(order_id, post_status):
+            return {
+                "amount": "14.00",
+                "name": "Amit",
+                "order_id": order_id,
+                "status": "valid",
+                "ts": quickreply._now_ts(),
+                # Recorded while the old channel was configured.
+                "post_chat_id": -1001,
+                "post_status": post_status,
+                "source_chat_id": 42,
+                "source_message_id": 9,
+            }
+
+        uploads = []
+
+        class MovedClient:
+            async def get_messages(self, *_args, **_kwargs):
+                return SimpleNamespace(media=object())
+
+            async def send_file(self, target, **_kwargs):
+                uploads.append(target)
+                return SimpleNamespace(id=555)
+
+        monkeypatch.setattr(quickreply, "client", MovedClient())
+        queued = record("ANIQUEUED", "queued")
+        assert await quickreply._post_payment_to_channel(queued)
+        assert uploads == [-1002]
+        assert queued["post_chat_id"] == -1002
+
+        class RetryClient(MovedClient):
+            async def iter_messages(self, chat_id, *_args, **_kwargs):
+                # The earlier attempt did land - in the previous channel.
+                if chat_id == -1001:
+                    yield SimpleNamespace(
+                        id=777, message="Order ANIRETRY", media=object()
+                    )
+
+        monkeypatch.setattr(quickreply, "client", RetryClient())
+        retried = record("ANIRETRY", "failed")
+        assert await quickreply._post_payment_to_channel(retried)
+        assert uploads == [-1002]
+        assert retried["post_chat_id"] == -1001
+        assert retried["post_message_id"] == 777
+
+    asyncio.run(scenario())
+
+
+def test_unban_lifts_every_group_ban_and_hands_off_to_the_bot(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from telethon.tl.functions.channels import EditBannedRequest
+        from telethon.tl.types import PeerChannel
+        from telethon.utils import get_peer_id
+
+        monkeypatch.setattr(linkstore, "UNBANS", tmp_path / "unbans.json")
+        monkeypatch.setattr(quickreply.config, "CHANNEL_RAW", "-1000000000003")
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["payments"] = [
+            {
+                "amount": "14.00",
+                "name": "Amit",
+                "order_id": "ANIBANNED",
+                "status": "valid",
+                "ts": quickreply._now_ts(),
+                "payer_id": 42,
+                "join_status": "removed",
+            }
+        ]
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        requests, replies = [], []
+
+        banned_in = {
+            get_peer_id(PeerChannel(1)): 42,   # banned, unban expected
+            get_peer_id(PeerChannel(2)): 7,    # someone else is banned here
+            get_peer_id(PeerChannel(3)): 42,   # guard.py's channel
+        }
+        scanned = []
+
+        class Client:
+            async def iter_dialogs(self):
+                for index, name in ((1, "Alpha"), (2, "Beta"), (3, "Guarded")):
+                    yield SimpleNamespace(
+                        entity=PeerChannel(index),
+                        name=name,
+                        is_group=True,
+                        is_channel=True,
+                    )
+
+            async def get_permissions(self, chat, user):
+                if get_peer_id(chat) == get_peer_id(PeerChannel(1)):
+                    # An id this account has no cached entity for.
+                    raise ValueError("Could not find the input entity")
+                return SimpleNamespace(is_banned=banned_in.get(
+                    get_peer_id(chat)) == user)
+
+            async def iter_participants(self, chat, filter=None):
+                scanned.append(get_peer_id(chat))
+                member = banned_in.get(get_peer_id(chat))
+                if member is not None:
+                    yield SimpleNamespace(id=member)
+
+            async def __call__(self, request):
+                requests.append(request)
+
+        monkeypatch.setattr(quickreply, "client", Client())
+
+        class Event:
+            raw_text = ".unban 42"
+
+            async def edit(self, text, **_kwargs):
+                replies.append(text)
+
+        await quickreply.cmd_unban(Event())
+
+        # Beta bans somebody else, and the guarded channel is guard.py's job.
+        assert len(requests) == 1
+        assert isinstance(requests[0], EditBannedRequest)
+        assert requests[0].banned_rights.view_messages is False
+        assert "Unbanned 42 in 1 of 3 chat(s)." in replies[0]
+        assert "Alpha" in replies[0]
+        assert "Skipped, guard.py enforces it: Guarded" in replies[0]
+        # Only the unresolvable id needed the (potentially huge) ban list.
+        assert scanned == [get_peer_id(PeerChannel(1))]
+        assert quickreply._pay["payments"][0]["join_status"] == "unbanned"
+        assert linkstore.pending_unbans() == [
+            {"user_id": 42, "ts": pytest.approx(
+                linkstore.pending_unbans()[0]["ts"]
+            )}
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_unban_journal_stops_the_bot_from_re_banning(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "unban.db")
+        monkeypatch.setattr(linkstore, "UNBANS", tmp_path / "unbans.json")
+        await db.init()
+        unbanned, notices = [], []
+        try:
+            await db.upsert_group(
+                -1001, "Alpha", "alpha", "supergroup", None, None, True
+            )
+            assert await db.register_order("ANIBAN", "14", "Amit", "all")
+            link_id = await db.add_order_link(
+                "ANIBAN", -1001, "https://t.me/+banned"
+            )
+            await db.set_order_link_joined(link_id, 42)
+            await db.queue_member_ban(-1001, 42, "order removed")
+            assert len(await db.pending_member_bans()) == 1
+
+            async def unban(chat_id, user_id, **_kwargs):
+                unbanned.append((chat_id, user_id))
+
+            async def notify(text, **_kwargs):
+                notices.append(text)
+
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+            monkeypatch.setattr(app, "tell_owner", notify)
+
+            linkstore.queue_unban(42)
+            await app._drain_unban_journal()
+
+            assert unbanned == [(-1001, 42)]
+            assert await db.pending_member_bans() == []
+            assert (await db.order_links("ANIBAN"))[0]["buyer_banned"] == 1
+            assert linkstore.pending_unbans() == []
+            assert notices and "42" in notices[0]
+        finally:
+            await db.close()
+            await app.bot.session.close()
+
+    asyncio.run(scenario())

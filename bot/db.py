@@ -1032,6 +1032,41 @@ async def pending_member_bans() -> list[aiosqlite.Row]:
     )
 
 
+async def cancel_member_bans(user_id: int) -> int:
+    """Stop enforcing every journalled permanent ban for one user.
+
+    Called when the owner unbans somebody. The rows are kept for the audit
+    trail but leave the 'pending' state, so no retry re-applies them.
+    """
+    rows = await _all(
+        "SELECT chat_id FROM member_bans WHERE user_id=? AND status!='cancelled'",
+        (user_id,),
+    )
+    if rows:
+        await _run(
+            "UPDATE member_bans SET status='cancelled', last_error='', "
+            "updated_at=? WHERE user_id=? AND status!='cancelled'",
+            (time.time(), user_id),
+        )
+    return len(rows)
+
+
+async def release_order_link_bans(user_id: int) -> int:
+    """Mark buyer cleanup settled so no revocation retry re-bans this user."""
+    rows = await _all(
+        "SELECT id FROM order_links WHERE joined_user=? "
+        "AND (buyer_banned=0 OR buyer_removed=0)",
+        (user_id,),
+    )
+    if rows:
+        await _run(
+            "UPDATE order_links SET buyer_banned=1, buyer_removed=1 "
+            "WHERE joined_user=?",
+            (user_id,),
+        )
+    return len(rows)
+
+
 async def set_member_ban_result(
     chat_id: int, user_id: int, completed: bool, error: str = ""
 ) -> None:

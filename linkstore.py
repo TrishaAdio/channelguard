@@ -22,6 +22,7 @@ RESULTS = STORE.parent / "link_results.json"
 DEMO_LINK = STORE.parent / "demo_link.json"
 COMMANDS = STORE.parent / "command_claims.json"
 REVOKES = STORE.parent / "pending_revokes.json"
+UNBANS = STORE.parent / "pending_unbans.json"
 _MAX_ENTRIES = 500
 _TTL = 3600
 _COMMAND_TTL = 86400
@@ -314,6 +315,38 @@ def complete_revoke(chat_id: int, link: str) -> None:
         return items, None
 
     _mutate(REVOKES, {}, update)
+
+
+# --- member unban journal -------------------------------------------------
+# The userbot lifts bans with its own admin account; the admin bot keeps the
+# durable ban journal. Without this handoff the bot's retry loop would re-ban
+# the user it was just told to release.
+def queue_unban(user_id: int) -> str:
+    """Ask the admin bot to release one user and forget its ban records."""
+    key = str(int(user_id))
+
+    def update(items):
+        if not isinstance(items, dict):
+            items = {}
+        items[key] = {"user_id": int(user_id), "ts": time.time()}
+        return items, key
+
+    return _mutate(UNBANS, {}, update)
+
+
+def pending_unbans() -> list[dict]:
+    items = _read_json(UNBANS, {})
+    return list(items.values()) if isinstance(items, dict) else []
+
+
+def complete_unban(user_id: int) -> None:
+    def update(items):
+        if not isinstance(items, dict):
+            items = {}
+        items.pop(str(int(user_id)), None)
+        return items, None
+
+    _mutate(UNBANS, {}, update)
 
 
 # --- reservation bridge --------------------------------------------------
