@@ -112,13 +112,59 @@ def payment_channel():
     return coerce(PAYMENT_CHANNEL_RAW)
 
 
+# Environment keys that also back a module-level value read at import time.
+# Saving one of these has to refresh the live value, otherwise the running
+# process keeps using the parameter the operator has already replaced.
+_ENV_BACKED_VALUES = {
+    "CHANNEL": "CHANNEL_RAW",
+    "OWNER": "OWNER_RAW",
+    "LINK_SOURCE": "LINK_SOURCE_RAW",
+    "PAYMENT_CHANNEL": "PAYMENT_CHANNEL_RAW",
+}
+
+
+def _apply_env_updates(updates: dict) -> None:
+    """Make saved values visible to this process without a restart."""
+    for key, value in updates.items():
+        text = "" if value is None else str(value)
+        os.environ[key] = text
+        name = _ENV_BACKED_VALUES.get(key)
+        if name:
+            globals()[name] = text
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace a config file with no window where it is empty or truncated."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def save_env(updates: dict) -> None:
-    """Write/replace the given KEY=value lines in .env, preserving the rest."""
+    """Write/replace the given KEY=value lines in .env, preserving the rest.
+
+    The in-process values are refreshed first: when the disk write fails the
+    caller is told, but the parameter it just set must not keep pointing at the
+    old value for the rest of this run.
+    """
+    _apply_env_updates(updates)
     lines = ENV_PATH.read_text().splitlines() if ENV_PATH.exists() else []
     out, seen = [], set()
     for ln in lines:
         key = ln.split("=", 1)[0] if "=" in ln else None
         if key in updates:
+            # A key repeated in .env is a silent trap: dotenv keeps the first
+            # definition, so drop the later copies instead of rewriting both.
+            if key in seen:
+                continue
             out.append(f"{key}={updates[key]}")
             seen.add(key)
         else:
@@ -126,7 +172,7 @@ def save_env(updates: dict) -> None:
     for k, v in updates.items():
         if k not in seen:
             out.append(f"{k}={v}")
-    ENV_PATH.write_text("\n".join(out) + "\n")
+    _atomic_write_text(ENV_PATH, "\n".join(out) + "\n")
 
 
 def require(*names: str) -> None:

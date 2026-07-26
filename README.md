@@ -37,7 +37,9 @@ A single-owner Telegram **bot** (bot token, not a login). What it does:
    who joined through it (kick + unban, so no permanent ban is left behind).
 4. **`/remove <orderid>`** kills every link and permanently bans each buyer
    who joined a group through that order. Failed cleanup is retried from
-   SQLite.
+   SQLite. To undo one, send `.unban <id>` from the **userbot**: it lifts the
+   ban in every group that account admins, and the bot then cancels its
+   journalled bans for that user so no retry re-applies them.
 5. **Join enforcement.** Every join request (on the general approval
    link) is stored and forwarded with inline **Approve / Decline** buttons.
    General-link rotation after approval is optional (`ROTATE_ON_JOIN`). Direct joins without
@@ -201,7 +203,8 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | reply to an image + `/add <amount> <name> [group ... \| all]` | record the payment (INR), privately deliver buyer-bound links, and auto-post the image + safe metadata caption to your channel |
 | `/setdone <template>` | the message the paying user receives in the private chat |
 | `/setchannelpostofpayment <template>` | the caption used for the channel post |
-| `.setchannel` (typed in a channel) | set that channel as the post target and persist it as `PAYMENT_CHANNEL` in `.env` |
+| `.setchannel` (typed in a channel) or `.setchannel <id \| @username \| t.me link>` (from any chat) | set the payment upload channel, persist it as `PAYMENT_CHANNEL` in `.env`, and re-queue every receipt that has not posted yet |
+| `.unban <id \| @username>` (or reply to the user) | lift that user's ban in every group/channel this account admins, and tell the admin bot to drop its durable ban records so nothing re-bans them |
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
@@ -223,6 +226,21 @@ Every new `/add` upload is linked to its payment record; replying
 `/cancel` to that generated post marks it **FAKE PAYMENT** while retaining an
 audit record, and excludes it from `/stats` and all later daily-total template
 values. Posts generated before `/cancel` support cannot be matched retroactively.
+
+**Where receipts are delivered.** The upload target has one meaning at a time:
+`PAYMENT_CHANNEL` in `.env` is the declared parameter and `data/pay.json` holds
+the live value. `.setchannel` writes both, and on startup a parameter that was
+edited by hand wins over `pay.json` — so the channel a `.ping` reports is always
+the channel receipts are sent to. Deliveries always target the current channel,
+never the one that was configured when the payment was recorded, so moving the
+channel also moves everything still queued or retrying (both the old and the new
+chat are checked first, so a receipt that already landed is never duplicated).
+The only case where `.env` does not win is a `.setchannel` whose `.env` write
+failed: it warns, keeps the new target for this data folder, and `.ping` then
+shows both values. The admin bot re-reads `PAYMENT_CHANNEL` for every order
+summary it posts, so `.setchannel` moves both halves of the system at once
+without a restart (`.env` is replaced atomically, so a concurrent read never
+sees a half-written file).
 Buyer-bound invite URLs are intentionally private: even when `/add ... all`
 creates many links, the payment channel receives only the delivery count/group
 names and unavailable details. Failed/ambiguous channel uploads are reconciled
@@ -282,7 +300,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
 | `ORDER_PREFIX`   | (payment logger) `{orderid}` prefix (default `ANI`) |
 | `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |
-| `PAYMENT_CHANNEL`| (payment logger/admin bot) numeric target channel id |
+| `PAYMENT_CHANNEL`| (payment logger/admin bot) numeric target channel id; authoritative — editing it moves the upload target on the next start |
 | `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
 | `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
