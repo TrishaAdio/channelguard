@@ -654,7 +654,7 @@ def test_rendered_channel_post_can_be_reused_as_a_live_template() -> None:
     template = (
         "#NEW PAYMENT RECEIVED ! 🎉\n\n"
         "AMOUNT : ₹599\n"
-        "MARCO SHARE : ₹2,298.60\n"
+        "ARROW SHARE : ₹2,298.60\n"
         "RIO'S SHARE : ₹2,809.40\n"
         "ORDER ID : {orderid}\n"
         "AMOUNT CREDITED ON : airtel\n\n"
@@ -683,7 +683,7 @@ def test_rendered_channel_post_can_be_reused_as_a_live_template() -> None:
     )
 
     assert "AMOUNT : ₹14" in text
-    assert f"MARCO SHARE : {mapping['{marco}']}" in text
+    assert f"ARROW SHARE : {mapping['{arrow}']}" in text
     assert f"RIO'S SHARE : {mapping['{rioshare}']}" in text
     assert "ORDER ID : ANILIVE42" in text
     assert f"PAYMENT COUNT : #{mapping['{total}']}" in text

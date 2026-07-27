@@ -205,7 +205,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `/setchannelpostofpayment <template>` | the caption used for the channel post |
 | `.setchannel` (typed in a channel) or `.setchannel <id \| @username \| t.me link>` (from any chat) | set the payment upload channel, persist it as `PAYMENT_CHANNEL` in `.env`, and re-queue every receipt that has not posted yet |
 | `.unban <id \| @username>` (or reply to the user) | lift that user's ban in every group/channel this account admins, and tell the admin bot to drop its durable ban records so nothing re-bans them |
-| `/stats` | today's total (INR), payment count, and Rio/Marco split |
+| `/stats` | today's total (INR), payment count, and Rio/Arrow split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
 | `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
@@ -214,7 +214,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 Template parameters (usable in both `/setdone` and `/setchannelpostofpayment`):
 `{amount}` (this payment), `{name}`, `{orderid}` (a unique per-payment id like
 `ANI7F3K9Q`, generated once and shared by the user message and channel post),
-`{rioshare}`, `{marco}`, `{total}` (payments today), `{todaytotal}` (collected
+`{rioshare}`, `{arrow}`, `{total}` (payments today), `{todaytotal}` (collected
 today). The `{orderid}` prefix and suffix length are set by `ORDER_PREFIX` and
 `ORDER_ID_LENGTH` in `.env`. Reply to a formatted post
 with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
@@ -246,7 +246,7 @@ creates many links, the payment channel receives only the delivery count/group
 names and unavailable details. Failed/ambiguous channel uploads are reconciled
 by order id and retried from `pay.json`.
 The revenue split, timezone, and share basis are configured via
-`RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
+`RIO_PCT`, `ARROW_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
 
 ## Files
 
@@ -302,7 +302,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |
 | `PAYMENT_CHANNEL`| (payment logger/admin bot) numeric target channel id; authoritative — editing it moves the upload target on the next start |
 | `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
-| `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
+| `ARROW_PCT`      | (payment logger) Arrow's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
 | `TZ`             | (payment logger) timezone for the "today" boundary (default `Asia/Kolkata`) |
 

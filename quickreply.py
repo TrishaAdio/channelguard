@@ -169,7 +169,7 @@ DEFAULT_CHANNEL = (
     "New payment received\n"
     "Order {orderid}\n"
     "{name} paid {amount}\n\n"
-    "Rio {rioshare} - Marco {marco}\n"
+    "Rio {rioshare} - Arrow {arrow}\n"
     "Payments today: {total}\n"
     "Collected today: {todaytotal}"
 )
@@ -867,7 +867,7 @@ def _pay_mapping(amount: Decimal, name: str, order_id: str = "",
 
     base = today_total if config.SHARE_BASE == "today" else amount
     rio = base * Decimal(str(config.RIO_PCT)) / Decimal("100")
-    marco = base * Decimal(str(config.MARCO_PCT)) / Decimal("100")
+    arrow = base * Decimal(str(config.ARROW_PCT)) / Decimal("100")
 
     return {
         "{amount}": fmt_inr(amount),
@@ -875,7 +875,7 @@ def _pay_mapping(amount: Decimal, name: str, order_id: str = "",
         "{orderid}": order_id or "",          # per-payment id, e.g. ANI7F3K9Q
         "{link}": link or "",                 # bot-generated reservation link(s)
         "{rioshare}": fmt_inr(rio),
-        "{marco}": fmt_inr(marco),
+        "{arrow}": fmt_inr(arrow),
         "{total}": str(today_count),          # count of payments today
         "{todaytotal}": fmt_inr(today_total),  # total amount collected today
     }
@@ -935,7 +935,7 @@ _TEMPLATE_TOKEN_ALIASES = {
     "orderid": "{orderid}",
     "link": "{link}",
     "rioshare": "{rioshare}",
-    "marco": "{marco}",
+    "arrow": "{arrow}",
     "total": "{total}",
     "todaytotal": "{todaytotal}",
 }
@@ -979,10 +979,10 @@ _LEGACY_PAYMENT_FIELD_PATTERNS = (
     ),
     (
         re.compile(
-            r"(?im)^\s*marco(?:'s)?\s+share\s*:\s*"
+            r"(?im)^\s*arrow(?:'s)?\s+share\s*:\s*"
             r"(?P<value>(?:₹\s*|INR\s*)?[+-]?\d[\d,]*(?:\.\d+)?)"
         ),
-        "{marco}",
+        "{arrow}",
     ),
     (
         re.compile(
@@ -1480,7 +1480,7 @@ def _required_payment_text(
         f"Amount: {mapping['{amount}']}",
         f"Name: {name}",
         f"Rio: {mapping['{rioshare}']}",
-        f"Marco: {mapping['{marco}']}",
+        f"Arrow: {mapping['{arrow}']}",
         f"Payments today: {mapping['{total}']}",
         f"Collected today: {mapping['{todaytotal}']}",
     ]
@@ -2795,11 +2795,11 @@ async def cmd_stats(event) -> None:
     day = _todays_payments()
     total = _payment_total(day)
     rio = total * Decimal(str(config.RIO_PCT)) / Decimal("100")
-    marco = total * Decimal(str(config.MARCO_PCT)) / Decimal("100")
+    arrow = total * Decimal(str(config.ARROW_PCT)) / Decimal("100")
     await _ack(
         event,
         f"Today - {fmt_inr(total)} - {len(day)} payments\n"
-        f"Rio {fmt_inr(rio)} - Marco {fmt_inr(marco)}"
+        f"Rio {fmt_inr(rio)} - Arrow {fmt_inr(arrow)}"
     )
 
 
@@ -3270,7 +3270,7 @@ HELP_TEXT = (
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
     "<code>{link}</code> buyer-bound invite link(s), private receipt only - "
-    "<code>{rioshare}</code> Rio's share - <code>{marco}</code> Marco's share - "
+    "<code>{rioshare}</code> Rio's share - <code>{arrow}</code> Arrow's share - "
     "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today\n"
     "<blockquote>Reply to a formatted post with /setdone or "
     "/setchannelpostofpayment to keep bold, links and premium emoji.</blockquote>\n"

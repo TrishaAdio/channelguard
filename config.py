@@ -60,10 +60,10 @@ ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 # Persistent fallback for the payment upload channel. ``.setchannel`` writes
 # this automatically, while data/pay.json remains the live runtime store.
 PAYMENT_CHANNEL_RAW = os.getenv("PAYMENT_CHANNEL", "")
-# Revenue split for the {rioshare}/{marco} caption parameters.
+# Revenue split for the {rioshare}/{arrow} caption parameters.
 RIO_PCT = _float("RIO_PCT", 55.0, minimum=0.0)
-MARCO_PCT = _float("MARCO_PCT", 45.0, minimum=0.0)
-# What {rioshare}/{marco} are computed from:
+ARROW_PCT = _float("ARROW_PCT", 45.0, minimum=0.0)
+# What {rioshare}/{arrow} are computed from:
 #   today       -> that % of the TOTAL amount received so far today
 #   transaction -> that % of THIS single payment's amount
 SHARE_BASE = os.getenv("SHARE_BASE", "today").strip().lower()
