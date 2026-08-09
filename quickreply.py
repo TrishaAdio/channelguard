@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import math
 import os
@@ -128,6 +129,8 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 # `/setchannelpostofpayment`.
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_SETPROOFS_RE = re.compile(r"^[./]setproofs(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_PROOF_RE = re.compile(r"^[./]proof(?:\s+(\d+))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -541,9 +544,17 @@ def _configured_post_channel() -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _configured_proof_channel() -> int | None:
+    value = config.proof_channel()
+    return value if isinstance(value, int) else None
+
+
 def _default_pay() -> dict:
     channel = _configured_post_channel()
+    proofs = _configured_proof_channel()
     return {
+        "proof_channel": proofs,
+        "proof_channel_env": proofs,
         "post_channel": channel,
         # The PAYMENT_CHANNEL value this store was last reconciled with. It is
         # what makes an operator's manual .env edit distinguishable from a .env
@@ -589,6 +600,15 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
     data["post_channel"] = post_channel
     if "post_channel_env" in data:
         data["post_channel_env"] = _optional_int(data.get("post_channel_env"))
+
+    proof_channel = _optional_int(data.get("proof_channel"))
+    if data.get("proof_channel") not in (None, "") and proof_channel is None:
+        repairs.append("invalid proof_channel removed")
+    if proof_channel is None:
+        proof_channel = _configured_proof_channel()
+    data["proof_channel"] = proof_channel
+    if "proof_channel_env" in data:
+        data["proof_channel_env"] = _optional_int(data.get("proof_channel_env"))
 
     for key, default in (
         ("done_template", DEFAULT_DONE),
@@ -686,42 +706,72 @@ def _write_pay_data(data: dict) -> None:
         os.close(descriptor)
 
 
-def _sync_env_post_channel(data: dict) -> tuple[bool, str]:
-    """Reconcile the runtime upload target with the PAYMENT_CHANNEL parameter.
+def _sync_env_channel(
+    data: dict,
+    *,
+    key: str,
+    env_key: str,
+    env_value,
+    label: str,
+) -> tuple[bool, str]:
+    """Reconcile a runtime channel target with its declared .env parameter.
 
-    ``.setchannel`` keeps .env and pay.json in step, so the two normally agree.
-    When they disagree the operator edited the parameter by hand (or restored an
-    older pay.json), and the declared parameter has to win — otherwise the
-    setting reads as applied while every receipt keeps going somewhere else.
+    ``.setchannel``/``.setproofs`` keep .env and pay.json in step, so the two
+    normally agree. When they disagree the operator edited the parameter by hand
+    (or restored an older pay.json), and the declared parameter has to win —
+    otherwise the setting reads as applied while everything keeps going
+    somewhere else.
 
-    The one case where .env must NOT win is a ``.setchannel`` whose .env write
-    failed: ``post_channel_env`` still records the value .env actually holds, so
-    a stale parameter cannot quietly move deliveries back.
+    The one case where .env must NOT win is a set command whose .env write
+    failed: ``<key>_env`` still records the value .env actually holds, so a
+    stale parameter cannot quietly move deliveries back.
 
     Returns ``(changed, note)`` where ``changed`` means the store needs saving.
     """
-    env_channel = _configured_post_channel()
-    current = _optional_int(data.get("post_channel"))
-    known_env = "post_channel_env" in data
-    seen_env = _optional_int(data.get("post_channel_env"))
+    seen_key = f"{key}_env"
+    current = _optional_int(data.get(key))
+    known_env = seen_key in data
+    seen_env = _optional_int(data.get(seen_key))
 
     note = ""
-    if env_channel is not None and env_channel != current:
+    if env_value is not None and env_value != current:
         if current is None:
-            data["post_channel"] = env_channel
-            note = f"upload channel restored from PAYMENT_CHANNEL ({env_channel})"
-        elif not known_env or env_channel != seen_env:
-            data["post_channel"] = env_channel
+            data[key] = env_value
+            note = f"{label} restored from {env_key} ({env_value})"
+        elif not known_env or env_value != seen_env:
+            data[key] = env_value
             note = (
-                f"upload channel moved to PAYMENT_CHANNEL ({env_channel}); "
+                f"{label} moved to {env_key} ({env_value}); "
                 f"pay.json still pointed at {current}"
             )
 
     changed = bool(note)
-    if not known_env or seen_env != env_channel:
-        data["post_channel_env"] = env_channel
+    if not known_env or seen_env != env_value:
+        data[seen_key] = env_value
         changed = True
     return changed, note
+
+
+def _sync_env_post_channel(data: dict) -> tuple[bool, str]:
+    """Reconcile the payment upload target with PAYMENT_CHANNEL."""
+    return _sync_env_channel(
+        data,
+        key="post_channel",
+        env_key="PAYMENT_CHANNEL",
+        env_value=_configured_post_channel(),
+        label="upload channel",
+    )
+
+
+def _sync_env_proof_channel(data: dict) -> tuple[bool, str]:
+    """Reconcile the `.proof` target with PROOF_CHANNEL."""
+    return _sync_env_channel(
+        data,
+        key="proof_channel",
+        env_key="PROOF_CHANNEL",
+        env_value=_configured_proof_channel(),
+        label="proof channel",
+    )
 
 
 def _load_pay() -> dict:
@@ -753,14 +803,19 @@ def _load_pay() -> dict:
             repairs = [f"pay.json could not be parsed ({type(e).__name__})"]
 
     if unreadable:
-        # Recover only the declared upload target; never write the file back.
+        # Recover only the declared targets; never write the file back.
         data["post_channel"] = _configured_post_channel()
         data["post_channel_env"] = data["post_channel"]
+        data["proof_channel"] = _configured_proof_channel()
+        data["proof_channel_env"] = data["proof_channel"]
         return data
 
     # A parameter change is normal operator input, not damage: reconcile it
     # before the repair write so it lands without a bogus recovery backup.
     env_changed, env_note = _sync_env_post_channel(data)
+    proof_changed, proof_note = _sync_env_proof_channel(data)
+    env_changed = env_changed or proof_changed
+    env_note = "; ".join(note for note in (env_note, proof_note) if note)
 
     if repairs:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -2866,6 +2921,20 @@ def _runtime_status_text() -> str:
             "PAYMENT_CHANNEL in .env: "
             f"{declared if declared is not None else 'NOT SET'}."
         )
+    proofs = _optional_int(_pay.get("proof_channel"))
+    parts.append(f"Proof channel: {proofs if proofs is not None else 'NOT SET'}.")
+    proof_live = _configured_proof_channel()
+    proof_recorded = (
+        _optional_int(_pay.get("proof_channel_env"))
+        if "proof_channel_env" in _pay
+        else proof_live
+    )
+    proof_declared = proof_recorded if proof_recorded != proofs else proof_live
+    if proof_declared != proofs:
+        parts.append(
+            "PROOF_CHANNEL in .env: "
+            f"{proof_declared if proof_declared is not None else 'NOT SET'}."
+        )
     pending = len(_pending_channel_payments())
     if pending:
         parts.append(f"Pending deliveries: {pending}.")
@@ -3343,6 +3412,165 @@ async def cmd_unban(event) -> None:
     await _ack(event, "\n\n".join(lines))
 
 
+# --------------------------------------------------------------------------
+# .setproofs / .proof — rendered chat screenshots
+# --------------------------------------------------------------------------
+#: How many messages `.proof` may capture in one image.
+PROOF_MAX_MESSAGES = 20
+
+
+async def cmd_setproofs(event) -> None:
+    """Set the channel `.proof` screenshots are sent to."""
+    match = _SETPROOFS_RE.match((getattr(event, "raw_text", "") or "").strip())
+    argument = (match.group(1).strip() if match and match.group(1) else "")
+
+    if argument.casefold() in ("", "here", "this"):
+        if not getattr(event, "is_channel", False):
+            await _ack(
+                event,
+                "Run .setproofs inside the target channel, or name it: "
+                ".setproofs <id|@username>",
+            )
+            return
+        chat_id = event.chat_id
+        chat = await event.get_chat()
+        title = getattr(chat, "title", None) or "this chat"
+        where = "here: "
+    else:
+        try:
+            chat_id, title = await _resolve_post_target(argument)
+        except ValueError as error:
+            await _ack(event, str(error))
+            return
+        except Exception as error:  # noqa: BLE001
+            await _ack(
+                event,
+                f"Couldn't resolve {argument}: {type(error).__name__}: {error}",
+            )
+            return
+        where = ""
+
+    # Captured before save_env(), which refreshes the live value: on a failed
+    # .env write this is what .env still holds, and remembering it keeps the
+    # next start from "adopting" that stale parameter over this new target.
+    previous_env = _configured_proof_channel()
+    _pay["proof_channel"] = int(chat_id)
+    _pay["proof_channel_env"] = int(chat_id)
+    persisted = True
+    try:
+        config.save_env({"PROOF_CHANNEL": str(chat_id)})
+    except OSError as error:
+        persisted = False
+        _pay["proof_channel_env"] = previous_env
+        ui.warn(f"Couldn't persist PROOF_CHANNEL in .env: {error}")
+
+    try:
+        _save_pay()
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Couldn't save the proof channel: {error}")
+        return
+
+    suffix = "" if persisted else "\nNot written to .env; it will not survive a restart."
+    await _ack(event, f"Proof channel set {where}{title} ({chat_id}){suffix}")
+
+
+def _proof_options(theme: str = "light"):
+    from chatshot import RenderOptions
+
+    return RenderOptions(theme=theme, width=720, scale=3)
+
+
+async def cmd_proof(event) -> None:
+    """Render the latest message(s) of this chat and post them to the proofs channel.
+
+    `.proof` takes the newest message, `.proof <n>` the newest n, and replying to
+    a message anchors the capture at that message instead.
+    """
+    match = _PROOF_RE.match((getattr(event, "raw_text", "") or "").strip())
+    count = int(match.group(1)) if match and match.group(1) else 1
+    count = max(1, min(PROOF_MAX_MESSAGES, count))
+
+    target = _optional_int(_pay.get("proof_channel"))
+    if target is None:
+        await _ack(event, "No proof channel set. Run .setproofs in the target channel.")
+        return
+
+    try:
+        from chatshot.fetch import Fetcher
+        from chatshot.render import render_png
+    except ImportError as error:
+        await _ack(
+            event,
+            "Screenshot renderer unavailable: "
+            f"{error}. Install playwright and run: python -m playwright install chromium",
+        )
+        return
+
+    reply = await event.get_reply_message()
+    try:
+        if reply is not None:
+            # Anchor at the replied message and walk forward from it.
+            messages = await client.get_messages(
+                event.chat_id, limit=count, min_id=reply.id - 1, reverse=True
+            )
+            messages = [m for m in messages][:count] or [reply]
+        else:
+            # The `.proof` command itself is the newest message in this chat and
+            # must never appear in its own screenshot.
+            fetched = await client.get_messages(
+                event.chat_id, limit=count + 5, max_id=event.id
+            )
+            messages = [m for m in fetched if m.id != event.id][:count]
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Couldn't read the chat: {type(error).__name__}: {error}")
+        return
+
+    messages = [m for m in messages if m is not None]
+    if not messages:
+        await _ack(event, "Nothing to capture in this chat.")
+        return
+
+    await _ack(event, f"Rendering {len(messages)} message(s)\u2026")
+
+    try:
+        chat = await event.get_chat()
+        fetcher = Fetcher(client, tz=_TZ)
+        conversation, emoji = await fetcher.conversation(
+            chat, messages, options=_proof_options()
+        )
+        png = await render_png(
+            conversation, emoji_src=lambda doc: emoji.get(doc, "")
+        )
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"proof render failed: {type(error).__name__}: {error}")
+        await _ack(event, f"Render failed: {type(error).__name__}: {error}")
+        return
+
+    caption = f"{conversation.meta.title} \u2014 {len(messages)} message(s)"
+    # A named stream lets Telethon infer the mime type; raw bytes would be
+    # uploaded as an unnamed document instead of a viewable image.
+    stream = io.BytesIO(png)
+    stream.name = "proof.png"
+    marker = _expect_automatic_outgoing(target, [caption])
+    try:
+        sent = await client.send_file(
+            target, stream, caption=caption, force_document=False
+        )
+        _finish_automatic_outgoing(target, marker, sent)
+    except Exception as error:  # noqa: BLE001
+        _cancel_automatic_outgoing(target, marker)
+        await _ack(event, f"Couldn't post to the proof channel: {error}")
+        return
+
+    print(
+        ui.green("[proof] ")
+        + f"{len(messages)} msg(s) from {event.chat_id} -> {target} "
+        + f"({len(png)//1024}KB)",
+        flush=True,
+    )
+    await _ack(event, f"Proof posted to {target}.")
+
+
 async def _notify_owner(text: str) -> None:
     """Send a note to the configured OWNER (falls back to Saved Messages)."""
     target = config.owner() or _state.get("self_id") or "me"
@@ -3436,6 +3664,13 @@ HELP_TEXT = (
     "<code>/stats</code> - today's total, count, and split\n"
     "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake, remove it from stats, and revoke buyer-bound access\n"
     "<code>/clear</code> - reset today's stats to zero\n\n"
+    "<b>Proof screenshots</b> (any chat)\n"
+    "<code>.setproofs</code> - type it in the target channel, or "
+    "<code>.setproofs &lt;id|@username&gt;</code> from anywhere\n"
+    "<code>.proof</code> - render this chat's latest message as a macOS-style "
+    "screenshot and post it to the proof channel\n"
+    "<code>.proof &lt;n&gt;</code> - the latest n messages (max "
+    f"{PROOF_MAX_MESSAGES}); reply to a message to start from it instead\n\n"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
@@ -3818,6 +4053,13 @@ async def _handle_outgoing(event):
     if _SETCHANNEL_RE.match(raw_text.strip()):
         async with _payment_lock:
             await cmd_setchannel(event)
+        return
+    if _SETPROOFS_RE.match(raw_text.strip()):
+        async with _payment_lock:
+            await cmd_setproofs(event)
+        return
+    if _PROOF_RE.match(raw_text.strip()):
+        await cmd_proof(event)
         return
     if _UNBAN_RE.match(raw_text.strip()):
         await cmd_unban(event)
