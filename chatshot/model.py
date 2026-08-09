@@ -217,6 +217,11 @@ class RenderOptions:
     #: Backdrop behind the window shadow. Kept opaque because Telegram
     #: re-encodes photos as JPEG and would flatten alpha to black.
     backdrop: str = "auto"
+    #: Fixed chat-pane height in CSS px. Set it to render "one screenful" the way
+    #: a real window screenshot looks: newest message at the bottom, older ones
+    #: filling upward, and whatever does not fit clipped at the top edge. Leave
+    #: None to size the image to its content instead.
+    page_height: Optional[int] = None
 
 
 @dataclass

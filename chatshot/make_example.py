@@ -11,7 +11,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from .fixtures import sample_conversation
+from .fixtures import page_conversation
 from .render import render_png_sync
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "docs"
@@ -29,7 +29,7 @@ TARGETS = {
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for theme, filename in TARGETS.items():
-        conversation = sample_conversation(theme)
+        conversation = page_conversation(theme)
         conversation.options.scale = EXAMPLE_SCALE
         png = render_png_sync(conversation)
         path = OUT_DIR / filename

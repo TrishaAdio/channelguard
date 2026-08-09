@@ -182,6 +182,39 @@ def sample_conversation(theme: str = "light") -> Conversation:
     )
 
 
+def page_conversation(theme: str = "light") -> Conversation:
+    """`sample_conversation` with enough earlier history to fill a page.
+
+    Used for the README images so they show what `.proof` actually produces:
+    a fixed landscape pane whose top message is clipped by the window edge.
+    """
+    conversation = sample_conversation(theme)
+    buyer = conversation.messages[0].sender
+    base = conversation.messages[0].ts
+    earlier = [
+        Msg(
+            id=100 + index,
+            sender=buyer,
+            ts=base - timedelta(minutes=40 - index),
+            text=text,
+        )
+        for index, text in enumerate(
+            [
+                "yo bhai",
+                "saw the channel post",
+                "how much for indian pack",
+                "and delhi one?",
+                "both available na",
+                "sending now",
+            ]
+        )
+    ]
+    conversation.messages = earlier + conversation.messages
+    conversation.options.width = 900
+    conversation.options.page_height = 620
+    return conversation
+
+
 def entity_showcase(theme: str = "light") -> Conversation:
     """Every supported entity type in one bubble, for visual verification."""
     base = datetime(2026, 8, 9, 14, 5)

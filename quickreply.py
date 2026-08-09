@@ -3415,8 +3415,17 @@ async def cmd_unban(event) -> None:
 # --------------------------------------------------------------------------
 # .setproofs / .proof — rendered chat screenshots
 # --------------------------------------------------------------------------
-#: How many messages `.proof` may capture in one image.
-PROOF_MAX_MESSAGES = 20
+#: How many messages `.proof <n>` may capture in one image.
+PROOF_MAX_MESSAGES = 40
+#: One captured "screenful", in CSS px. Landscape on purpose: a real Mac/laptop
+#: chat window is wider than it is tall, and a portrait crop reads as a phone.
+PROOF_PAGE_WIDTH = 900
+PROOF_PAGE_HEIGHT = 620
+#: Messages fetched for a page capture. The page height decides how many are
+#: actually visible; the rest are clipped at the top edge like a real screenshot.
+#: Sized as an upper bound for a page of one-line messages, because everything
+#: fetched beyond what fits costs an avatar/media download for nothing.
+PROOF_PAGE_MESSAGES = 16
 
 
 async def cmd_setproofs(event) -> None:
@@ -3474,10 +3483,21 @@ async def cmd_setproofs(event) -> None:
     await _ack(event, f"Proof channel set {where}{title} ({chat_id}){suffix}")
 
 
-def _proof_options(theme: str = "light"):
+def _proof_options(theme: str = "light", *, page: bool = True):
+    """Render options for `.proof`.
+
+    `page=True` fixes the pane height so the result looks like a screenshot of a
+    real chat window. An explicit `.proof <n>` sizes the image to those n
+    messages instead, so nothing the operator asked for gets cropped away.
+    """
     from chatshot import RenderOptions
 
-    return RenderOptions(theme=theme, width=720, scale=3)
+    return RenderOptions(
+        theme=theme,
+        width=PROOF_PAGE_WIDTH if page else 720,
+        scale=3,
+        page_height=PROOF_PAGE_HEIGHT if page else None,
+    )
 
 
 async def cmd_proof(event) -> None:
@@ -3487,8 +3507,14 @@ async def cmd_proof(event) -> None:
     a message anchors the capture at that message instead.
     """
     match = _PROOF_RE.match((getattr(event, "raw_text", "") or "").strip())
-    count = int(match.group(1)) if match and match.group(1) else 1
-    count = max(1, min(PROOF_MAX_MESSAGES, count))
+    explicit = match.group(1) if match and match.group(1) else ""
+    # Bare `.proof` captures a screenful. A number means "exactly these n".
+    page_mode = not explicit
+    limit = (
+        PROOF_PAGE_MESSAGES
+        if page_mode
+        else max(1, min(PROOF_MAX_MESSAGES, int(explicit)))
+    )
 
     target = _optional_int(_pay.get("proof_channel"))
     if target is None:
@@ -3507,36 +3533,44 @@ async def cmd_proof(event) -> None:
         return
 
     reply = await event.get_reply_message()
+    # The capture ends at the newest message shown. Without a reply that is the
+    # message just before `.proof` itself, which must never appear in its own
+    # screenshot; with a reply it is the replied message, so its context appears
+    # above it exactly as it would on screen.
+    anchor_id = reply.id if reply is not None else event.id - 1
     try:
-        if reply is not None:
-            # Anchor at the replied message and walk forward from it.
-            messages = await client.get_messages(
-                event.chat_id, limit=count, min_id=reply.id - 1, reverse=True
-            )
-            messages = [m for m in messages][:count] or [reply]
-        else:
-            # The `.proof` command itself is the newest message in this chat and
-            # must never appear in its own screenshot.
-            fetched = await client.get_messages(
-                event.chat_id, limit=count + 5, max_id=event.id
-            )
-            messages = [m for m in fetched if m.id != event.id][:count]
+        fetched = await client.get_messages(
+            event.chat_id, limit=limit + 5, max_id=anchor_id + 1
+        )
+        # get_messages returns newest-first; take the newest `limit` of them and
+        # then put them back in reading order rather than relying on the
+        # renderer's internal sort.
+        messages = [
+            m for m in fetched if m is not None and m.id <= anchor_id
+        ][:limit]
+        messages.sort(key=lambda m: m.id)
     except Exception as error:  # noqa: BLE001
         await _ack(event, f"Couldn't read the chat: {type(error).__name__}: {error}")
         return
+    if not messages and reply is not None:
+        messages = [reply]
 
     messages = [m for m in messages if m is not None]
     if not messages:
         await _ack(event, "Nothing to capture in this chat.")
         return
 
-    await _ack(event, f"Rendering {len(messages)} message(s)\u2026")
+    await _ack(
+        event,
+        "Rendering a page\u2026" if page_mode
+        else f"Rendering {len(messages)} message(s)\u2026",
+    )
 
     try:
         chat = await event.get_chat()
         fetcher = Fetcher(client, tz=_TZ)
         conversation, emoji = await fetcher.conversation(
-            chat, messages, options=_proof_options()
+            chat, messages, options=_proof_options(page=page_mode)
         )
         png = await render_png(
             conversation, emoji_src=lambda doc: emoji.get(doc, "")
@@ -3558,7 +3592,9 @@ async def cmd_proof(event) -> None:
         await _ack(event, f"Render failed \u2014 {summary}")
         return
 
-    caption = f"{conversation.meta.title} \u2014 {len(messages)} message(s)"
+    caption = conversation.meta.title
+    if not page_mode:
+        caption += f" \u2014 {len(messages)} message(s)"
     # A named stream lets Telethon infer the mime type; raw bytes would be
     # uploaded as an unnamed document instead of a viewable image.
     stream = io.BytesIO(png)
@@ -3694,10 +3730,12 @@ HELP_TEXT = (
     "<b>Proof screenshots</b> (any chat)\n"
     "<code>.setproofs</code> - type it in the target channel, or "
     "<code>.setproofs &lt;id|@username&gt;</code> from anywhere\n"
-    "<code>.proof</code> - render this chat's latest message as a macOS-style "
-    "screenshot and post it to the proof channel\n"
-    "<code>.proof &lt;n&gt;</code> - the latest n messages (max "
-    f"{PROOF_MAX_MESSAGES}); reply to a message to start from it instead\n\n"
+    "<code>.proof</code> - capture a full screenful of this chat as a "
+    "macOS-style window screenshot and post it to the proof channel\n"
+    "<code>.proof &lt;n&gt;</code> - exactly the latest n messages, uncropped "
+    f"(max {PROOF_MAX_MESSAGES})\n"
+    "<blockquote>Reply to a message and the capture ends there, with its "
+    "context above it.</blockquote>"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "

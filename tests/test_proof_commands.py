@@ -208,7 +208,8 @@ def test_proof_never_captures_its_own_command_message(monkeypatch) -> None:
 
         captured = [m.id for m in seen["messages"]]
         assert 500 not in captured, "the .proof command leaked into its own capture"
-        assert captured == [499]
+        # Bare `.proof` captures a page, so it takes the surrounding history too.
+        assert captured == [497, 498, 499]
         assert client.sent and client.sent[0][0] == -100555
 
     asyncio.run(scenario())
@@ -237,7 +238,7 @@ def test_proof_count_is_parsed_and_clamped(monkeypatch) -> None:
         quickreply._pay = quickreply._default_pay()
         quickreply._pay["proof_channel"] = -100555
         seen = _install_render_stubs(monkeypatch)
-        client = FakeClient(_msgs(*range(1, 40)))
+        client = FakeClient(_msgs(*range(1, 90)))
         monkeypatch.setattr(quickreply, "client", client)
 
         await quickreply.cmd_proof(Event(".proof 3", msg_id=100))
@@ -260,7 +261,8 @@ def test_proof_anchors_at_a_replied_message(monkeypatch) -> None:
         reply = SimpleNamespace(id=11, date=11, message="m11")
         await quickreply.cmd_proof(Event(".proof 2", msg_id=99, reply=reply))
 
-        assert [m.id for m in seen["messages"]] == [11, 12]
+        # The capture ends at the replied message, with its context above it.
+        assert [m.id for m in seen["messages"]] == [10, 11]
 
     asyncio.run(scenario())
 
@@ -363,3 +365,84 @@ def test_ping_reports_a_proof_channel_divergence(monkeypatch) -> None:
 def test_help_documents_the_proof_commands() -> None:
     assert ".setproofs" in quickreply.HELP_TEXT
     assert ".proof" in quickreply.HELP_TEXT
+
+
+
+# --------------------------------------------------------------------------
+# page mode: `.proof` captures a screenful, not a single message
+# --------------------------------------------------------------------------
+
+
+def test_bare_proof_captures_a_page_not_one_message(monkeypatch) -> None:
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["proof_channel"] = -100555
+        seen = _install_render_stubs(monkeypatch)
+        monkeypatch.setattr(quickreply, "client", FakeClient(_msgs(*range(1, 60))))
+
+        event = Event(".proof", msg_id=100)
+        await quickreply.cmd_proof(event)
+
+        assert len(seen["messages"]) == quickreply.PROOF_PAGE_MESSAGES
+        assert len(seen["messages"]) > 1
+        # A fixed pane height is what makes it look like a window screenshot.
+        assert seen["options"].page_height == quickreply.PROOF_PAGE_HEIGHT
+        assert "Rendering a page" in event.edits[0]
+
+    asyncio.run(scenario())
+
+
+def test_explicit_count_sizes_to_content_instead_of_cropping(monkeypatch) -> None:
+    """`.proof 5` must show all five, so it must not be clipped to a page."""
+
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["proof_channel"] = -100555
+        seen = _install_render_stubs(monkeypatch)
+        monkeypatch.setattr(quickreply, "client", FakeClient(_msgs(*range(1, 60))))
+
+        await quickreply.cmd_proof(Event(".proof 5", msg_id=100))
+
+        assert len(seen["messages"]) == 5
+        assert seen["options"].page_height is None
+
+    asyncio.run(scenario())
+
+
+def test_the_page_is_landscape_like_a_desktop_window() -> None:
+    """A portrait crop reads as a phone screenshot, not a Mac window."""
+    assert quickreply.PROOF_PAGE_WIDTH > quickreply.PROOF_PAGE_HEIGHT
+    options = quickreply._proof_options(page=True)
+    assert options.width == quickreply.PROOF_PAGE_WIDTH
+    assert options.page_height == quickreply.PROOF_PAGE_HEIGHT
+
+
+def test_page_fetch_is_bounded_to_what_can_fit() -> None:
+    """Every message fetched beyond the visible page costs a media download."""
+    # ~40px per grouped one-line bubble is the tightest realistic row height.
+    assert quickreply.PROOF_PAGE_MESSAGES <= quickreply.PROOF_PAGE_HEIGHT // 38
+
+
+def test_page_mode_clips_to_a_fixed_height() -> None:
+    from datetime import datetime, timedelta
+
+    from chatshot.html import build_html
+    from chatshot.model import ChatMeta, Conversation, Msg, RenderOptions, Sender
+
+    base = datetime(2026, 8, 9, 21, 0)
+    sender = Sender(id=7, name="X")
+    messages = [
+        Msg(id=i, sender=sender, ts=base + timedelta(minutes=i), text=f"line {i}")
+        for i in range(1, 30)
+    ]
+    conversation = Conversation(
+        messages=messages,
+        meta=ChatMeta(title="X", is_private=True),
+        options=RenderOptions(page_height=620),
+    )
+    html = build_html(conversation)
+    assert 'class="pane wp page"' in html
+    assert 'style="height:620px"' in html
+
+    conversation.options.page_height = None
+    assert "page" not in build_html(conversation).split("id=\"pane\"")[1][:60]

@@ -209,8 +209,9 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
 | `.setproofs` (typed in a channel) or `.setproofs <id \| @username \| t.me link>` (from any chat) | set the channel `.proof` posts to, and persist it as `PROOF_CHANNEL` in `.env` |
-| `.proof` | render this chat's latest message as a macOS-style screenshot and post it to the proof channel |
-| `.proof <n>` | the latest `n` messages (max 20); reply to a message to anchor the capture there instead |
+| `.proof` | capture a full screenful of this chat as a macOS-style window screenshot and post it to the proof channel |
+| `.proof <n>` | exactly the latest `n` messages, uncropped (max 40) |
+| reply + `.proof` | the capture ends at the replied message, with its context above it |
 | `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
 | `.help` | show every command and template parameter |
 
@@ -268,10 +269,16 @@ ratio. Text shaping, wrapping and emoji fallback are done by the browser, which
 is what makes the output crisp rather than hand-drawn.
 
 ```
-.proof            the newest message in this chat
-.proof 5          the newest 5 messages (max 20)
-reply + .proof 3  3 messages starting at the replied one
+.proof            one full screenful of this chat  (the normal case)
+.proof 5          exactly the newest 5 messages, uncropped
+reply + .proof    a screenful ending at the replied message
 ```
+
+Bare `.proof` renders **a page, not a message**: a fixed 900x620 landscape pane
+with the newest message at the bottom, older ones filling upward, and whatever
+does not fit clipped at the top edge — which is what a screenshot of a scrolled
+chat window actually looks like. `.proof <n>` instead sizes the image to exactly
+those `n` messages, so nothing you asked for gets cropped away.
 
 The `.proof` command message is always excluded from its own screenshot.
 

@@ -51,6 +51,12 @@ body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 
 /* ---- wallpaper ---- */
 #pane{position:relative;padding:14px 16px 18px;background:var(--bg)}
+/* One screenful: pin the conversation to the bottom like a live chat window and
+   let anything that does not fit fall off the top edge, which is exactly what a
+   real screenshot of a scrolled chat looks like. */
+#pane.page{display:flex;flex-direction:column;justify-content:flex-end;
+  overflow:hidden}
+#pane.page > .row:first-child,#pane.page > .sep:first-child{margin-top:0}
 #pane.wp{
   background:
     radial-gradient(70% 70% at 18% 22%, var(--wp1) 0%, transparent 60%),
@@ -620,13 +626,20 @@ body{{font-family:var(--font),'Noto Sans Devanagari','Noto Color Emoji',sans-ser
     # "plain" is a documented preset, so it has to actually mean a flat
     # background rather than quietly falling back to the mesh.
     use_mesh = options.wallpaper and options.wallpaper_preset != "plain"
-    pane_class = "pane wp" if use_mesh else "pane"
+    pane_classes = ["pane"]
+    if use_mesh:
+        pane_classes.append("wp")
+    pane_style = ""
+    if options.page_height:
+        pane_classes.append("page")
+        pane_style = f' style="height:{int(options.page_height)}px"'
+    pane_class = " ".join(pane_classes)
 
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<style>{root}{_CSS}</style></head><body>"
         f'<div id="shot"><div id="win" class="{win_class.strip()}">'
-        f'{bar}<div id="pane" class="{pane_class}">{"".join(stream)}</div>'
+        f'{bar}<div id="pane" class="{pane_class}"{pane_style}>{"".join(stream)}</div>'
         "</div></div>"
         f"<script>{_SCRIPT}</script></body></html>"
     )
