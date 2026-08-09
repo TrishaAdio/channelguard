@@ -424,11 +424,19 @@ def _swap_link(text: str, entities, new_link: str):
             e.url = new_link
             changed = True
 
-    # (b) a raw invite link in the visible text -> swap + shift offsets
+    # (b) raw invite links in the visible text -> swap + shift offsets.
+    # Every occurrence is replaced: a post carrying two raw invite links used to
+    # keep the second, revoked one live after a rotation.
     new_text = text or ""
-    m = FIND_LINK_RE.search(new_text)
-    if m and m.group(0) != new_link:
+    cursor = 0
+    while True:
+        m = FIND_LINK_RE.search(new_text, cursor)
+        if not m:
+            break
         old = m.group(0)
+        if old == new_link:
+            cursor = m.end()
+            continue
         pi = m.start()
         o = _u16(new_text[:pi])
         old_len = _u16(old)
@@ -445,6 +453,7 @@ def _swap_link(text: str, entities, new_link: str):
                 e.length = max(0, e.length + delta)  # covers/equals -> resize
         new_text = new_text[:pi] + new_link + new_text[pi + len(old):]
         changed = True
+        cursor = pi + len(new_link)
 
     return (new_text, entities) if changed else None
 
@@ -721,14 +730,33 @@ def _load_pay() -> dict:
 
     raw_bytes = b""
     repairs = []
+    unreadable = False
     try:
         raw_bytes = config.PAY_FILE.read_bytes()
-        raw = raw_bytes.decode("utf-8")
-        value = json.loads(raw)
-        data, repairs = _normalize_pay_data(value)
-    except (UnicodeError, ValueError, OSError) as e:
+    except OSError as e:
+        # The file exists but could not be read at all. Its contents are
+        # unknown, so overwriting it would destroy the payment log, both
+        # templates and the upload target with no recovery copy.
+        unreadable = True
         data = _default_pay()
-        repairs = [f"pay.json could not be read ({type(e).__name__})"]
+        ui.warn(
+            f"pay.json exists but could not be read ({type(e).__name__}: {e}). "
+            "Payment data is NOT loaded and will not be overwritten; fix the "
+            "file or its permissions and restart."
+        )
+    if not unreadable:
+        try:
+            value = json.loads(raw_bytes.decode("utf-8"))
+            data, repairs = _normalize_pay_data(value)
+        except (UnicodeError, ValueError) as e:
+            data = _default_pay()
+            repairs = [f"pay.json could not be parsed ({type(e).__name__})"]
+
+    if unreadable:
+        # Recover only the declared upload target; never write the file back.
+        data["post_channel"] = _configured_post_channel()
+        data["post_channel_env"] = data["post_channel"]
+        return data
 
     # A parameter change is normal operator input, not damage: reconcile it
     # before the repair write so it lands without a bogus recovery backup.
@@ -1142,6 +1170,11 @@ async def _resolve_template(kind: str):
             ents = list(src.entities or [])
             if not ents:
                 ui.warn(f"{kind} template: source post has no formatting/entities.")
+                # With no formatting to recover there is nothing the source post
+                # can add, and the saved template is the canonical one. Trusting
+                # the post instead let a later edit silently rewrite the
+                # template the operator was told had been saved.
+                return text or (src.message or ""), []
             return src.message or text, ents
     if not text:
         return "", []
@@ -1529,7 +1562,10 @@ def _decorate_channel_output(text: str, entries: list) -> str:
 
 
 _PRIVATE_INVITE_RE = re.compile(
-    r"https?://(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
+    # The scheme is optional on purpose: Telegram renders a bare `t.me/+hash`
+    # as a working invite, so a scrubber that required https:// would let one
+    # through. Sanitization must never be narrower than FIND_LINK_RE detection.
+    r"(?:https?://)?(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
     re.IGNORECASE,
 )
 
@@ -1593,6 +1629,89 @@ def _split_plain_text(
     if current:
         chunks.append(current)
     return chunks or [header or ""]
+
+
+async def _send_receipt_to_peer(peer: int, payloads: list) -> bool:
+    """Send receipt chunks to one private peer, degrading entities if rejected."""
+    marker = _expect_automatic_outgoing(peer, [body for body, _ents in payloads])
+    results = []
+    try:
+        for body, ents in payloads:
+            last_error = None
+            for attempt in _entity_fallbacks(ents):
+                try:
+                    results.append(
+                        await client.send_message(
+                            peer,
+                            body,
+                            formatting_entities=list(attempt) or None,
+                            link_preview=False,
+                        )
+                    )
+                    last_error = None
+                    break
+                except Exception as error:  # noqa: BLE001
+                    last_error = error
+                    if not _is_entity_error(error):
+                        raise
+            if last_error is not None:
+                raise last_error
+    except Exception as error:  # noqa: BLE001
+        _cancel_automatic_outgoing(peer, marker)
+        ui.warn(
+            f"Private receipt to {peer} failed: {type(error).__name__}: {error}"
+        )
+        return False
+    _finish_automatic_outgoing(peer, marker, results)
+    return True
+
+
+async def _deliver_receipt_privately(
+    event,
+    peer: int,
+    text: str,
+    entities,
+    amount: Decimal,
+    name: str,
+    order_id: str,
+    entries: list,
+    failures: list,
+) -> bool:
+    """Deliver a link-bearing receipt to a DM, never to the command chat.
+
+    `/add` is accepted in any chat, but buyer-bound invite URLs must stay
+    private. When the command was not typed in a private chat the receipt is
+    sent to the payer's DM and the command chat only gets a scrubbed summary.
+    """
+    if _u16(text) <= 4096:
+        payloads = [(text, list(entities or []))]
+    else:
+        fallback = _required_payment_text(
+            amount, name, order_id, entries, failures, include_current=True
+        )
+        payloads = [
+            (chunk, [])
+            for chunk in _split_plain_text(fallback, header=f"Order ID: {order_id}")
+        ]
+    if not await _send_receipt_to_peer(peer, payloads):
+        return False
+    summary = _PRIVATE_INVITE_RE.sub(
+        "[private link delivered in DM]",
+        _required_payment_text(
+            amount,
+            name,
+            order_id,
+            entries,
+            failures,
+            include_current=True,
+            expose_links=False,
+        ),
+    )
+    await _ack(
+        event,
+        f"{summary}\n\nLink(s) sent privately to {peer}.",
+    )
+    return True
 
 
 async def _deliver_payment_receipt(
@@ -1990,13 +2109,16 @@ def _fit_media_caption(text: str, entities, preserve="", limit: int = 1024):
     if clipped_required:
         prefix = " | ".join(required) + "\n"
         keep = prefix_length(max(0, limit - _u16(prefix)))
-        # Do not leave a partial duplicate of required metadata at the end.
-        duplicate_positions = [
-            position for _value, position in positions
-            if 0 <= position < keep
+        # Do not leave a *partial* duplicate of required metadata at the cut.
+        # Only an occurrence that straddles the boundary matters: pulling `keep`
+        # back to any complete occurrence inside the kept region threw away the
+        # entire body whenever a preserved value appeared early in the template.
+        straddling = [
+            position for value, position in positions
+            if 0 <= position < keep < position + len(value)
         ]
-        if duplicate_positions:
-            keep = min(duplicate_positions)
+        if straddling:
+            keep = min(straddling)
 
     clipped = prefix + text[:keep]
     final_length = _u16(clipped)
@@ -2225,7 +2347,14 @@ async def cmd_add(event) -> None:
     order_id = _generate_order_id()
 
     reply = await event.get_reply_message()
-    has_media = bool(reply and reply.media)
+    # A link preview is not an uploadable receipt: send_file() can never post a
+    # MessageMediaWebPage, so treating it as media queued a channel upload that
+    # failed permanently and was retried forever.
+    has_media = bool(
+        reply
+        and reply.media
+        and not isinstance(reply.media, MessageMediaWebPage)
+    )
 
     # 1) Send one batched request to the BOT. The userbot never searches groups
     #    or reuses the guard's /demo link for a payment.
@@ -2241,6 +2370,17 @@ async def cmd_add(event) -> None:
         if not payer_id:
             await _ack(event, "Can't tell who paid - run /add in the customer's DM "
                               "or reply to their message.")
+            return
+        # A channel post's sender_id is the channel itself. Binding a
+        # single-use link to a channel id is meaningless and would publish the
+        # buyer's link to everyone reading that channel.
+        if int(payer_id) <= 0:
+            await _ack(
+                event,
+                "That reply was posted by a channel, not a user, so there is "
+                "nobody to bind the link to. Reply to the buyer's own message "
+                "or run /add in their DM.",
+            )
             return
         if linkstore is None:
             await _ack(event, "Bot bridge unavailable.")
@@ -2349,16 +2489,32 @@ async def cmd_add(event) -> None:
 
     # 2) Deliver the private receipt first. This is the authoritative commit:
     # startup recovery only compensates records that never reached this point.
-    receipt_sent = await _deliver_payment_receipt(
-        event,
-        us_text,
-        us_ents,
-        amount,
-        accname,
-        order_id,
-        entries,
-        failures,
-    )
+    # Editing the command message is only safe in a private chat: in a group or
+    # channel that would publish the buyer-bound invite URLs, so those are
+    # routed to the payer's DM instead.
+    if entries and not event.is_private and payer_id:
+        receipt_sent = await _deliver_receipt_privately(
+            event,
+            int(payer_id),
+            us_text,
+            us_ents,
+            amount,
+            accname,
+            order_id,
+            entries,
+            failures,
+        )
+    else:
+        receipt_sent = await _deliver_payment_receipt(
+            event,
+            us_text,
+            us_ents,
+            amount,
+            accname,
+            order_id,
+            entries,
+            failures,
+        )
     if not receipt_sent:
         await _fail_payment(
             event, payment, request_id, "Could not deliver the payment receipt."
@@ -2691,10 +2847,21 @@ def _runtime_status_text() -> str:
         f"Quick-reply userbot is running ({QUICKREPLY_BUILD}).",
         f"Payment channel: {target if target is not None else 'NOT SET'}.",
     ]
-    declared = _configured_post_channel()
+    live_env = _configured_post_channel()
+    # `save_env` refreshes the in-process parameter before it writes, so after a
+    # failed `.env` write `live_env` already reports the new target and cannot
+    # witness the divergence. `post_channel_env` is what `.env` still holds, so
+    # it is the authority whenever the two disagree.
+    recorded_env = (
+        _optional_int(_pay.get("post_channel_env"))
+        if "post_channel_env" in _pay
+        else live_env
+    )
+    declared = recorded_env if recorded_env != target else live_env
     if declared != target:
-        # Only reachable when a `.setchannel` could not write .env, and the two
-        # would diverge again after a restart. Surface it instead of hiding it.
+        # Reachable when a `.setchannel` could not write .env, or .env was
+        # hand-edited while running: the two would diverge again after a
+        # restart. Surface it instead of hiding it.
         parts.append(
             "PAYMENT_CHANNEL in .env: "
             f"{declared if declared is not None else 'NOT SET'}."
@@ -3029,7 +3196,10 @@ async def _ban_state(chat, user_id: int) -> tuple[bool, object]:
         await asyncio.sleep(min(int(error.seconds), 60) + 1)
         return False, None
     except UserNotParticipantError:
-        return False, None          # definitively not banned in this chat
+        # Not conclusive: a removed-and-banned user is not a participant, yet
+        # still sits in the chat's kicked list. Check that list before deciding
+        # there is no ban, which is the whole point of `.unban`.
+        pass
     except (AttributeError, TypeError, ValueError):
         pass                        # unknown id: recover it from the ban list
     except Exception:  # noqa: BLE001 - no admin rights, not a channel, ...

@@ -187,6 +187,11 @@ async def init() -> None:
     await _ensure_column(
         "order_links", "buyer_banned", "INTEGER NOT NULL DEFAULT 0"
     )
+    # Stamped on every lifecycle transition so a reservation abandoned in a
+    # transient state ('expiring'/'cancelling') can be detected and resumed.
+    await _ensure_column(
+        "reservations", "updated_at", "REAL NOT NULL DEFAULT 0"
+    )
     await _conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_command_key "
         "ON orders(command_key) WHERE command_key != ''"
@@ -277,7 +282,11 @@ async def upsert_group(
         VALUES (?,?,?,?,?,?,?,?,?)
         ON CONFLICT(chat_id) DO UPDATE SET
             title=excluded.title,
-            short_code=excluded.short_code,
+            -- A short code the owner may already have shared must survive a
+            -- demotion/re-add, which upserts the group with an empty code.
+            short_code=COALESCE(
+                NULLIF(excluded.short_code, ''), groups.short_code
+            ),
             chat_type=excluded.chat_type,
             username=excluded.username,
             invite_link=COALESCE(excluded.invite_link, groups.invite_link),
@@ -495,9 +504,16 @@ async def create_next_order(
                 if existing:
                     await connection.commit()
                     return str(existing["order_id"])
+            # `_` and `%` are LIKE wildcards: an ORDER_PREFIX containing
+            # either would match foreign ids and inflate the sequence.
+            like_prefix = (
+                prefix.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
             cur = await connection.execute(
-                "SELECT order_id FROM orders WHERE order_id LIKE ?",
-                (prefix + "%",),
+                "SELECT order_id FROM orders WHERE order_id LIKE ? ESCAPE '\\'",
+                (like_prefix + "%",),
             )
             rows = await cur.fetchall()
             await cur.close()
@@ -848,6 +864,7 @@ async def claim_reservation_status(
         status,
         error[:500],
         approved_at,
+        now,
         reservation_id,
         *sorted(expected_statuses),
     )
@@ -856,7 +873,8 @@ async def claim_reservation_status(
             f"""
             UPDATE reservations SET
                 status=?, last_error=?,
-                approved_at=COALESCE(?, approved_at)
+                approved_at=COALESCE(?, approved_at),
+                updated_at=?
             WHERE id=? AND status IN ({placeholders})
             """,
             params,
@@ -872,17 +890,20 @@ async def set_reservation_status(
 ) -> None:
     now = time.time()
     approved_at = now if status in {"approving", "approved_revoke_pending"} else None
-    revoked_at = now if status == "completed" else None
+    # Every terminal state means the link is no longer reusable; stamping only
+    # 'completed' left the audit column empty for cancelled/expired seats.
+    revoked_at = now if status in {"completed", "cancelled", "expired"} else None
     await _run(
         """
         UPDATE reservations SET
             status=?,
             last_error=?,
             approved_at=COALESCE(?, approved_at),
-            revoked_at=COALESCE(?, revoked_at)
+            revoked_at=COALESCE(?, revoked_at),
+            updated_at=?
         WHERE id=?
         """,
-        (status, error[:500], approved_at, revoked_at, reservation_id),
+        (status, error[:500], approved_at, revoked_at, now, reservation_id),
     )
 
 
@@ -907,13 +928,18 @@ async def reservations_for_order(order_id: str) -> list[aiosqlite.Row]:
 async def pending_reservation_revocations(
     approving_before: float,
 ) -> list[aiosqlite.Row]:
+    # 'expiring'/'cancelling' are claimed transiently before the invite link is
+    # revoked. A crash in that window used to strand the row forever with a
+    # live link, which is the exact leak this ladder exists to prevent, so
+    # stale ones are resumed here alongside the explicit *_pending states.
     return await _all(
         "SELECT * FROM reservations "
         "WHERE status IN ('approved_revoke_pending', 'cancel_requested', "
         "'cancel_revoke_pending', 'expire_revoke_pending') "
         "OR (status='approving' AND approved_at<=?) "
+        "OR (status IN ('expiring', 'cancelling') AND updated_at<=?) "
         "ORDER BY approved_at, created_at",
-        (approving_before,),
+        (approving_before, approving_before),
     )
 
 
@@ -977,19 +1003,38 @@ async def reconcile_order_status(order_id: str) -> None:
         await set_order_status(order_id, "removed")
 
 
+#: Statuses whose links/buyers are still being cleaned up by
+#: `pending_order_link_revocations`, plus the terminal states those settle
+#: into. Overwriting any of them silently drops the order out of the only
+#: retry driver there is, leaving live links and un-removed buyers behind.
+CLEANUP_STATUSES = frozenset(
+    {
+        "remove_pending",
+        "removed",
+        "revoke_pending",
+        "revoked",
+        "joined_revoke_pending",
+    }
+)
+
+
 async def reconcile_order_expiry(order_id: str) -> None:
     """Aggregate per-link reservation expiry without hiding surviving links."""
     row = await _one(
-        "SELECT "
+        "SELECT status, "
         "EXISTS(SELECT 1 FROM order_links "
         "WHERE order_id=? AND revoked=0) AS has_open "
         "FROM orders WHERE order_id=?",
         (order_id, order_id),
     )
-    if row:
-        await set_order_status(
-            order_id, "partially_expired" if row["has_open"] else "expired"
-        )
+    if not row:
+        return
+    # One seat expiring must never cancel the cleanup another seat is owed.
+    if row["status"] in CLEANUP_STATUSES:
+        return
+    await set_order_status(
+        order_id, "partially_expired" if row["has_open"] else "expired"
+    )
 
 
 # --- events ---------------------------------------------------------------
@@ -1032,21 +1077,31 @@ async def pending_member_bans() -> list[aiosqlite.Row]:
     )
 
 
-async def cancel_member_bans(user_id: int) -> int:
-    """Stop enforcing every journalled permanent ban for one user.
+async def cancel_member_bans(
+    user_id: int, chat_id: Optional[int] = None
+) -> int:
+    """Stop enforcing journalled permanent bans for one user.
 
-    Called when the owner unbans somebody. The rows are kept for the audit
-    trail but leave the 'pending' state, so no retry re-applies them.
+    Called when the owner unbans somebody, and whenever the bot deliberately
+    removes a user *without* a lasting ban — otherwise the retry loop simply
+    re-applies the journalled ban on its next pass. Pass `chat_id` to scope the
+    release to a single group; a ban earned in another group is left alone. The
+    rows are kept for the audit trail but leave the 'pending' state, so no
+    retry re-applies them.
     """
+    condition = "user_id=? AND status!='cancelled'"
+    params: tuple = (user_id,)
+    if chat_id is not None:
+        condition += " AND chat_id=?"
+        params = (user_id, chat_id)
     rows = await _all(
-        "SELECT chat_id FROM member_bans WHERE user_id=? AND status!='cancelled'",
-        (user_id,),
+        f"SELECT chat_id FROM member_bans WHERE {condition}", params
     )
     if rows:
         await _run(
             "UPDATE member_bans SET status='cancelled', last_error='', "
-            "updated_at=? WHERE user_id=? AND status!='cancelled'",
-            (time.time(), user_id),
+            f"updated_at=? WHERE {condition}",
+            (time.time(), *params),
         )
     return len(rows)
 
