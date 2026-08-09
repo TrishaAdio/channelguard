@@ -75,7 +75,10 @@ dp = Dispatcher()
 _GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
 _bot_user_id = 0
 _PRIVATE_INVITE_RE = re.compile(
-    r"https?://(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
+    # The scheme is optional on purpose: Telegram renders a bare `t.me/+hash`
+    # as a working invite, so a scrubber that required https:// would let one
+    # through. Sanitization must never be narrower than detection.
+    r"(?:https?://)?(?:www\.)?t\.me/(?:joinchat/|\+)[^\s<>()]+",
     re.IGNORECASE,
 )
 
@@ -184,10 +187,22 @@ async def remove_buyer(chat_id: int, user_id: Optional[int]) -> bool:
     try:
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        return True
     except Exception as error:  # noqa: BLE001
         log.warning("buyer removal failed for %s in %s: %s", user_id, chat_id, error)
         return False
+    # This removal is deliberately not a ban. Any journalled ban for this chat
+    # has to stop being enforced, or the retry loop re-bans the user seconds
+    # later and /revoke would leave exactly the ban it promises not to.
+    try:
+        await db.cancel_member_bans(user_id, chat_id)
+    except Exception as error:  # noqa: BLE001
+        log.error(
+            "Could not release journalled ban for %s in %s: %s",
+            user_id,
+            chat_id,
+            error,
+        )
+    return True
 
 
 async def ban_buyer(chat_id: int, user_id: Optional[int]) -> bool:
@@ -498,10 +513,16 @@ async def on_join_request(req: ChatJoinRequest) -> None:
             if await revoke_link(chat.id, used_link):
                 await db.set_order_link_revoked_by_invite(used_link)
                 terminal = "cancelled" if cancellation_won else "completed"
+                # Cancellation may have parked the row in any of its states;
+                # expecting only 'cancel_requested' made this a silent no-op
+                # that left the reservation non-terminal forever.
+                expected = (
+                    {"cancelling", "cancel_requested", "cancel_revoke_pending"}
+                    if cancellation_won
+                    else {"approved_revoke_pending"}
+                )
                 await db.claim_reservation_status(
-                    reservation["id"],
-                    {"cancel_requested" if cancellation_won else "approved_revoke_pending"},
-                    terminal,
+                    reservation["id"], expected, terminal
                 )
             elif cancellation_won:
                 await db.set_reservation_status(
@@ -698,11 +719,18 @@ async def on_chat_member(update: ChatMemberUpdated) -> None:
     if not link_row:
         request = await db.get_join_request(update.chat.id, user.id)
         request_link = str(request["invite_link"] or "") if request else ""
+        # A join request does not always carry an invite link (public groups, or
+        # "approve new members" without a bot-minted link), and neither does the
+        # chat_member update that follows. Requiring both sides to be present
+        # and equal banned the very user the owner had just approved, so the
+        # links are only compared when both are actually known.
+        links_agree = (
+            not used_link or not request_link or request_link == used_link
+        )
         if (
             request is not None
             and request["status"] in {"pending", "approved"}
-            and used_link
-            and request_link == used_link
+            and links_agree
         ):
             if request["status"] == "pending":
                 await db.set_join_status(update.chat.id, user.id, "approved")
@@ -735,39 +763,62 @@ async def on_chat_member(update: ChatMemberUpdated) -> None:
     order_id = link_row["order_id"]
     order = await db.get_order(order_id)
     expected_buyer = int(order["buyer_id"]) if order and order["buyer_id"] else None
-    forbidden_state = order and order["status"] in {
+    # `/remove` (and a failed order) means this user must not keep access at
+    # all. `/revoke` explicitly promises no lasting ban, so a buyer who slips
+    # through a revoked order link is removed rather than banned.
+    ban_state = order and order["status"] in {
         "remove_pending",
         "removed",
+        "failed",
+    }
+    revoke_state = order and order["status"] in {
         "revoke_pending",
         "revoked",
-        "failed",
     }
     already_used = (
         link_row["joined_user"] is not None
         and int(link_row["joined_user"]) != user.id
     )
-    if (
-        forbidden_state
-        or already_used
-        or (expected_buyer is not None and expected_buyer != user.id)
-    ):
-        reason = (
-            f"order {order_id} link used by unauthorized user"
-            if not forbidden_state
-            else f"order {order_id} is {order['status']}"
-        )
-        banned = await _queue_permanent_ban(
-            update.chat.id, user.id, reason
-        )
+    wrong_account = already_used or (
+        expected_buyer is not None and expected_buyer != user.id
+    )
+    if ban_state or revoke_state or wrong_account:
+        permanent = bool(ban_state or wrong_account)
+        if wrong_account:
+            reason = f"order {order_id} link used by unauthorized user"
+        else:
+            reason = f"order {order_id} is {order['status']}"
+        if permanent:
+            handled = await _queue_permanent_ban(
+                update.chat.id, user.id, reason
+            )
+            outcome = (
+                "permanently banned" if handled else "ban retry queued"
+            )
+        else:
+            # Record the join before the removal so a failure is retryable:
+            # pending_order_link_revocations only finds links with a joined_user.
+            await db.set_order_link_joined(link_row["id"], user.id)
+            handled = await remove_buyer(update.chat.id, user.id)
+            if handled:
+                await db.set_order_link_buyer_removed(link_row["id"])
+            outcome = "removed without a ban" if handled else "removal retry queued"
         if await revoke_link(update.chat.id, used_link):
             await db.set_order_link_revoked(link_row["id"])
-        if order and order["status"] not in {"remove_pending", "removed"}:
+        # A revoked order behaving exactly as designed is not a compromise.
+        if wrong_account and order and order["status"] not in {
+            "remove_pending",
+            "removed",
+        }:
             await db.set_order_status(order_id, "compromised")
+        elif revoke_state and not handled:
+            await db.set_order_status(order_id, "revoke_pending")
         await db.log_event(
             "order_link_misuse",
             update.chat.id,
             user.id,
-            f"{order_id}; expected={expected_buyer}; banned={banned}",
+            f"{order_id}; expected={expected_buyer}; permanent={permanent}; "
+            f"handled={handled}",
         )
         await tell_owner(
             f"Blocked misuse of order <code>{esc(order_id)}</code> in "
@@ -778,7 +829,7 @@ async def on_chat_member(update: ChatMemberUpdated) -> None:
                 if expected_buyer is not None
                 else ""
             )
-            + f" — {'permanently banned' if banned else 'ban retry queued'}</blockquote>"
+            + f" — {outcome}</blockquote>"
         )
         return
 
@@ -1493,13 +1544,20 @@ async def cmd_remove(message: Message, command: CommandObject) -> None:
         await _remove_order_permanently(message, order)
         return
 
-    # 2) A saved template keyword?
+    # 2) A bare id or @username always means a user. Probing templates first was
+    # destructive: db.remove_template deletes on match, so `/remove 12345` could
+    # silently delete a template instead of removing that user.
+    if arg.lstrip("-").isdigit() or arg.startswith("@"):
+        await _remove_user(message, arg)
+        return
+
+    # 3) A saved template keyword?
     if await db.remove_template(arg):
         await db.log_event("template_remove", detail=arg.lower())
         await message.answer(f"Template <code>{esc(arg.lower())}</code> removed.")
         return
 
-    # 3) Otherwise treat it as a user: decline requests + kick everywhere.
+    # 4) Otherwise treat it as a user reference.
     await _remove_user(message, arg)
 
 
@@ -1603,12 +1661,10 @@ async def _remove_user(message: Message, ident: str) -> None:
 
     kicked = 0
     for g in await db.all_groups(admin_only=True):
-        try:
-            await bot.ban_chat_member(g["chat_id"], user_id)
-            await bot.unban_chat_member(g["chat_id"], user_id, only_if_banned=True)
+        # remove_buyer also releases the journalled ban for that group, so this
+        # removal cannot be turned back into a permanent ban by the retry loop.
+        if await remove_buyer(g["chat_id"], user_id):
             kicked += 1
-        except Exception:  # noqa: BLE001
-            pass
     await db.log_event(
         "remove_user", user_id=user_id, detail=f"declined={declined} kicked={kicked}"
     )
@@ -1947,15 +2003,21 @@ async def _cancel_request_reservations(
     bridge_order = await db.get_order_by_request_id(rid)
     if bridge_order is not None:
         order_ids.add(str(bridge_order["order_id"]))
+    # Permanence is a property of each order, not of the request. One `/remove`d
+    # order sharing a request id must not upgrade a `/revoke`d sibling into a
+    # permanent ban — that would break the "no lasting ban" guarantee for a
+    # buyer whose order was only revoked.
+    permanent_orders = set()
     for order_id in order_ids:
         current = await db.get_order(order_id)
-        if current is not None and current["status"] in {
-            "remove_pending", "removed"
-        }:
-            permanent_ban = True
-    for order_id in order_ids:
+        order_permanent = permanent_ban or (
+            current is not None
+            and current["status"] in {"remove_pending", "removed"}
+        )
+        if order_permanent:
+            permanent_orders.add(order_id)
         await db.set_order_status(
-            order_id, "remove_pending" if permanent_ban else "revoke_pending"
+            order_id, "remove_pending" if order_permanent else "revoke_pending"
         )
 
     for reservation in reservations:
@@ -1990,12 +2052,15 @@ async def _cancel_request_reservations(
             await db.set_order_link_joined_by_invite(
                 reservation["invite_link"], reservation["user_id"]
             )
-            operation = ban_buyer if permanent_ban else remove_buyer
+            reservation_permanent = permanent_ban or (
+                str(reservation["order_id"] or "") in permanent_orders
+            )
+            operation = ban_buyer if reservation_permanent else remove_buyer
             removed = await operation(
                 reservation["chat_id"], reservation["user_id"]
             )
             if removed:
-                if permanent_ban:
+                if reservation_permanent:
                     await db.set_order_link_buyer_banned_by_invite(
                         reservation["invite_link"]
                     )
@@ -2343,6 +2408,26 @@ async def revocation_retry_loop() -> None:
                         {"approving"},
                         "approved_revoke_pending",
                         "stale approval recovery",
+                    )
+                    if not claimed:
+                        continue
+                    reservation = await db.get_reservation(reservation["id"])
+                    if reservation is None:
+                        continue
+                # A worker died holding a transient claim. Promote it into the
+                # matching *_revoke_pending state so the settled logic below
+                # revokes the link and reaches the right terminal status
+                # instead of mislabelling the seat as 'completed'.
+                resume = {
+                    "expiring": "expire_revoke_pending",
+                    "cancelling": "cancel_revoke_pending",
+                }.get(str(reservation["status"]))
+                if resume:
+                    claimed = await db.claim_reservation_status(
+                        reservation["id"],
+                        {str(reservation["status"])},
+                        resume,
+                        "resumed interrupted transition",
                     )
                     if not claimed:
                         continue

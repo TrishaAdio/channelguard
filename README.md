@@ -208,6 +208,10 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
 | `/clear` | reset today's stats to zero |
+| `.setproofs` (typed in a channel) or `.setproofs <id \| @username \| t.me link>` (from any chat) | set the channel `.proof` posts to, and persist it as `PROOF_CHANNEL` in `.env` |
+| `.proof` | capture a full screenful of this chat as a macOS-style window screenshot and post it to the proof channel |
+| `.proof <n>` | exactly the latest `n` messages, uncropped (max 40) |
+| reply + `.proof` | the capture ends at the replied message, with its context above it |
 | `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
 | `.help` | show every command and template parameter |
 
@@ -248,6 +252,74 @@ by order id and retried from `pay.json`.
 The revenue split, timezone, and share basis are configured via
 `RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
 
+### Proof screenshots (`chatshot/`)
+
+`.proof` renders real messages from the chat you run it in as a **macOS-style
+Telegram screenshot** and posts the PNG to the channel set by `.setproofs`.
+
+![Example .proof output](docs/example.png)
+
+*Actual renderer output ([dark theme](docs/example-dark.png)). Regenerate both
+with `python3 -m chatshot.make_example`.*
+
+Telethon cannot take a screenshot — it is a protocol client with no UI to
+capture. So `chatshot` reads the messages through Telethon, rebuilds them as
+HTML/CSS, and photographs that with headless Chromium at a 3x device pixel
+ratio. Text shaping, wrapping and emoji fallback are done by the browser, which
+is what makes the output crisp rather than hand-drawn.
+
+```
+.proof            one full screenful of this chat  (the normal case)
+.proof 5          exactly the newest 5 messages, uncropped
+reply + .proof    a screenful ending at the replied message
+```
+
+Bare `.proof` renders **a page, not a message**: a fixed 900x620 landscape pane
+with the newest message at the bottom, older ones filling upward, and whatever
+does not fit clipped at the top edge — which is what a screenshot of a scrolled
+chat window actually looks like. `.proof <n>` instead sizes the image to exactly
+those `n` messages, so nothing you asked for gets cropped away.
+
+The `.proof` command message is always excluded from its own screenshot.
+
+What it reproduces: sender grouping with the tail on the last bubble of a run,
+Telegram's per-peer name/avatar colours, real profile photos, reply and forward
+headers, date separators, sent/read ticks, the timestamp tucked into the last
+line of the bubble, light and dark themes, and every entity type — bold,
+italic, underline, strike, spoiler, code, pre with its language label,
+blockquote, links, mentions and custom emoji. Photos, stickers, videos,
+documents and voice notes render too, with voice waveforms decoded from
+Telegram's actual 5-bit amplitude data rather than faked.
+
+**Setup.** `.proof` is the only feature needing a browser; everything else runs
+without it.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m chatshot.setup_assets    # Chromium + fonts, then self-verifies
+```
+
+`setup_assets` installs Inter, Noto Color Emoji, JetBrains Mono and Noto Sans
+Devanagari — all SIL Open Font License. The colour emoji font matters: without
+it Chromium draws emoji as monochrome boxes. Apple's **SF Pro** is the genuine
+macOS typeface but its licence forbids redistribution, so it is never
+downloaded; if you have it locally, drop the `.otf` files into
+`~/.local/share/fonts/chatshot/` and set `RenderOptions.font` to
+`"SF Pro Text"`.
+
+Rendering is separated from fetching, so the look can be changed and tested
+from fixtures with no Telegram account:
+
+```bash
+python3 -c "from chatshot.fixtures import sample_conversation as s; \
+from chatshot.render import render_png_sync as r; \
+open('out.png','wb').write(r(s('dark')))"
+```
+
+`RenderOptions` covers `theme`, `width`, `scale`, `window_chrome`,
+`wallpaper_preset`, `clock24`, and privacy switches `hide_sender_names` /
+`hide_avatars` for posting a proof without exposing the buyer's identity.
+
 ## Files
 
 | File            | Role                                                          |
@@ -257,6 +329,7 @@ The revenue split, timezone, and share basis are configured via
 | `resolve.py`    | Channel resolver + interactive picker                         |
 | `guard.py`      | Link rotation (DM owner) + auto-kick joiners                  |
 | `quickreply.py` | 2nd userbot: keep `/demo` quick reply = the latest link       |
+| `chatshot/`     | `.proof` renderer: Telegram messages -> macOS-style PNG       |
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
 | `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
 
@@ -301,6 +374,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `ORDER_PREFIX`   | (payment logger) `{orderid}` prefix (default `ANI`) |
 | `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |
 | `PAYMENT_CHANNEL`| (payment logger/admin bot) numeric target channel id; authoritative — editing it moves the upload target on the next start |
+| `PROOF_CHANNEL`  | (`.proof`) numeric channel id for rendered screenshots; same authoritative precedence as `PAYMENT_CHANNEL` |
 | `RIO_PCT`        | (payment logger) Rio's split percent (default 55)   |
 | `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |

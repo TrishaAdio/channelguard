@@ -60,6 +60,9 @@ ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 # Persistent fallback for the payment upload channel. ``.setchannel`` writes
 # this automatically, while data/pay.json remains the live runtime store.
 PAYMENT_CHANNEL_RAW = os.getenv("PAYMENT_CHANNEL", "")
+# Where `.proof` sends rendered chat screenshots. Set by `.setproofs`, which
+# persists it here so it survives a data-directory loss.
+PROOF_CHANNEL_RAW = os.getenv("PROOF_CHANNEL", "")
 # Revenue split for the {rioshare}/{marco} caption parameters.
 RIO_PCT = _float("RIO_PCT", 55.0, minimum=0.0)
 MARCO_PCT = _float("MARCO_PCT", 45.0, minimum=0.0)
@@ -112,6 +115,10 @@ def payment_channel():
     return coerce(PAYMENT_CHANNEL_RAW)
 
 
+def proof_channel():
+    return coerce(PROOF_CHANNEL_RAW)
+
+
 # Environment keys that also back a module-level value read at import time.
 # Saving one of these has to refresh the live value, otherwise the running
 # process keeps using the parameter the operator has already replaced.
@@ -120,6 +127,7 @@ _ENV_BACKED_VALUES = {
     "OWNER": "OWNER_RAW",
     "LINK_SOURCE": "LINK_SOURCE_RAW",
     "PAYMENT_CHANNEL": "PAYMENT_CHANNEL_RAW",
+    "PROOF_CHANNEL": "PROOF_CHANNEL_RAW",
 }
 
 

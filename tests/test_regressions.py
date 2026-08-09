@@ -1716,3 +1716,745 @@ def test_unban_journal_stops_the_bot_from_re_banning(
             await app.bot.session.close()
 
     asyncio.run(scenario())
+
+
+
+def test_approved_join_request_without_an_invite_link_is_not_banned(
+    tmp_path, monkeypatch
+) -> None:
+    """A join request carries no invite link in a public group / plain approval.
+
+    The enforcement gate used to require an invite link on both the stored
+    request and the chat_member update, so the owner pressing Approve was
+    followed by a permanent ban of the user they had just approved.
+    """
+
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "nolink.db")
+        await db.init()
+        banned = []
+        notices = []
+        try:
+            await db.add_join_request(-1001, 71, None, "NoLink", None)
+            await db.set_join_status(-1001, 71, "approved")
+
+            async def ban(*args):
+                banned.append(args)
+
+            async def notify(text, **_kwargs):
+                notices.append(text)
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app, "tell_owner", notify)
+            monkeypatch.setattr(app, "_bot_user_id", 999)
+
+            await app.on_chat_member(
+                SimpleNamespace(
+                    old_chat_member=SimpleNamespace(
+                        status=app.ChatMemberStatus.LEFT
+                    ),
+                    new_chat_member=SimpleNamespace(
+                        status=app.ChatMemberStatus.MEMBER,
+                        user=SimpleNamespace(
+                            id=71, username=None, full_name="NoLink"
+                        ),
+                    ),
+                    invite_link=None,
+                    chat=SimpleNamespace(id=-1001, title="Public"),
+                )
+            )
+
+            assert banned == []
+            assert notices == []
+            assert await db._all("SELECT * FROM member_bans") == []
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_revoked_order_join_is_removed_without_a_lasting_ban(
+    tmp_path, monkeypatch
+) -> None:
+    """/revoke promises no lasting ban, including for a late joiner.
+
+    A buyer racing a /revoke used to be permanently banned, and any journalled
+    ban survived the kick+unban so the retry loop re-applied it.
+    """
+
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "revokejoin.db")
+        await db.init()
+        calls = []
+        try:
+            assert await db.register_order(
+                "ANIREVJOIN", "14", "Amit", "lol", buyer_id=42
+            )
+            await db.add_order_link(
+                "ANIREVJOIN", -1001, "https://t.me/+revoking"
+            )
+            await db.set_order_status("ANIREVJOIN", "revoke_pending")
+            # An earlier enforcement pass had already journalled a ban.
+            await db.queue_member_ban(-1001, 42, "earlier enforcement")
+
+            async def ban(chat_id, user_id):
+                calls.append(("ban", chat_id, user_id))
+
+            async def unban(chat_id, user_id, **_kwargs):
+                calls.append(("unban", chat_id, user_id))
+
+            async def revoke(*_args):
+                return True
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+            monkeypatch.setattr(app, "revoke_link", revoke)
+            monkeypatch.setattr(app, "tell_owner", lambda *_a, **_k: _noop())
+            monkeypatch.setattr(app, "_bot_user_id", 999)
+
+            await app.on_chat_member(
+                SimpleNamespace(
+                    old_chat_member=SimpleNamespace(
+                        status=app.ChatMemberStatus.LEFT
+                    ),
+                    new_chat_member=SimpleNamespace(
+                        status=app.ChatMemberStatus.MEMBER,
+                        user=SimpleNamespace(
+                            id=42, username=None, full_name="Buyer"
+                        ),
+                    ),
+                    invite_link=SimpleNamespace(
+                        invite_link="https://t.me/+revoking"
+                    ),
+                    chat=SimpleNamespace(id=-1001, title="LOLsi"),
+                )
+            )
+
+            # Kicked, then explicitly unbanned - never left banned.
+            assert calls == [("ban", -1001, 42), ("unban", -1001, 42)]
+            link = (await db.order_links("ANIREVJOIN"))[0]
+            assert link["joined_user"] == 42
+            assert link["buyer_removed"] == 1
+            assert link["revoked"] == 1
+            # A revoked order behaving as designed is not a compromise.
+            assert (await db.get_order("ANIREVJOIN"))["status"] != "compromised"
+            # The journalled ban must stop being enforced.
+            rows = await db._all("SELECT * FROM member_bans")
+            assert [row["status"] for row in rows] == ["cancelled"]
+            assert await db.pending_member_bans() == []
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+async def _noop() -> None:
+    return None
+
+
+def test_remove_user_releases_journalled_bans(tmp_path, monkeypatch) -> None:
+    """/remove <user> removes without a lasting ban, so the journal must clear."""
+
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "removeuser.db")
+        await db.init()
+        calls = []
+        answers = []
+        try:
+            await db.upsert_group(
+                -1001, "LOLsi", "Ls", "supergroup", None,
+                "https://t.me/+general", is_admin=True,
+            )
+            await db.queue_member_ban(-1001, 84, "unauthorized join")
+
+            async def ban(chat_id, user_id):
+                calls.append(("ban", chat_id, user_id))
+
+            async def unban(chat_id, user_id, **_kwargs):
+                calls.append(("unban", chat_id, user_id))
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+
+            class Message:
+                async def answer(self, text, **_kwargs):
+                    answers.append(text)
+
+            await app._remove_user(Message(), "84")
+
+            assert calls == [("ban", -1001, 84), ("unban", -1001, 84)]
+            assert "removed from 1 group(s)" in answers[0]
+            assert await db.pending_member_bans() == []
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_short_code_survives_a_demotion(tmp_path, monkeypatch) -> None:
+    """Demotion upserts an empty short code; a published code must not vanish."""
+
+    async def scenario() -> None:
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "codes.db")
+        await db.init()
+        try:
+            await db.upsert_group(
+                -1001, "Lom And Som Op", "Lm", "supergroup", None,
+                "https://t.me/+kept", is_admin=True,
+            )
+            # The bot is demoted to a plain member.
+            await db.upsert_group(
+                -1001, "Lom And Som Op", "", "supergroup", None, None,
+                is_admin=False,
+            )
+            row = await db.get_group(-1001)
+            assert row["short_code"] == "Lm"
+            assert row["invite_link"] == "https://t.me/+kept"
+            assert row["is_admin"] == 0
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_expiry_never_abandons_a_pending_cleanup(tmp_path, monkeypatch) -> None:
+    """One seat expiring must not cancel the cleanup another seat is owed.
+
+    pending_order_link_revocations only drives *_pending orders, so overwriting
+    the status with 'partially_expired' silently stopped every retry.
+    """
+
+    async def scenario() -> None:
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "expiry.db")
+        await db.init()
+        try:
+            assert await db.register_order("ANIEXP", "14", "Amit", "lol")
+            await db.add_order_link("ANIEXP", -1001, "https://t.me/+open")
+            await db.set_order_status("ANIEXP", "revoke_pending")
+
+            await db.reconcile_order_expiry("ANIEXP")
+
+            assert (await db.get_order("ANIEXP"))["status"] == "revoke_pending"
+            pending = await db.pending_order_link_revocations()
+            assert [row["order_id"] for row in pending] == ["ANIEXP"]
+
+            # An order that is not being cleaned up still reports expiry.
+            assert await db.register_order("ANIEXP2", "14", "Amit", "lol")
+            await db.add_order_link("ANIEXP2", -1001, "https://t.me/+open2")
+            await db.reconcile_order_expiry("ANIEXP2")
+            assert (
+                await db.get_order("ANIEXP2")
+            )["status"] == "partially_expired"
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_stuck_transient_reservations_are_recovered(
+    tmp_path, monkeypatch
+) -> None:
+    """A crash while 'expiring'/'cancelling' left a live invite link forever."""
+
+    async def scenario() -> None:
+        import time as _time
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "stuck.db")
+        await db.init()
+        try:
+            assert await db.add_reservation(
+                "req", "cp", -1001, 42, "https://t.me/+expiring", "ANISTUCK"
+            )
+            assert await db.add_reservation(
+                "req", "lp", -1002, 43, "https://t.me/+cancelling", "ANISTUCK"
+            )
+            rows = await db.reservations_for_request("req")
+            expiring, cancelling = rows[0], rows[1]
+            assert await db.claim_reservation_status(
+                expiring["id"], {"pending"}, "expiring"
+            )
+            assert await db.claim_reservation_status(
+                cancelling["id"], {"pending"}, "cancelling"
+            )
+
+            # Fresh claims are still owned by a live worker.
+            assert await db.pending_reservation_revocations(
+                _time.time() - 300
+            ) == []
+
+            stale = await db.pending_reservation_revocations(_time.time() + 60)
+            assert sorted(row["status"] for row in stale) == [
+                "cancelling",
+                "expiring",
+            ]
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_order_prefix_wildcards_do_not_inflate_the_sequence(
+    tmp_path, monkeypatch
+) -> None:
+    """`_` and `%` are LIKE wildcards and matched foreign order ids."""
+
+    async def scenario() -> None:
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "prefix.db")
+        await db.init()
+        try:
+            # A different prefix that only matches if `_` stays a wildcard.
+            assert await db.register_order("AXI0007", "1", "x", "k")
+            first = await db.create_next_order(
+                "A_I", "14", "Amit", "lol", command_key="one"
+            )
+            second = await db.create_next_order(
+                "A_I", "14", "Amit", "lol", command_key="two"
+            )
+            assert first == "A_I0001"
+            assert second == "A_I0002"
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_scheme_less_invite_links_are_scrubbed_from_channel_output() -> None:
+    """Telegram renders a bare `t.me/+hash` as a working invite."""
+    from bot import app
+
+    text, entities = quickreply._sanitize_channel_invites(
+        "Buyer link: t.me/+secrethash and t.me/joinchat/OtherHash", []
+    )
+    assert "secrethash" not in text
+    assert "OtherHash" not in text
+    assert entities == []
+
+    scrubbed = app._PRIVATE_INVITE_RE.sub(
+        "[private link delivered in DM]", "join t.me/+botsidehash now"
+    )
+    assert "botsidehash" not in scrubbed
+
+    # Entity-only (hidden) scheme-less invites are dropped too.
+    _text, safe = quickreply._sanitize_channel_invites(
+        "tap here",
+        [SimpleNamespace(offset=0, length=3, url="t.me/+hiddenhash")],
+    )
+    assert safe == []
+
+
+def test_oversized_caption_keeps_the_body_when_amount_appears_early() -> None:
+    """Pulling `keep` back to any complete occurrence destroyed the caption."""
+    order_id = "ANI7F3K9Q"
+    amount = "\u20b9500"
+    body = "x" * 1300
+    text = f"Rahul paid {amount}\n{body}\nOrder: {order_id}"
+
+    clipped, _entities, changed = quickreply._fit_media_caption(
+        text, [], preserve=(order_id, amount)
+    )
+
+    assert changed
+    assert quickreply._u16(clipped) <= 1024
+    assert order_id in clipped
+    assert amount in clipped
+    # The receipt body must survive, not be cut down to the first few chars.
+    assert clipped.count("x") > 900
+
+
+def test_link_preview_is_not_treated_as_a_payment_image(monkeypatch) -> None:
+    """A MessageMediaWebPage can never be uploaded with send_file()."""
+
+    async def scenario() -> None:
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        edits = []
+
+        preview = quickreply.MessageMediaWebPage(webpage=SimpleNamespace())
+
+        class Event:
+            raw_text = "/add 10 Bob"
+            chat_id = 42
+            id = 77
+            is_private = True
+
+            async def get_reply_message(self):
+                return SimpleNamespace(
+                    media=preview, chat_id=42, id=5, sender_id=42
+                )
+
+            async def edit(self, text, **_kwargs):
+                edits.append(text)
+
+            async def respond(self, text, **_kwargs):
+                edits.append(text)
+
+        await quickreply.cmd_add(Event())
+
+        assert quickreply._pay["payments"] == []
+        assert "reply to an image" in edits[0]
+
+    asyncio.run(scenario())
+
+
+def test_unreadable_pay_file_is_never_overwritten(tmp_path, monkeypatch) -> None:
+    """A read failure used to replace the payment log with an empty store."""
+    # A directory exists() but cannot be read, standing in for an I/O failure.
+    unreadable = tmp_path / "pay.json"
+    unreadable.mkdir()
+    warnings = []
+    monkeypatch.setattr(quickreply.config, "PAY_FILE", unreadable)
+    monkeypatch.setattr(quickreply.config, "PAYMENT_CHANNEL_RAW", "-1001")
+    monkeypatch.setattr(quickreply.ui, "warn", lambda text: warnings.append(text))
+
+    data = quickreply._load_pay()
+
+    assert data["payments"] == []
+    # The declared upload target is still recovered.
+    assert data["post_channel"] == -1001
+    # Nothing was written and no bogus recovery backup was produced.
+    assert unreadable.is_dir()
+    assert list(tmp_path.glob("pay.recovery-*.json")) == []
+    assert warnings and "could not be read" in warnings[0]
+
+
+def test_ping_reports_env_divergence_after_a_failed_write(monkeypatch) -> None:
+    """save_env refreshes the live value first, so .env needs its own witness."""
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pay["post_channel"] = -100222
+    # What .env still holds after the write failed.
+    quickreply._pay["post_channel_env"] = -100111
+    # save_env already refreshed the in-process parameter to the new target.
+    monkeypatch.setattr(quickreply.config, "PAYMENT_CHANNEL_RAW", "-100222")
+
+    text = quickreply._runtime_status_text()
+
+    assert "Payment channel: -100222" in text
+    assert "PAYMENT_CHANNEL in .env: -100111" in text
+
+
+def test_add_outside_a_private_chat_delivers_links_privately(
+    monkeypatch,
+) -> None:
+    """Editing the /add message in a group would publish buyer-bound links."""
+
+    async def scenario() -> None:
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        edits = []
+        sends = []
+
+        async def reserve(*_args, **_kwargs):
+            return {
+                "request_id": "req",
+                "entries": [
+                    {
+                        "link": "https://t.me/+paidlink",
+                        "title": "Group",
+                        "keyword": "cp",
+                    }
+                ],
+                "failures": [],
+                "metadata": {},
+            }
+
+        async def render(kind, *_args, **_kwargs):
+            return (f"{kind}: https://t.me/+paidlink", [])
+
+        class Client:
+            async def send_message(self, peer, body, **_kwargs):
+                sends.append((peer, body))
+                return SimpleNamespace(id=len(sends))
+
+        monkeypatch.setattr(quickreply, "_reserve_links", reserve)
+        monkeypatch.setattr(quickreply, "_safe_payment_output", render)
+        monkeypatch.setattr(quickreply, "client", Client())
+
+        class Event:
+            raw_text = "/add 10 Bob cp"
+            chat_id = -1002
+            id = 77
+            is_private = False
+
+            async def get_reply_message(self):
+                return SimpleNamespace(
+                    sender_id=42, media=None, chat_id=-1002, id=5
+                )
+
+            async def edit(self, text, **_kwargs):
+                edits.append(text)
+
+            async def respond(self, text, **_kwargs):
+                edits.append(text)
+
+        await quickreply.cmd_add(Event())
+
+        # The buyer got the link in their DM...
+        assert sends and sends[0][0] == 42
+        assert "https://t.me/+paidlink" in sends[0][1]
+        # ...and the group never saw it.
+        assert edits
+        assert "t.me/+paidlink" not in "".join(edits)
+        assert quickreply._pay["payments"][0]["status"] == "valid"
+
+    asyncio.run(scenario())
+
+
+def test_channel_authored_reply_is_rejected_as_the_payer(monkeypatch) -> None:
+    """A channel post's sender_id is the channel, which cannot own a link."""
+
+    async def scenario() -> None:
+        quickreply._state["self_id"] = 1
+        quickreply._pay = quickreply._default_pay()
+        monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+        edits = []
+        reserved = []
+
+        async def reserve(*args, **kwargs):
+            reserved.append((args, kwargs))
+            return {"request_id": "", "entries": [], "failures": []}
+
+        monkeypatch.setattr(quickreply, "_reserve_links", reserve)
+
+        class Event:
+            raw_text = "/add 10 Bob cp"
+            chat_id = -1001234
+            id = 77
+            is_private = False
+
+            async def get_reply_message(self):
+                return SimpleNamespace(
+                    sender_id=-1001234, media=None, chat_id=-1001234, id=5
+                )
+
+            async def edit(self, text, **_kwargs):
+                edits.append(text)
+
+            async def respond(self, text, **_kwargs):
+                edits.append(text)
+
+        await quickreply.cmd_add(Event())
+
+        assert reserved == []
+        assert quickreply._pay["payments"] == []
+        assert "channel, not a user" in edits[0]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_does_not_escalate_a_revoked_sibling_order(
+    tmp_path, monkeypatch
+) -> None:
+    """Permanence belongs to each order, not to the shared payment request."""
+
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "sibling.db")
+        await db.init()
+        calls = []
+        try:
+            assert await db.register_order(
+                "ANIGONE", "14", "Amit", "lol",
+                request_id="payment", buyer_id=42,
+            )
+            assert await db.register_order(
+                "ANIKEEP", "14", "Amit", "lol",
+                request_id="payment", buyer_id=43,
+            )
+            for order_id, chat_id, user_id, link in (
+                ("ANIGONE", -1001, 42, "https://t.me/+gone"),
+                ("ANIKEEP", -1002, 43, "https://t.me/+keep"),
+            ):
+                assert await db.add_reservation(
+                    "payment", order_id, chat_id, user_id, link, order_id
+                )
+                await db.add_order_link(order_id, chat_id, link)
+                row = await db.reservation_for_join(chat_id, user_id, link)
+                await db.set_reservation_status(row["id"], "completed")
+            # Only this order was permanently removed.
+            await db.set_order_status("ANIGONE", "remove_pending")
+
+            async def ban(chat_id, user_id):
+                calls.append(("ban", chat_id, user_id))
+
+            async def unban(chat_id, user_id, **_kwargs):
+                calls.append(("unban", chat_id, user_id))
+
+            async def revoke(*_args):
+                return True
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+            monkeypatch.setattr(app, "revoke_link", revoke)
+            monkeypatch.setattr(app, "linkstore", None)
+
+            await app._cancel_request_reservations("payment")
+
+            # The removed order's buyer stays banned; the sibling is only kicked.
+            assert ("ban", -1001, 42) in calls
+            assert ("unban", -1001, 42) not in calls
+            assert ("ban", -1002, 43) in calls
+            assert ("unban", -1002, 43) in calls
+
+            gone_link = (await db.order_links("ANIGONE"))[0]
+            keep_link = (await db.order_links("ANIKEEP"))[0]
+            assert gone_link["buyer_banned"] == 1
+            assert keep_link["buyer_removed"] == 1
+            assert keep_link["buyer_banned"] == 0
+            assert (await db.get_order("ANIKEEP"))["status"] != "remove_pending"
+        finally:
+            await db.close()
+            await app.bot.session.close()
+
+    asyncio.run(scenario())
+
+
+
+def test_rotation_replaces_every_raw_invite_link() -> None:
+    """A post with two raw invite links kept the second, revoked one live."""
+    text = "Main: https://t.me/+oldone backup: https://t.me/+oldtwo done"
+    bold = SimpleNamespace(offset=quickreply._u16("Main: "), length=0)
+    bold.length = quickreply._u16("https://t.me/+oldone")
+    tail = SimpleNamespace(
+        offset=quickreply._u16(
+            "Main: https://t.me/+oldone backup: https://t.me/+oldtwo "
+        ),
+        length=quickreply._u16("done"),
+    )
+
+    result = quickreply._swap_link(text, [bold, tail], "https://t.me/+fresh")
+
+    assert result is not None
+    new_text, entities = result
+    assert "oldone" not in new_text
+    assert "oldtwo" not in new_text
+    assert new_text.count("https://t.me/+fresh") == 2
+    # The trailing entity still points at "done" after both replacements.
+    assert (
+        new_text.encode("utf-16-le")[
+            entities[1].offset * 2:(entities[1].offset + entities[1].length) * 2
+        ].decode("utf-16-le")
+        == "done"
+    )
+
+
+def test_plain_text_template_is_not_reread_from_the_source_post(
+    monkeypatch,
+) -> None:
+    """An edited source post must not silently rewrite a saved template."""
+
+    async def scenario() -> None:
+        quickreply._pay = quickreply._default_pay()
+        quickreply._pay["done_template"] = "Saved: {amount}"
+        quickreply._pay.pop("done_entities", None)
+        quickreply._pay["done_ref"] = {"chat_id": 1, "message_id": 2}
+
+        class Client:
+            async def get_messages(self, _chat_id, ids=None):
+                # The operator later edited the source post.
+                return SimpleNamespace(message="Edited later", entities=[])
+
+        monkeypatch.setattr(quickreply, "client", Client())
+        monkeypatch.setattr(quickreply.ui, "warn", lambda *_a, **_k: None)
+
+        text, entities = await quickreply._resolve_template("done")
+
+        assert text == "Saved: {amount}"
+        assert entities == []
+
+    asyncio.run(scenario())
+
+
+def test_unban_checks_the_ban_list_when_not_a_participant(monkeypatch) -> None:
+    """A removed-and-banned user is not a participant but is still banned."""
+
+    async def scenario() -> None:
+        scanned = []
+
+        class Client:
+            async def get_permissions(self, _chat, _user_id):
+                raise quickreply.UserNotParticipantError(request=None)
+
+        async def banned_participant(chat, user_id):
+            scanned.append((chat, user_id))
+            return SimpleNamespace(id=user_id)
+
+        monkeypatch.setattr(quickreply, "client", Client())
+        monkeypatch.setattr(
+            quickreply, "_banned_participant", banned_participant
+        )
+
+        is_banned, target = await quickreply._ban_state(-1001, 42)
+
+        assert scanned == [(-1001, 42)]
+        assert is_banned is True
+        assert getattr(target, "id", None) == 42
+
+    asyncio.run(scenario())
+
+
+def test_remove_with_a_bare_id_does_not_delete_a_template(
+    tmp_path, monkeypatch
+) -> None:
+    """Probing templates first meant /remove <id> could delete one."""
+
+    async def scenario() -> None:
+        from bot import app
+
+        await db.close()
+        monkeypatch.setattr(db.config, "DB_PATH", tmp_path / "removeorder.db")
+        await db.init()
+        answers = []
+        try:
+            # A template whose keyword happens to look like a user id.
+            await db.upsert_template("12345", "14", "Amit", "body")
+            await db.upsert_group(
+                -1001, "LOLsi", "Ls", "supergroup", None,
+                "https://t.me/+general", is_admin=True,
+            )
+
+            async def ban(*_args, **_kwargs):
+                return None
+
+            async def unban(*_args, **_kwargs):
+                return None
+
+            monkeypatch.setattr(app.bot, "ban_chat_member", ban)
+            monkeypatch.setattr(app.bot, "unban_chat_member", unban)
+
+            class Message:
+                from_user = SimpleNamespace(id=app.config.OWNER_ID)
+                chat = SimpleNamespace(type=app.ChatType.PRIVATE)
+
+                async def answer(self, text, **_kwargs):
+                    answers.append(text)
+
+            await app.cmd_remove(
+                Message(), SimpleNamespace(args="12345")
+            )
+
+            # The user was removed and the template survived.
+            assert "removed from 1 group(s)" in answers[0]
+            surviving = await db.get_template("12345")
+            assert surviving is not None
+            assert surviving["body"] == "body"
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())

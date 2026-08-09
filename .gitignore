@@ -22,3 +22,7 @@ venv/
 # Bot data (SQLite DB, generated at runtime)
 groupbot/data/
 data/
+
+# chatshot render output / verification images
+renders/
+chatshot-verify.png
