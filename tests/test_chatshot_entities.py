@@ -457,3 +457,78 @@ def test_close_renderer_is_safe_when_none_was_started() -> None:
     render_mod._renderer = None
     asyncio.run(render_mod.close_renderer())      # must not raise
     assert render_mod._renderer is None
+
+
+# --------------------------------------------------------------------------
+# Chromium launch diagnostics
+# --------------------------------------------------------------------------
+
+#: Verbatim shape of a real headless-server launch failure.
+_REAL_LAUNCH_FAILURE = """BrowserType.launch: Target page, context or browser has been closed
+Browser logs:
+
+<launching> /home/u/.cache/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell --no-sandbox
+<launched> pid=117389
+[pid=117389][err] /home/u/.cache/ms-playwright/chrome-headless-shell: error while loading shared libraries: libatk-1.0.so.0: cannot open shared object file: No such file or directory
+Call log:
+  - <launching> ...
+"""
+
+
+def test_missing_shared_library_is_named_in_the_hint() -> None:
+    """Relaying Playwright's ~3000-char call log to Telegram is useless."""
+    from chatshot.render import launch_failure_hint
+
+    hint = launch_failure_hint(_REAL_LAUNCH_FAILURE)
+    assert "libatk-1.0.so.0" in hint
+    assert "install-deps" in hint
+    assert len(hint) < 200
+    # The raw call log must not be forwarded.
+    assert "Call log" not in hint
+    assert "<launching>" not in hint
+
+
+def test_setup_assets_extracts_the_library_name() -> None:
+    from chatshot.setup_assets import _missing_library
+
+    assert _missing_library(_REAL_LAUNCH_FAILURE) == "libatk-1.0.so.0"
+    assert _missing_library("unrelated failure") == ""
+
+
+def test_unknown_launch_failure_degrades_to_a_short_line() -> None:
+    from chatshot.render import launch_failure_hint
+
+    assert launch_failure_hint("boom\nmore\nlines") == "boom"
+    assert launch_failure_hint("") == "Chromium failed to start."
+    assert len(launch_failure_hint("x" * 5000)) <= 300
+
+
+def test_a_failed_launch_does_not_leave_the_driver_running() -> None:
+    """A lingering driver subprocess produces 'Event loop is closed' at exit."""
+    from chatshot.render import RenderError, Renderer
+
+    stopped: list[bool] = []
+
+    class FakeChromium:
+        async def launch(self, args=None):
+            raise RuntimeError(_REAL_LAUNCH_FAILURE)
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            stopped.append(True)
+
+    async def scenario() -> None:
+        renderer = Renderer()
+        renderer._playwright = FakePlaywright()
+        try:
+            await renderer._browser_ready()
+        except RenderError as error:
+            assert "libatk-1.0.so.0" in str(error)
+        else:
+            raise AssertionError("expected RenderError")
+        assert stopped == [True]
+        assert renderer._playwright is None
+
+    asyncio.run(scenario())

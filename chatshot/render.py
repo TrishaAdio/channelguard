@@ -56,6 +56,27 @@ def viewport_for(options) -> dict:
     }
 
 
+_MISSING_LIB_MARKER = "error while loading shared libraries: "
+
+
+def launch_failure_hint(detail: str) -> str:
+    """A one-line, actionable summary of a Chromium launch failure.
+
+    Playwright reports a launch failure with several thousand characters of
+    command line and call log. Relaying that verbatim to Telegram is useless (and
+    too long to send), while the single line that matters is usually a missing
+    shared library.
+    """
+    if _MISSING_LIB_MARKER in detail:
+        library = detail.split(_MISSING_LIB_MARKER, 1)[1].split(":", 1)[0].strip()
+        return (
+            f"Chromium is missing the system library {library}. "
+            "Run: sudo $(which python) -m playwright install-deps chromium"
+        )
+    first_line = next((ln.strip() for ln in detail.splitlines() if ln.strip()), "")
+    return (first_line[:300] or "Chromium failed to start.")
+
+
 class Renderer:
     def __init__(self, max_concurrent: int = _MAX_CONCURRENT) -> None:
         self._playwright = None
@@ -80,7 +101,18 @@ class Renderer:
                         "&& python -m playwright install chromium"
                     ) from error
                 self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(args=_ARGS)
+            try:
+                self._browser = await self._playwright.chromium.launch(args=_ARGS)
+            except Exception as error:  # noqa: BLE001
+                # Leaving the driver running after a failed launch keeps a
+                # subprocess alive whose transport then complains at interpreter
+                # shutdown ("Event loop is closed"), so tear it down and let the
+                # next attempt start clean.
+                try:
+                    await self._playwright.stop()
+                finally:
+                    self._playwright = None
+                raise RenderError(launch_failure_hint(f"{error}")) from error
             return self._browser
 
     async def start(self) -> None:

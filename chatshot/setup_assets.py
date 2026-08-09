@@ -75,6 +75,39 @@ def refresh_font_cache() -> None:
         print("  fc-cache not found; install fontconfig if fonts do not appear")
 
 
+#: Shared libraries Chromium needs that a headless server image usually lacks.
+#: Ubuntu 24.04 renamed several of these with a `t64` suffix (the 64-bit time_t
+#: transition), so both spellings are listed and apt ignores the absent ones.
+_APT_PACKAGES = (
+    "libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 "
+    "libasound2t64 libnss3 libnspr4 libdrm2 libgbm1 libxkbcommon0 "
+    "libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2"
+)
+
+
+def _missing_library(detail: str) -> str:
+    """Extract the first missing .so name from a Chromium launch failure."""
+    marker = "error while loading shared libraries: "
+    if marker not in detail:
+        return ""
+    return detail.split(marker, 1)[1].split(":", 1)[0].strip()
+
+
+def _explain_launch_failure(detail: str) -> None:
+    """Turn Playwright's wall of log output into the one command that fixes it."""
+    library = _missing_library(detail)
+    if not library:
+        print("  Chromium could not start. First lines of the failure:")
+        for line in detail.splitlines()[:6]:
+            print(f"    {line}")
+        return
+    print(f"  Chromium is missing a system library: {library}")
+    print("  It downloaded fine; the OS just lacks its shared libraries.")
+    print("  Fix with either of:")
+    print(f"    sudo {sys.executable} -m playwright install-deps chromium")
+    print(f"    sudo apt-get update && sudo apt-get install -y {_APT_PACKAGES}")
+
+
 def install_chromium() -> bool:
     print("Installing Chromium for Playwright ...")
     result = subprocess.run(
@@ -113,7 +146,8 @@ def verify() -> bool:
             page.locator("#p").screenshot(path="chatshot-verify.png")
             browser.close()
     except Exception as error:  # noqa: BLE001
-        print(f"VERIFY: render failed ({type(error).__name__}: {error})")
+        print(f"VERIFY: Chromium failed to start ({type(error).__name__})")
+        _explain_launch_failure(f"{error}")
         return False
 
     print(f"VERIFY: Inter={'ok' if ok_ui else 'MISSING'} "

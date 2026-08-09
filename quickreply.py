@@ -3542,8 +3542,20 @@ async def cmd_proof(event) -> None:
             conversation, emoji_src=lambda doc: emoji.get(doc, "")
         )
     except Exception as error:  # noqa: BLE001
+        # Playwright launch failures carry thousands of characters of call log.
+        # The console gets the detail; Telegram gets the one actionable line.
         ui.warn(f"proof render failed: {type(error).__name__}: {error}")
-        await _ack(event, f"Render failed: {type(error).__name__}: {error}")
+        try:
+            from chatshot.render import RenderError, launch_failure_hint
+
+            summary = (
+                str(error)
+                if isinstance(error, RenderError)
+                else launch_failure_hint(f"{error}")
+            )
+        except ImportError:
+            summary = f"{type(error).__name__}: {error}"[:300]
+        await _ack(event, f"Render failed \u2014 {summary}")
         return
 
     caption = f"{conversation.meta.title} \u2014 {len(messages)} message(s)"
