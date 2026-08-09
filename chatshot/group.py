@@ -26,6 +26,10 @@ def _same_group(a: Optional[Msg], b: Optional[Msg], window: int) -> bool:
         return False
     if a.sender.id != b.sender.id:
         return False
+    # A message can reach us without a date. Grouping is a time-based decision,
+    # so without one the safe answer is "separate run" rather than a crash.
+    if a.ts is None or b.ts is None:
+        return False
     if a.ts.date() != b.ts.date():
         return False
     # A sticker floats without a bubble, so it never shares a run.
@@ -78,15 +82,19 @@ def with_date_separators(messages: list[Msg]) -> list[tuple[str, object]]:
     out: list[tuple[str, object]] = []
     last: Optional[date] = None
     for message in messages:
-        day = message.ts.date()
-        if day != last:
+        day = message.ts.date() if message.ts is not None else None
+        if day is not None and day != last:
             out.append(("date", date_label(day)))
             last = day
         out.append(("msg", message))
     return out
 
 
-def format_time(ts: datetime, clock24: bool = False) -> str:
+def format_time(ts: Optional[datetime], clock24: bool = False) -> str:
+    """Empty string for an undated message: better a missing time than a crash,
+    and better than inventing a timestamp on something labelled a proof."""
+    if ts is None:
+        return ""
     if clock24:
         return ts.strftime("%H:%M")
     # %-I is glibc-specific; strip the pad manually so this stays portable.

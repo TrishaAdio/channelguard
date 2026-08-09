@@ -145,6 +145,10 @@ img.ce{width:1.16em;height:1.16em;vertical-align:-0.19em;object-fit:contain}
 /* Telegram runs a photo edge-to-edge inside the bubble. `overflow:hidden` would
    clip the tail fin, so the image carries the corner radii itself instead. */
 .ph{display:block;max-width:100%;object-fit:cover}
+.phmiss{display:flex;align-items:center;justify-content:center;max-width:100%;
+  background:rgba(127,127,127,.22);border-radius:14px 14px 0 0}
+.phmiss span{font-size:13px;opacity:.6}
+.bubble.media.nocap .phmiss{border-radius:14px}
 .bubble.media{padding:0}
 .bubble.media .ph{border-radius:14px 14px 0 0}
 .bubble.media.nocap .ph{border-radius:14px}
@@ -261,6 +265,20 @@ _SCRIPT = """
 # --------------------------------------------------------------------------
 
 
+#: Stand-in shown wherever a name is suppressed.
+_MASKED_NAME = "\u2014"
+
+
+def _mask_name(name: str, options) -> str:
+    """Apply `hide_sender_names` consistently.
+
+    The option exists to post a proof without exposing who the other party is,
+    so it has to cover every place a name appears — a bubble name, a reply
+    header and a forward header all identify the same person.
+    """
+    return _MASKED_NAME if options.hide_sender_names else name
+
+
 def _avatar(name: str, avatar: str, color_index: int, extra: str = "av") -> str:
     if avatar:
         return f'<div class="{extra}"><img src="{esc_attr(avatar)}" alt=""></div>'
@@ -308,6 +326,18 @@ def _photo_box(media: Media) -> str:
     return f"width:{display}px;aspect-ratio:{max(1, width)}/{max(1, height)}"
 
 
+def _missing_image(media: Media) -> str:
+    """Placeholder for media that could not be downloaded.
+
+    Emitting `<img src="">` instead would render the browser's broken-image
+    glyph, which looks like a bug in the screenshot rather than a missing file.
+    """
+    return (
+        f'<div class="phmiss" style="{_photo_box(media)}">'
+        '<span>image unavailable</span></div>'
+    )
+
+
 def _fmt_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -326,6 +356,8 @@ def _media_html(media: Media, out: bool, spacer: str = "") -> str:
     if kind == "photo":
         # An explicit width plus aspect-ratio is required: media may be a tiny
         # placeholder or a thumbnail, and `height:auto` alone would collapse it.
+        if not media.src:
+            return _missing_image(media)
         return f'<img class="ph" style="{_photo_box(media)}" src="{esc_attr(media.src)}" alt="">'
     if kind == "sticker":
         return f'<img class="stk" src="{esc_attr(media.src)}" alt="">'
@@ -338,7 +370,7 @@ def _media_html(media: Media, out: bool, spacer: str = "") -> str:
         poster = (
             f'<img class="ph" style="{_photo_box(media)}" src="{esc_attr(media.src)}" alt="">'
             if media.src
-            else ""
+            else _missing_image(media)
         )
         return (
             f'<div class="vidwrap">{poster}<div class="play">{_PLAY}</div>{pill}</div>'
@@ -397,12 +429,15 @@ def _bubble(message: Msg, options, theme: str, emoji_src) -> str:
 
     if message.show_name:
         color = name_color(theme, message.sender.color_index)
-        label = "\u2014" if options.hide_sender_names else message.sender.name
-        body.append(f'<span class="nm" style="color:{color}">{esc(label)}</span>')
+        body.append(
+            f'<span class="nm" style="color:{color}">'
+            f'{esc(_mask_name(message.sender.name, options))}</span>'
+        )
 
     if message.forward_from:
         body.append(
-            f'<div class="fwd">Forwarded from <b>{esc(message.forward_from)}</b></div>'
+            '<div class="fwd">Forwarded from '
+            f'<b>{esc(_mask_name(message.forward_from, options))}</b></div>'
         )
 
     if message.reply is not None:
@@ -416,7 +451,8 @@ def _bubble(message: Msg, options, theme: str, emoji_src) -> str:
             f'<div class="rep"><div class="bar" style="background:{color}"></div>'
             f"{thumb}"
             '<div class="tx">'
-            f'<div class="rn" style="color:{color}">{esc(message.reply.name)}</div>'
+            f'<div class="rn" style="color:{color}">'
+            f'{esc(_mask_name(message.reply.name, options))}</div>'
             f'<div class="rt">{esc(message.reply.text)}</div>'
             "</div></div>"
         )
@@ -557,25 +593,34 @@ body{{font-family:var(--font),'Noto Sans Devanagari','Noto Color Emoji',sans-ser
     meta = conversation.meta
     bar = ""
     if options.window_chrome and meta.show_header:
+        # In a one-to-one chat the window title *is* the other party's name and
+        # the header avatar is their photo, so anonymising has to cover both or
+        # hide_sender_names/hide_avatars would leak exactly what they suppress.
+        title = meta.title
+        if options.hide_sender_names and meta.is_private:
+            title = "Private chat"
+        anonymous = options.hide_avatars or options.hide_sender_names
         subtitle = (
             f'<span class="s">{esc(meta.subtitle)}</span>' if meta.subtitle else ""
         )
+        header_avatar = ""
+        if title and not anonymous:
+            header_avatar = _avatar(title, meta.avatar, meta.color_index)
         bar = (
             '<div id="bar">'
             '<div class="lights"><div class="light l1"></div>'
             '<div class="light l2"></div><div class="light l3"></div></div>'
-            + (
-                _avatar(meta.title, meta.avatar, meta.color_index)
-                if meta.title
-                else ""
-            )
+            + header_avatar
             + '<div id="bartitle">'
-            f'<span class="t">{esc(meta.title)}</span>{subtitle}</div>'
+            f'<span class="t">{esc(title)}</span>{subtitle}</div>'
             "</div>"
         )
 
     win_class = "" if options.window_chrome else " bare"
-    pane_class = "pane wp" if options.wallpaper else "pane"
+    # "plain" is a documented preset, so it has to actually mean a flat
+    # background rather than quietly falling back to the mesh.
+    use_mesh = options.wallpaper and options.wallpaper_preset != "plain"
+    pane_class = "pane wp" if use_mesh else "pane"
 
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
