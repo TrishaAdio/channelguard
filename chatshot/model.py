@@ -203,7 +203,7 @@ class RenderOptions:
 
     theme: str = "light"           # light | dark
     width: int = 720               # CSS px of the chat column
-    scale: int = 3                 # device pixel ratio
+    scale: float = 3.0             # device pixel ratio; fractional is allowed
     window_chrome: bool = True     # macOS window frame + shadow
     wallpaper: bool = True
     wallpaper_preset: str = "auto"   # auto | slate | telegram | plain

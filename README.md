@@ -256,6 +256,11 @@ The revenue split, timezone, and share basis are configured via
 `.proof` renders real messages from the chat you run it in as a **macOS-style
 Telegram screenshot** and posts the PNG to the channel set by `.setproofs`.
 
+![Example .proof output](docs/example.png)
+
+*Actual renderer output ([dark theme](docs/example-dark.png)). Regenerate both
+with `python3 -m chatshot.make_example`.*
+
 Telethon cannot take a screenshot — it is a protocol client with no UI to
 capture. So `chatshot` reads the messages through Telethon, rebuilds them as
 HTML/CSS, and photographs that with headless Chromium at a 3x device pixel

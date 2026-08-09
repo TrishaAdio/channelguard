@@ -24,13 +24,21 @@ from .model import (
 _OFFER = "Yes \u2014 \u20b9500 for one seat. Send the payment and I'll add you."
 
 
-def _png_pixel(color: tuple[int, int, int]) -> str:
-    """A 1x1 PNG data URI, stretched by CSS. Keeps fixtures dependency-free."""
+def _png(width: int, height: int, pixel) -> str:
+    """Build a tiny truecolour PNG data URI without any imaging dependency.
+
+    A small bitmap stretched by CSS is smoothed by the browser, so an 8x6 source
+    reads as a soft gradient rather than a flat block.
+    """
     import struct
     import zlib
 
-    red, green, blue = color
-    raw = bytes([0, red, green, blue])
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)                      # filter type: none
+        for x in range(width):
+            red, green, blue = pixel(x / max(1, width - 1), y / max(1, height - 1))
+            raw += bytes((red & 255, green & 255, blue & 255))
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         body = tag + data
@@ -40,11 +48,34 @@ def _png_pixel(color: tuple[int, int, int]) -> str:
 
     png = (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
         + chunk(b"IEND", b"")
     )
     return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+def _png_pixel(color: tuple[int, int, int]) -> str:
+    return _png(1, 1, lambda _x, _y: color)
+
+
+def placeholder_image(width: int = 96, height: int = 64) -> str:
+    """A neutral abstract gradient, standing in for a real photo.
+
+    Sampled at a real resolution rather than a handful of pixels: a tiny source
+    upscaled by the browser produces hard-edged blobs, not a smooth image.
+    """
+    import math
+
+    def pixel(x: float, y: float) -> tuple[int, int, int]:
+        wave = 0.5 + 0.5 * math.sin(3.0 * x + 1.7 * y)
+        return (
+            int(46 + 120 * x + 40 * wave),
+            int(84 + 70 * y + 50 * wave),
+            int(150 + 70 * (1 - x) + 25 * y),
+        )
+
+    return _png(width, height, pixel)
 
 
 def ent(text: str, kind: str, needle: str, **kwargs) -> Ent:
@@ -98,7 +129,7 @@ def sample_conversation(theme: str = "light") -> Conversation:
             id=5,
             sender=buyer,
             ts=base + timedelta(minutes=3, seconds=10),
-            media=Media(kind="photo", src=_png_pixel((84, 122, 168)), w=420, h=280),
+            media=Media(kind="photo", src=placeholder_image(), w=420, h=280),
             text="payment screenshot",
         ),
         Msg(

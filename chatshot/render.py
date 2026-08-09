@@ -96,7 +96,7 @@ class Renderer:
 
         async with self._slots:
             context = await browser.new_context(
-                device_scale_factor=max(1, int(options.scale)),
+                device_scale_factor=max(1.0, float(options.scale)),
                 viewport={
                     "width": int(options.width) + 2 * int(options.padding) + 40,
                     "height": 900,
@@ -146,7 +146,7 @@ def render_png_sync(conversation: Conversation, *, emoji_src=None) -> bytes:
         browser = playwright.chromium.launch(args=_ARGS)
         try:
             context = browser.new_context(
-                device_scale_factor=max(1, int(options.scale)),
+                device_scale_factor=max(1.0, float(options.scale)),
                 viewport={
                     "width": int(options.width) + 2 * int(options.padding) + 40,
                     "height": 900,
