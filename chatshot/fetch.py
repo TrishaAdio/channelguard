@@ -57,6 +57,9 @@ _ENTITY_MAP = {
 #: rendered PNG grows with it and Telegram re-encodes anyway.
 _MAX_INLINE_BYTES = 4 * 1024 * 1024
 
+#: Thumbnail sizes to try, largest first, when inlining an image.
+_THUMB_FALLBACKS = (-1, 2, 1, 0)
+
 
 def _data_uri(payload: bytes, mime: str = "image/jpeg") -> str:
     if not payload:
@@ -161,12 +164,25 @@ class Fetcher:
         try:
             blob = await self.client.download_media(message, file=bytes, thumb=thumb)
         except Exception as error:  # noqa: BLE001
-            log.debug("media download failed: %s", error)
+            log.debug("media download failed (thumb=%s): %s", thumb, error)
             return b""
         if blob and len(blob) > _MAX_INLINE_BYTES:
-            log.debug("media too large to inline (%d bytes); using a thumb", len(blob))
+            log.debug("media too large to inline (%d bytes)", len(blob))
             return b""
         return blob or b""
+
+    async def _download_image(self, message) -> bytes:
+        """Largest image that fits the inline budget.
+
+        A high-resolution photo can exceed the budget outright; returning nothing
+        would render a placeholder, so progressively smaller cached sizes are
+        tried before giving up.
+        """
+        for thumb in _THUMB_FALLBACKS:
+            blob = await self._download(message, thumb=thumb)
+            if blob:
+                return blob
+        return b""
 
     def _entities(self, message) -> list[Ent]:
         out: list[Ent] = []
@@ -198,7 +214,7 @@ class Fetcher:
         spoiler = bool(getattr(media, "spoiler", False))
 
         if isinstance(media, tl.MessageMediaPhoto) or getattr(message, "photo", None):
-            blob = await self._download(message, thumb=-1)
+            blob = await self._download_image(message)
             width, height = self._photo_size(message)
             return Media(
                 kind="photo",
@@ -236,13 +252,13 @@ class Fetcher:
 
         if sticker is not None:
             # Animated .tgs/.webm cannot go in an <img>; the cached thumbnail can.
-            blob = await self._download(message, thumb=-1)
+            blob = await self._download_image(message)
             return Media(
                 kind="sticker", src=_data_uri(blob, _sniff_mime(blob)) if blob else ""
             )
 
         if video is not None:
-            blob = await self._download(message, thumb=-1)
+            blob = await self._download_image(message)
             return Media(
                 kind="video",
                 src=_data_uri(blob, _sniff_mime(blob)) if blob else "",
@@ -357,10 +373,16 @@ class Fetcher:
         options: Optional[RenderOptions] = None,
     ) -> tuple[Conversation, dict[int, str]]:
         """Build a Conversation plus the custom-emoji lookup for the renderer."""
-        ordered = sorted(
-            [m for m in messages if m is not None],
-            key=lambda m: (getattr(m, "date", None) or 0, m.id),
-        )
+        # `or 0` here would compare int against datetime and raise as soon as
+        # one message in the batch had no date, so undated ones sort by id
+        # behind the dated ones instead.
+        def sort_key(message):
+            when = getattr(message, "date", None)
+            if when is None:
+                return (1, 0.0, int(getattr(message, "id", 0) or 0))
+            return (0, when.timestamp(), int(getattr(message, "id", 0) or 0))
+
+        ordered = sorted([m for m in messages if m is not None], key=sort_key)
         emoji = await self._custom_emoji(ordered)
         read_ceiling = await self._read_ceiling(chat)
 

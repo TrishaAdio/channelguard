@@ -3571,6 +3571,21 @@ async def cmd_proof(event) -> None:
     await _ack(event, f"Proof posted to {target}.")
 
 
+async def _close_proof_renderer() -> None:
+    """Shut down the headless browser a `.proof` may have started."""
+    try:
+        from chatshot.render import close_renderer
+    except ImportError:
+        return
+    try:
+        await close_renderer()
+    except Exception as error:  # noqa: BLE001
+        ui.warn(
+            f"Couldn't close the screenshot browser: "
+            f"{type(error).__name__}: {error}"
+        )
+
+
 async def _notify_owner(text: str) -> None:
     """Send a note to the configured OWNER (falls back to Saved Messages)."""
     target = config.owner() or _state.get("self_id") or "me"
@@ -4364,6 +4379,7 @@ async def main() -> None:
     finally:
         recovery_task.cancel()
         await asyncio.gather(recovery_task, return_exceptions=True)
+        await _close_proof_renderer()
 
 
 if __name__ == "__main__":

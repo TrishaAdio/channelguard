@@ -36,6 +36,26 @@ class RenderError(RuntimeError):
     pass
 
 
+def device_scale(options) -> float:
+    """Device pixel ratio for a render.
+
+    Kept as a float on purpose: `int()` here silently turned a 1.75x request
+    into a 1x render. Playwright accepts a fractional device_scale_factor.
+    """
+    try:
+        scale = float(options.scale)
+    except (TypeError, ValueError):
+        scale = 1.0
+    return max(1.0, scale)
+
+
+def viewport_for(options) -> dict:
+    return {
+        "width": int(options.width) + 2 * int(options.padding) + 40,
+        "height": 900,
+    }
+
+
 class Renderer:
     def __init__(self, max_concurrent: int = _MAX_CONCURRENT) -> None:
         self._playwright = None
@@ -96,11 +116,8 @@ class Renderer:
 
         async with self._slots:
             context = await browser.new_context(
-                device_scale_factor=max(1.0, float(options.scale)),
-                viewport={
-                    "width": int(options.width) + 2 * int(options.padding) + 40,
-                    "height": 900,
-                },
+                device_scale_factor=device_scale(options),
+                viewport=viewport_for(options),
                 color_scheme="dark" if options.theme == "dark" else "light",
             )
             try:
@@ -136,6 +153,18 @@ async def render_png(conversation: Conversation, *, emoji_src=None) -> bytes:
     return await get_renderer().png(conversation, emoji_src=emoji_src)
 
 
+async def close_renderer() -> None:
+    """Close the process-wide renderer, if one was ever created.
+
+    Called on shutdown so a `.proof` does not leave a Chromium process behind.
+    """
+    global _renderer
+    if _renderer is None:
+        return
+    renderer, _renderer = _renderer, None
+    await renderer.close()
+
+
 def render_png_sync(conversation: Conversation, *, emoji_src=None) -> bytes:
     """Blocking helper for the CLI and tests."""
     from playwright.sync_api import sync_playwright
@@ -146,11 +175,8 @@ def render_png_sync(conversation: Conversation, *, emoji_src=None) -> bytes:
         browser = playwright.chromium.launch(args=_ARGS)
         try:
             context = browser.new_context(
-                device_scale_factor=max(1.0, float(options.scale)),
-                viewport={
-                    "width": int(options.width) + 2 * int(options.padding) + 40,
-                    "height": 900,
-                },
+                device_scale_factor=device_scale(options),
+                viewport=viewport_for(options),
                 color_scheme="dark" if options.theme == "dark" else "light",
             )
             page = context.new_page()

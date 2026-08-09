@@ -4,7 +4,9 @@ UTF-16 offset drift and mis-nested overlapping entities.
 
 from __future__ import annotations
 
+import asyncio
 from html.parser import HTMLParser
+from types import SimpleNamespace
 
 import pytest
 
@@ -251,3 +253,207 @@ def test_plain_preview_collapses_whitespace_and_truncates() -> None:
     assert plain_preview("a\n\n  b") == "a b"
     long = plain_preview("x" * 200, limit=10)
     assert len(long) == 10 and long.endswith("\u2026")
+
+
+
+# --------------------------------------------------------------------------
+# undated messages, missing media, and the privacy switches
+# --------------------------------------------------------------------------
+
+
+def _msg(**kwargs):
+    from datetime import datetime
+
+    from chatshot.model import Msg, Sender
+
+    base = {
+        "id": 1,
+        "sender": Sender(id=9, name="Rahul Verma"),
+        "ts": datetime(2026, 8, 9, 12, 0),
+    }
+    base.update(kwargs)
+    return Msg(**base)
+
+
+def _conv(messages, **option_kwargs):
+    from chatshot.model import ChatMeta, Conversation, RenderOptions
+
+    meta = option_kwargs.pop("meta", None) or ChatMeta(title="Rahul Verma")
+    return Conversation(
+        messages=messages, meta=meta, options=RenderOptions(**option_kwargs)
+    )
+
+
+def test_a_message_without_a_date_does_not_crash_the_renderer() -> None:
+    """Telegram normally sends a date, but nothing in the model guaranteed one."""
+    from chatshot.html import build_html
+
+    html = build_html(_conv([_msg(ts=None, text="hi"), _msg(id=2, ts=None, text="yo")]))
+    assert "hi" in html and "yo" in html
+
+
+def test_undated_messages_get_no_time_and_no_date_separator() -> None:
+    from chatshot.group import format_time, with_date_separators
+
+    assert format_time(None) == ""
+    assert format_time(None, clock24=True) == ""
+    kinds = [kind for kind, _item in with_date_separators([_msg(ts=None)])]
+    assert kinds == ["msg"]          # no invented date pill
+
+
+def test_undated_messages_are_never_grouped() -> None:
+    from chatshot.group import apply_grouping
+
+    messages = [_msg(ts=None), _msg(id=2, ts=None)]
+    apply_grouping(messages)
+    assert all(m.first_in_group and m.last_in_group for m in messages)
+
+
+def test_a_dated_and_an_undated_message_still_sort() -> None:
+    """`or 0` in the sort key compared int against datetime and raised."""
+    from datetime import datetime, timezone
+
+    from chatshot.fetch import Fetcher
+
+    class Client:
+        async def get_me(self):
+            return SimpleNamespace(id=1)
+
+    dated = SimpleNamespace(
+        id=2, date=datetime(2026, 8, 9, tzinfo=timezone.utc), message="b",
+        out=False, entities=[], media=None, action=None, forward=None,
+        edit_date=None, photo=None, document=None,
+    )
+    undated = SimpleNamespace(
+        id=1, date=None, message="a", out=False, entities=[], media=None,
+        action=None, forward=None, edit_date=None, photo=None, document=None,
+    )
+    for message in (dated, undated):
+        message.get_sender = lambda: _async(None)
+        message.get_reply_message = lambda: _async(None)
+
+    fetcher = Fetcher(Client())
+    conversation, _emoji = asyncio.run(
+        fetcher.conversation(SimpleNamespace(id=5, title="T"), [dated, undated])
+    )
+    # Dated first, undated behind it - and crucially, no TypeError.
+    assert [m.id for m in conversation.messages] == [2, 1]
+
+
+def _async(value):
+    async def inner():
+        return value
+
+    return inner()
+
+
+def test_missing_media_renders_a_placeholder_not_a_broken_image() -> None:
+    from chatshot.html import _media_html
+    from chatshot.model import Media
+
+    html = _media_html(Media(kind="photo", src="", w=800, h=600), False)
+    assert 'src=""' not in html
+    assert "phmiss" in html
+
+    video = _media_html(Media(kind="video", src="", w=640, h=480, duration=9), False)
+    assert 'src=""' not in video
+    assert "phmiss" in video
+
+
+def test_hide_sender_names_masks_every_place_a_name_appears() -> None:
+    """Bubble name, reply header, forward header and the window title all
+    identify the same person, so the switch has to cover all four."""
+    from chatshot.html import build_html
+    from chatshot.model import ChatMeta, ReplyRef
+
+    message = _msg(
+        text="hi",
+        reply=ReplyRef(name="Rahul Verma", text="earlier"),
+        forward_from="Rahul Verma",
+    )
+    message.show_name = True
+    html = build_html(
+        _conv(
+            [message],
+            meta=ChatMeta(title="Rahul Verma", is_private=True),
+            hide_sender_names=True,
+        )
+    )
+    assert "Rahul Verma" not in html
+    assert "Private chat" in html
+
+
+def test_names_are_shown_when_the_switch_is_off() -> None:
+    from chatshot.html import build_html
+    from chatshot.model import ChatMeta
+
+    html = build_html(
+        _conv([_msg(text="hi")], meta=ChatMeta(title="Rahul Verma", is_private=True))
+    )
+    assert "Rahul Verma" in html
+
+
+def test_hide_avatars_also_drops_the_window_header_avatar() -> None:
+    from chatshot.html import build_html
+    from chatshot.model import ChatMeta
+
+    avatar = "data:image/png;base64,AAAA"
+    shown = build_html(
+        _conv([_msg(text="hi")], meta=ChatMeta(title="R", avatar=avatar))
+    )
+    hidden = build_html(
+        _conv(
+            [_msg(text="hi")],
+            meta=ChatMeta(title="R", avatar=avatar),
+            hide_avatars=True,
+        )
+    )
+    assert avatar in shown
+    assert avatar not in hidden
+
+
+def test_plain_wallpaper_preset_disables_the_mesh() -> None:
+    from chatshot.html import build_html
+
+    mesh = build_html(_conv([_msg(text="hi")]))
+    plain = build_html(_conv([_msg(text="hi")], wallpaper_preset="plain"))
+    assert 'class="pane wp"' in mesh
+    assert 'class="pane wp"' not in plain
+
+
+def test_fractional_render_scale_reaches_the_browser() -> None:
+    """`int(options.scale)` in render.py silently turned 1.75 into a 1x render."""
+    from chatshot.model import RenderOptions
+    from chatshot.render import device_scale
+
+    assert device_scale(RenderOptions(scale=1.75)) == 1.75
+    assert device_scale(RenderOptions(scale=3)) == 3.0
+    # Never below 1x, and a junk value degrades instead of raising.
+    assert device_scale(RenderOptions(scale=0)) == 1.0
+    assert device_scale(RenderOptions(scale="nonsense")) == 1.0
+
+
+def test_oversized_images_fall_back_to_a_smaller_thumbnail() -> None:
+    from chatshot.fetch import _MAX_INLINE_BYTES, _THUMB_FALLBACKS, Fetcher
+
+    attempts: list = []
+
+    class Client:
+        async def download_media(self, _message, file=None, thumb=None):
+            attempts.append(thumb)
+            # Only the smallest cached size fits the inline budget.
+            if thumb == _THUMB_FALLBACKS[-1]:
+                return b"\x89PNG\r\n\x1a\nsmall"
+            return b"x" * (_MAX_INLINE_BYTES + 1)
+
+    blob = asyncio.run(Fetcher(Client())._download_image(object()))
+    assert blob.startswith(b"\x89PNG")
+    assert attempts == list(_THUMB_FALLBACKS)
+
+
+def test_close_renderer_is_safe_when_none_was_started() -> None:
+    from chatshot import render as render_mod
+
+    render_mod._renderer = None
+    asyncio.run(render_mod.close_renderer())      # must not raise
+    assert render_mod._renderer is None
