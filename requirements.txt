@@ -1,3 +1,8 @@
 telethon==1.36.0
 python-dotenv==1.0.1
 colorama==0.4.6
+# Renders `.proof` chat screenshots via headless Chromium. After installing,
+# run `python -m chatshot.setup_assets` once to fetch Chromium and the fonts.
+# `.proof` is the only feature that needs this; the rest of the userbot runs
+# without it.
+playwright==1.62.0
