@@ -693,6 +693,58 @@ def test_rendered_channel_post_can_be_reused_as_a_live_template() -> None:
     assert "₹5,108" not in text
 
 
+def test_credited_on_is_a_parameter_so_one_layout_serves_many_accounts(
+    monkeypatch,
+) -> None:
+    rendered = (
+        "#NEW PAYMENT RECEIVED ! 🎉\n\n"
+        "AMOUNT : ₹100\n"
+        "MARCO SHARE : ₹1,510.65\n"
+        "RIO'S SHARE : ₹1,846.35\n"
+        "ORDER ID : ANI9ZCC2Y\n"
+        "AMOUNT CREDITED ON : airtel\n\n"
+        "PAYMENT COUNT : #19\n"
+        "TOTAL : ₹3,357"
+    )
+
+    # With the account declared, capturing a rendered receipt recovers it as a
+    # token instead of freezing the previous account's name into the template.
+    monkeypatch.setattr(quickreply.config, "CREDITED_ON", "airtel")
+    template, _entities = quickreply._canonicalize_legacy_payment_fields(rendered, [])
+    assert "AMOUNT CREDITED ON : {creditedon}" in template
+    assert "airtel" not in template
+
+    # The same template then follows .env onto another account.
+    monkeypatch.setattr(quickreply.config, "CREDITED_ON", "paytm")
+    monkeypatch.setattr(quickreply.config, "RIO_PCT", 70.0)
+    monkeypatch.setattr(quickreply.config, "MARCO_PCT", 30.0)
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pay["channel_template"] = template
+    text, _ = asyncio.run(
+        quickreply._safe_payment_output(
+            "channel",
+            quickreply.Decimal("1000"),
+            "Neha",
+            "TRI7W9GZJ",
+            [],
+            [],
+            include_current=True,
+        )
+    )
+    assert "AMOUNT CREDITED ON : paytm" in text
+    assert "MARCO SHARE : ₹300" in text
+    assert "RIO'S SHARE : ₹700" in text
+    assert "{" not in text
+
+    # Undeclared account: the literal name must survive untouched, so existing
+    # templates that spell the account out keep working.
+    monkeypatch.setattr(quickreply.config, "CREDITED_ON", "")
+    plain, _entities = quickreply._canonicalize_legacy_payment_fields(rendered, [])
+    assert "AMOUNT CREDITED ON : airtel" in plain
+    assert "{creditedon}" not in plain
+    assert "{amount}" in plain and "{todaytotal}" in plain
+
+
 def test_partial_group_failure_renders_values_privately_and_in_channel(
     monkeypatch,
 ) -> None:

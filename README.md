@@ -215,7 +215,8 @@ Template parameters (usable in both `/setdone` and `/setchannelpostofpayment`):
 `{amount}` (this payment), `{name}`, `{orderid}` (a unique per-payment id like
 `ANI7F3K9Q`, generated once and shared by the user message and channel post),
 `{rioshare}`, `{marco}`, `{total}` (payments today), `{todaytotal}` (collected
-today). The `{orderid}` prefix and suffix length are set by `ORDER_PREFIX` and
+today), `{creditedon}` (the account the money landed on, from `CREDITED_ON`).
+The `{orderid}` prefix and suffix length are set by `ORDER_PREFIX` and
 `ORDER_ID_LENGTH` in `.env`. Reply to a formatted post
 with `/setdone` or `/setchannelpostofpayment` to keep bold, links, and premium
 emoji verbatim. `pay.json` is validated and repaired at startup; malformed manual
@@ -247,6 +248,22 @@ names and unavailable details. Failed/ambiguous channel uploads are reconciled
 by order id and retried from `pay.json`.
 The revenue split, timezone, and share basis are configured via
 `RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
+
+### Reusing one receipt layout on another account
+
+The templates hold only `{tokens}`, so the same receipt text works anywhere:
+copy the template across, then point `.env` at the new account —
+`RIO_PCT`/`MARCO_PCT`/`SHARE_BASE` for the split, `CREDITED_ON` for the
+credited account, `ORDER_PREFIX` for the id namespace, `PAYMENT_CHANNEL` (or
+`.setchannel`) for the target. Use a separate data dir and sessions per
+account; `{total}`/`{todaytotal}` come from that install's `data/pay.json`.
+
+Replying to an already-rendered receipt with `/setchannelpostofpayment` is
+enough — labelled values (`AMOUNT :`, `MARCO SHARE :`, `RIO'S SHARE :`,
+`ORDER ID :`, `PAYMENT COUNT :`, `TOTAL :`) are converted back to live tokens
+on capture. `AMOUNT CREDITED ON :` is recovered the same way, but only when
+`CREDITED_ON` is set, so receipts that name the account in literal text are
+left alone.
 
 ## Files
 
@@ -305,6 +322,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `MARCO_PCT`      | (payment logger) Marco's split percent (default 45) |
 | `SHARE_BASE`     | (payment logger) split base: `today` or `transaction` (default `today`) |
 | `TZ`             | (payment logger) timezone for the "today" boundary (default `Asia/Kolkata`) |
+| `CREDITED_ON`    | (payment logger) `{creditedon}` value, e.g. `airtel`; blank leaves the token empty |
 
 ## Notes
 

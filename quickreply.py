@@ -878,6 +878,7 @@ def _pay_mapping(amount: Decimal, name: str, order_id: str = "",
         "{marco}": fmt_inr(marco),
         "{total}": str(today_count),          # count of payments today
         "{todaytotal}": fmt_inr(today_total),  # total amount collected today
+        "{creditedon}": config.CREDITED_ON,   # account the money landed on
     }
 
 
@@ -938,6 +939,7 @@ _TEMPLATE_TOKEN_ALIASES = {
     "marco": "{marco}",
     "total": "{total}",
     "todaytotal": "{todaytotal}",
+    "creditedon": "{creditedon}",
 }
 
 
@@ -1014,6 +1016,13 @@ _LEGACY_PAYMENT_FIELD_PATTERNS = (
     ),
 )
 
+# Recovered only when CREDITED_ON is configured: the account name is free text,
+# so without a declared parameter there is nothing to replace it with, and an
+# operator who keeps the account in literal template text must stay untouched.
+_LEGACY_CREDITED_ON_RE = re.compile(
+    r"(?im)^\s*amount\s+credited\s+on\s*:[ \t]*(?P<value>[^\r\n]*[^\s\r\n])"
+)
+
 
 def _substitute_spans(text: str, entities, replacements: list[tuple]):
     """Replace non-overlapping character spans while preserving entities."""
@@ -1069,6 +1078,12 @@ def _canonicalize_legacy_payment_fields(text: str, entities):
     for pattern, token in _LEGACY_PAYMENT_FIELD_PATTERNS:
         for match in pattern.finditer(text or ""):
             replacements.append((*match.span("value"), token))
+    if config.CREDITED_ON:
+        for match in _LEGACY_CREDITED_ON_RE.finditer(text or ""):
+            # An already-tokenized line needs no recovery.
+            if match.group("value").lstrip().startswith("{"):
+                continue
+            replacements.append((*match.span("value"), "{creditedon}"))
     return _substitute_spans(text, entities, replacements)
 
 
@@ -3271,7 +3286,8 @@ HELP_TEXT = (
     "<code>{orderid}</code> unique order id (e.g. ANI7F3K9Q) - "
     "<code>{link}</code> buyer-bound invite link(s), private receipt only - "
     "<code>{rioshare}</code> Rio's share - <code>{marco}</code> Marco's share - "
-    "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today\n"
+    "<code>{total}</code> payment count today - <code>{todaytotal}</code> collected today - "
+    "<code>{creditedon}</code> account credited (set <code>CREDITED_ON</code> in .env)\n"
     "<blockquote>Reply to a formatted post with /setdone or "
     "/setchannelpostofpayment to keep bold, links and premium emoji.</blockquote>\n"
     "<b>Greeting</b> (Saved Messages)\n"
