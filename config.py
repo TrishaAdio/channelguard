@@ -75,6 +75,10 @@ TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
 # once per payment (e.g. ANI7F3K9Q). Configure the prefix and suffix length.
 ORDER_PREFIX = os.getenv("ORDER_PREFIX", "ANI")
 ORDER_ID_LENGTH = _int("ORDER_ID_LENGTH", 6, minimum=3)
+# {creditedon} template parameter: where the money landed, e.g. "airtel".
+# Blank leaves the token empty, so receipts that name the account in literal
+# text keep working untouched.
+CREDITED_ON = os.getenv("CREDITED_ON", "").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
@@ -120,6 +124,7 @@ _ENV_BACKED_VALUES = {
     "OWNER": "OWNER_RAW",
     "LINK_SOURCE": "LINK_SOURCE_RAW",
     "PAYMENT_CHANNEL": "PAYMENT_CHANNEL_RAW",
+    "CREDITED_ON": "CREDITED_ON",
 }
 
 
