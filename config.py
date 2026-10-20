@@ -60,6 +60,10 @@ ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 # Persistent fallback for the payment upload channel. ``.setchannel`` writes
 # this automatically, while data/pay.json remains the live runtime store.
 PAYMENT_CHANNEL_RAW = os.getenv("PAYMENT_CHANNEL", "")
+# Daily payment-screenshot ZIPs (quickreply.py). Each finished IST day is
+# zipped and sent to SS_CHANNEL; change it live with .ssto, toggle with .ssauto.
+SS_CHANNEL_RAW = os.getenv("SS_CHANNEL", "@ohthatsthepoint")
+SS_AUTO = os.getenv("SS_AUTO", "1").strip().lower() not in ("0", "false", "no", "")
 # Revenue split for the {rioshare}/{marco} caption parameters.
 RIO_PCT = _float("RIO_PCT", 55.0, minimum=0.0)
 MARCO_PCT = _float("MARCO_PCT", 45.0, minimum=0.0)
@@ -112,6 +116,10 @@ def payment_channel():
     return coerce(PAYMENT_CHANNEL_RAW)
 
 
+def ss_channel():
+    return coerce(SS_CHANNEL_RAW)
+
+
 # Environment keys that also back a module-level value read at import time.
 # Saving one of these has to refresh the live value, otherwise the running
 # process keeps using the parameter the operator has already replaced.
@@ -120,6 +128,7 @@ _ENV_BACKED_VALUES = {
     "OWNER": "OWNER_RAW",
     "LINK_SOURCE": "LINK_SOURCE_RAW",
     "PAYMENT_CHANNEL": "PAYMENT_CHANNEL_RAW",
+    "SS_CHANNEL": "SS_CHANNEL_RAW",
 }
 
 

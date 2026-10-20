@@ -42,6 +42,15 @@ Payment logger (send these yourself in ANY chat):
                                     and revoke/remove buyer-bound access
   /clear                         reset today's stats to zero
   .ping                          verify the quick-reply userbot is running
+
+Backup + screenshot ZIPs (Saved Messages):
+  .save                          full backup ZIP (profile, photos, Business,
+                                 every quick reply + media, data/*.json) sent
+                                 to Saved Messages; no session or API keys
+  .sszip [today|yesterday|YYYY-MM-DD]
+                                 that IST day's payment screenshots as a ZIP
+  .ssauto [on|off]               auto-send each finished day's ZIP to SS_CHANNEL
+  .ssto <@channel|id>            where the daily ZIPs go (default @ohthatsthepoint)
   .help                          show every command and template parameter
 
 Business quick replies require Telegram Premium (the payment logger does not).
@@ -110,6 +119,7 @@ from bot.utils import (
     group_literal_rank,
 )
 from runtime_lock import ProcessLock
+import quickreply_extras as extras
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -182,6 +192,7 @@ _state = {
     "away_enabled": config.GREET_NEW,
     "owner_active_until": 0.0,
     "activity_generation": 0,
+    "ss_auto": config.SS_AUTO,
 }
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
@@ -3280,6 +3291,12 @@ HELP_TEXT = (
     "<b>Broadcast</b> (Saved Messages)\n"
     "<code>/broadcast 9:30 AM 18 JUL THANKS FOR</code> - reply to a post to copy it to every chat "
     "where you sent the keyword from that IST time until now\n"
+    "<b>Backup + screenshots</b> (Saved Messages)\n"
+    "<code>.save</code> - full backup ZIP (profile, photos, Business, every quick reply + media, "
+    "payments/templates data) sent here; no session or API keys inside\n"
+    "<code>.sszip [today|yesterday|YYYY-MM-DD]</code> - that IST day's payment screenshots as a ZIP\n"
+    "<code>.ssauto [on|off]</code> - auto-send each finished day's ZIP; "
+    "<code>.ssto &lt;@channel|id&gt;</code> - where it goes\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3682,6 +3699,19 @@ async def _handle_outgoing(event):
 
     text = raw_text.strip()
     low = text.lower()
+    command = low.split()[0] if low else ""
+    if command == ".save":
+        await cmd_save(event)
+        return
+    if command == ".sszip":
+        await cmd_sszip(event)
+        return
+    if command == ".ssauto":
+        await cmd_ssauto(event)
+        return
+    if command == ".ssto":
+        await cmd_ssto(event)
+        return
     if low.startswith("/broadcast"):
         reply = await event.get_reply_message()
         if reply is None:
@@ -3737,6 +3767,146 @@ async def _handle_outgoing(event):
         greeting = "set" if _load_greeting() else "not set"
         away = "enabled" if _state["away_enabled"] else "disabled"
         await event.reply(f"Greeting is {greeting}. Away messages are {away}.")
+
+
+# --------------------------------------------------------------------------
+# .save backup + payment-screenshot ZIPs (logic lives in quickreply_extras.py)
+# --------------------------------------------------------------------------
+SS_STATE_FILE = config.DATA_DIR / "ss_archive.json"
+_ss_lock = asyncio.Lock()
+
+
+async def cmd_save(event) -> None:
+    """`.save`: full account backup ZIP, verified, sent to Saved Messages."""
+    await _ack(event, "Saving everything (profile, photos, Business, quick replies, data)...")
+    try:
+        result = await extras.save_everything(
+            client, data_dir=config.DATA_DIR, env_path=config.ENV_PATH,
+            greeting_ref=_load_greeting(),
+        )
+        await client.send_file("me", file=str(result["path"]), caption=extras.backup_caption(result),
+                               force_document=True)
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Backup failed: {type(error).__name__}: {error}")
+        return
+    size = result["size"] / (1024 * 1024)
+    await _ack(event, ("Backup complete" if result["complete"] else "Backup saved but PARTIAL")
+               + f" - {result['files']} file(s), {size:.1f} MB. A copy is kept in "
+               f"data/backups/{result['path'].name}.")
+    print(ui.green("[save] ") + f"{result['path'].name} ({size:.1f} MB)", flush=True)
+
+
+async def cmd_sszip(event) -> None:
+    """`.sszip [day]`: that IST day's payment screenshots as one ZIP, here."""
+    parts = (event.raw_text or "").split()
+    try:
+        day = extras.parse_day(parts[1] if len(parts) > 1 else "", _TZ)
+    except ValueError as error:
+        await _ack(event, f"{error}. Usage: .sszip [today|yesterday|YYYY-MM-DD]")
+        return
+    await _ack(event, f"Downloading payment screenshots for {day}...")
+    import tempfile as _tempfile
+
+    async with _ss_lock:
+        with _tempfile.TemporaryDirectory(prefix="qr-ss-") as folder:
+            try:
+                result = await extras.build_ss_zip(
+                    client, list(_pay.get("payments", [])), day, _TZ, Path(folder))
+                if result["path"] is None:
+                    detail = (f"{result['expected']} payment(s) found but no screenshot could be "
+                              "downloaded." if result["expected"] else "no payments with a screenshot.")
+                    await _ack(event, f"{day}: {detail}")
+                    return
+                await client.send_file(event.chat_id, file=str(result["path"]),
+                                       caption=extras.ss_caption(result), force_document=True)
+            except Exception as error:  # noqa: BLE001
+                await _ack(event, f"Screenshot ZIP failed: {type(error).__name__}: {error}")
+                return
+    await _ack(event, f"{day}: {result['count']} screenshot(s) zipped"
+               + (f", {len(result['missing'])} missing" if result["missing"] else "") + ".")
+
+
+def _ss_status_text() -> str:
+    state = extras.SSState(SS_STATE_FILE)
+    delivered = state.data["delivered"]
+    lines = [
+        f"Daily screenshot ZIPs: {'ON' if _state['ss_auto'] else 'OFF'} -> {config.SS_CHANNEL_RAW or 'NOT SET'}",
+        f"Started: {state.data.get('enabled_since') or 'not yet'} (earlier days: use .sszip <date>)",
+    ]
+    for day in sorted(delivered)[-5:]:
+        info = delivered[day]
+        lines.append(f"{day}: {info.get('count', 0)} screenshot(s) delivered")
+    for day, failure in sorted(state.data["failures"].items()):
+        lines.append(f"{day}: retrying ({failure.get('error', 'failed')})")
+    return "\n".join(lines)
+
+
+async def cmd_ssauto(event) -> None:
+    parts = (event.raw_text or "").lower().split()
+    if len(parts) > 1 and parts[1] in ("on", "off"):
+        enabled = parts[1] == "on"
+        try:
+            config.save_env({"SS_AUTO": "1" if enabled else "0"})
+        except OSError as error:
+            ui.warn(f"Couldn't persist SS_AUTO: {error}")
+        _state["ss_auto"] = enabled
+    await _ack(event, _ss_status_text())
+
+
+async def cmd_ssto(event) -> None:
+    parts = (event.raw_text or "").split()
+    if len(parts) < 2:
+        await _ack(event, "Usage: .ssto <@channel|id|t.me link>\n" + _ss_status_text())
+        return
+    try:
+        chat_id, title = await _resolve_post_target(parts[1])
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Couldn't resolve {parts[1]}: {type(error).__name__}: {error}")
+        return
+    try:
+        config.save_env({"SS_CHANNEL": str(chat_id)})
+    except OSError as error:
+        ui.warn(f"Couldn't persist SS_CHANNEL: {error}")
+        config.SS_CHANNEL_RAW = str(chat_id)
+    await _ack(event, f"Daily screenshot ZIPs now go to {title} ({chat_id}).")
+
+
+async def _ss_archive_cycle() -> None:
+    if not _state["ss_auto"] or not config.SS_CHANNEL_RAW:
+        return
+    state = extras.SSState(SS_STATE_FILE)
+    today = extras.parse_day("today", _TZ)
+    state.ensure_start(today)
+    due = state.due_days(today)
+    if not due:
+        return
+    target = await client.get_entity(config.ss_channel())
+    async with _ss_lock:
+        for day in due:
+            try:
+                line = await extras.deliver_day(
+                    client, list(_pay.get("payments", [])), day, _TZ, target, state)
+                print(ui.green("[ss] ") + line, flush=True)
+            except Exception as error:  # noqa: BLE001
+                detail = f"{type(error).__name__}: {error}"
+                attempts = state.mark_failed(day, detail)
+                ui.warn(f"[ss] {day} not delivered: {detail}")
+                if attempts == 1:
+                    await _notify_owner(
+                        f"Payment screenshot ZIP for {day} could not be sent to "
+                        f"{config.SS_CHANNEL_RAW}: {detail}. It will retry automatically "
+                        "(.ssauto shows the status, .ssto changes the channel)."
+                    )
+
+
+async def _ss_archive_loop() -> None:
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _ss_archive_cycle()
+        except Exception as error:  # noqa: BLE001
+            ui.warn(f"Screenshot ZIP loop failed: {type(error).__name__}: {error}")
+        await asyncio.sleep(300)
 
 
 def _command_identity(event) -> str:
@@ -3944,14 +4114,18 @@ async def main() -> None:
         ui.warn("Bot link bridge: NOT loaded — run this from the repo root so "
                 "'import linkstore' works, or /add <keyword> can't reach the bot.")
     print(ui.dim("Ctrl+C to stop."))
+    ui.info("Backup: .save  |  screenshot ZIPs: .sszip [day], daily auto "
+            + (f"ON -> {config.SS_CHANNEL_RAW}" if _state["ss_auto"] else "OFF (.ssauto on)"))
     recovery_task = asyncio.create_task(
         _payment_recovery_loop(), name="payment-channel-recovery"
     )
+    ss_task = asyncio.create_task(_ss_archive_loop(), name="payment-screenshot-zips")
     try:
         await client.run_until_disconnected()
     finally:
-        recovery_task.cancel()
-        await asyncio.gather(recovery_task, return_exceptions=True)
+        for task in (recovery_task, ss_task):
+            task.cancel()
+        await asyncio.gather(recovery_task, ss_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

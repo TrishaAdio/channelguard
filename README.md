@@ -318,3 +318,32 @@ host-wide lock prevents two infrastructure launchers from running at once.
 - Admins cannot be banned by another admin (Telegram restriction); those
   attempts are ignored.
 - `.env` and `*.session` are gitignored — never commit them.
+
+## quickreply.py: `.save` backup and payment-screenshot ZIPs
+
+Send these in **Saved Messages**:
+
+| Command | What it does |
+|---|---|
+| `.save` | Full backup as one ZIP, sent to Saved Messages, with a copy in `data/backups/` (the last 10 are kept). |
+| `.sszip [today\|yesterday\|YYYY-MM-DD]` | That day's payment screenshots as `payment_screenshots_<date>.zip`, sent to the chat you typed it in. |
+| `.ssauto [on\|off]` | Shows or toggles the automatic daily ZIP, and lists recent deliveries. |
+| `.ssto <@channel\|id>` | Where the daily ZIPs go. The default is `@ohthatsthepoint`. |
+
+**What `.save` includes:**
+- **Profile:** names, username, bio, birthday, colours and emoji status.
+- **Photos:** every profile photo, including video avatars, plus the fallback photo.
+- **Business setup:** hours, location, intro, greeting/away messages and chat links.
+- **Quick replies:** every one, with its text, formatting, custom emoji, buttons and media.
+- **Greeting:** the `/set` greeting post.
+- **Bot data:** every `data/*.json` file (payment log, templates, greeted users…) and your `.env` settings.
+
+It never includes the session file, `API_ID`/`API_HASH` or tokens, or your phone number. The ZIP is checked after it's written. If any part failed, the caption says **PARTIAL** and names it.
+
+**Screenshot ZIPs:**
+- **Which day:** one Asia/Kolkata day, 00:00 to the next 00:00, decided by when you ran `/add` (the same day `/stats` uses). Payments marked fake or failed are left out.
+- **Where images come from:** each proof is downloaded from the customer chat. If the customer deleted it, the copy in the payment channel is used instead.
+- **Contents:** the original images, named `0001_<HHMM>_<orderid>.jpg`, plus a `manifest.json` with the order id, amount and time for each, and any screenshots that were missing.
+- **Automatic sending:** each finished day is sent to `SS_CHANNEL` a few minutes after midnight IST. The upload is checked, and the day is recorded in `data/ss_archive.json` so it's never sent twice. Failures retry by themselves, and the owner is told once.
+- **Earlier days:** automatic sending starts from the day you update. Use `.sszip <date>` for older days.
+- **Nothing is deleted** from Telegram.
