@@ -120,6 +120,7 @@ from bot.utils import (
 )
 from runtime_lock import ProcessLock
 import quickreply_extras as extras
+import quickreply_restore as restore
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -3297,6 +3298,8 @@ HELP_TEXT = (
     "<code>.sszip [today|yesterday|YYYY-MM-DD]</code> - that IST day's payment screenshots as a ZIP\n"
     "<code>.ssauto [on|off]</code> - auto-send each finished day's ZIP; "
     "<code>.ssto &lt;@channel|id&gt;</code> - where it goes\n"
+    "<code>.setup</code> - on a NEW account: rebuild it from the newest backup (or reply to a "
+    "backup ZIP); preview first, then <code>.setup confirm</code>. Username and gifts are not moved\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3712,6 +3715,9 @@ async def _handle_outgoing(event):
     if command == ".ssto":
         await cmd_ssto(event)
         return
+    if command == ".setup":
+        await cmd_setup(event)
+        return
     if low.startswith("/broadcast"):
         reply = await event.get_reply_message()
         if reply is None:
@@ -3907,6 +3913,79 @@ async def _ss_archive_loop() -> None:
         except Exception as error:  # noqa: BLE001
             ui.warn(f"Screenshot ZIP loop failed: {type(error).__name__}: {error}")
         await asyncio.sleep(300)
+
+
+# --------------------------------------------------------------------------
+# .setup - rebuild this account from a .save backup
+# --------------------------------------------------------------------------
+_pending_setup: dict = {}
+
+
+async def _setup_source(event):
+    """Replied backup ZIP (downloaded) or the newest data/backups ZIP."""
+    reply = await event.get_reply_message()
+    if reply is not None and getattr(reply, "file", None) is not None:
+        name = getattr(reply.file, "name", "") or ""
+        if not name.endswith(".zip"):
+            raise ValueError("Reply to a quickreply_backup_*.zip file.")
+        target = config.DATA_DIR / "backups" / Path(name).name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await client.download_media(reply, file=str(target))
+        return target
+    path = restore.newest_backup(config.DATA_DIR)
+    if path is None:
+        raise ValueError("No backup found. Run .save on the old account first, or forward its "
+                         "quickreply_backup_*.zip here and reply to it with .setup")
+    return path
+
+
+async def cmd_setup(event) -> None:
+    """`.setup` preview, `.setup confirm` apply, `.setup cancel`."""
+    parts = (event.raw_text or "").lower().split()
+    sub = parts[1] if len(parts) > 1 else ""
+    if sub == "cancel":
+        _pending_setup.clear()
+        await _ack(event, "Setup cancelled.")
+        return
+    if sub == "confirm":
+        path = _pending_setup.get("path")
+        if not path or time.monotonic() > _pending_setup.get("until", 0):
+            await _ack(event, "Nothing to confirm (or it expired). Send .setup first.")
+            return
+        _pending_setup.clear()
+        await _ack(event, "Restoring... this takes a minute (photos and media are uploaded).")
+        backup = restore.Backup(path)
+        try:
+            async with _payment_lock:
+                report, greeting = await restore.run(client, backup, dry_run=False,
+                                                     data_dir=config.DATA_DIR, sleep=asyncio.sleep,
+                                                     pay_store=_pay)
+                _save_pay()
+        finally:
+            backup.close()
+        if greeting:
+            _save_greeting(greeting["chat_id"], greeting["message_id"])
+        head = ("SETUP DONE" if not report.failed else f"SETUP DONE WITH {len(report.failed)} PROBLEM(S)")
+        await _ack(event, f"{head}\n\n{report.text()}"[:4000])
+        return
+    try:
+        path = await _setup_source(event)
+        backup = restore.Backup(path)
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Setup: {error}")
+        return
+    try:
+        report, _ = await restore.run(client, backup, dry_run=True, data_dir=config.DATA_DIR,
+                                      sleep=asyncio.sleep, pay_store=None)
+        info = restore.describe(backup)
+        source_id = (backup.doc.get("profile") or {}).get("id")
+    finally:
+        backup.close()
+    same = source_id == _state["self_id"]
+    _pending_setup.update(path=path, until=time.monotonic() + 600)
+    warn = ("\nNOTE: this backup is from THIS account; restoring adds the photos again.\n" if same else "")
+    await _ack(event, f"SETUP PREVIEW (nothing changed yet)\n{info}{warn}\n\n{report.text()}\n\n"
+                      "Send .setup confirm within 10 minutes to apply, or .setup cancel."[:4000])
 
 
 def _command_identity(event) -> str:

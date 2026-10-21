@@ -82,7 +82,8 @@ ORDER_ID_LENGTH = _int("ORDER_ID_LENGTH", 6, minimum=3)
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION = str(BASE_DIR / "userbot")          # guard account session
-QR_SESSION = str(BASE_DIR / "quickreply")    # quick-reply account session
+# quick-reply account session; QR_SESSION=newid in .env logs in another account
+QR_SESSION = str(BASE_DIR / (os.getenv("QR_SESSION", "quickreply").strip() or "quickreply"))
 ENV_PATH = BASE_DIR / ".env"
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
