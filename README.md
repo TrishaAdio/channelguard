@@ -347,3 +347,16 @@ It never includes the session file, `API_ID`/`API_HASH` or tokens, or your phone
 - **Automatic sending:** each finished day is sent to `SS_CHANNEL` a few minutes after midnight IST. The upload is checked, and the day is recorded in `data/ss_archive.json` so it's never sent twice. Failures retry by themselves, and the owner is told once.
 - **Earlier days:** automatic sending starts from the day you update. Use `.sszip <date>` for older days.
 - **Nothing is deleted** from Telegram.
+
+### `.setup`: rebuild a new account from a `.save` backup
+
+1. On the old account, send `.save` in Saved Messages.
+2. Log the new account in on its own session: add `QR_SESSION=newid` to `.env`, then run `python quickreply.py` and log in with the new number. The old `quickreply.session` is left alone; remove the line to switch back.
+3. On the new account, send `.setup` in Saved Messages. It uses the newest ZIP in `data/backups/`. You can also forward the backup ZIP to the new account and reply to it with `.setup`.
+4. It shows a preview without changing anything. Send `.setup confirm` within 10 minutes to apply it.
+
+**Restored:** name, bio, birthday, name and profile colour, emoji status, every profile photo (the current one stays current), the fallback photo, every quick reply with its formatting and media, the Business hours/location/intro/greeting/away messages (linked to the new quick replies) and chat links, the `/set` greeting, and the payment templates and payment channel.
+
+**Not moved:** the username and gifts stay with the old account. The payment log and greeted list aren't copied either, because they belong to the old account's chats. Inline buttons are dropped, since user accounts can't send them.
+
+Quick replies and Business features need Premium on the new account; without it they're reported as skipped. Each step is reported separately, and one failure doesn't stop the rest.
