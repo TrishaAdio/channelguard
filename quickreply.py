@@ -54,8 +54,11 @@ Backup + screenshot ZIPs (Saved Messages):
   .help                          show every command and template parameter
 
 DM country separator (any chat):
-  .separator on|off|status       file new DMs from outside India into the
-                                 "Videshi" folder; Indian DMs stay put
+  .separator on|off|status       file DMs from outside India into the
+                                 "Videshi" folder and out of "Unread";
+                                 Indian DMs stay put
+  .separator scan                sort existing DMs (also runs on "on")
+  .separator check               in a DM: its detected country -> Saved Msgs
   .gdpa                          in a DM: delete the command and put the
                                  user's country's per capita income ($) in
                                  the draft (not sent)
@@ -149,7 +152,7 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 # `/setchannelpostofpayment`.
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
-_SEPARATOR_RE = re.compile(r"^[./]separator(?:\s+(on|off|status))?$", re.IGNORECASE)
+_SEPARATOR_RE = re.compile(r"^[./]separator(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -3313,8 +3316,10 @@ HELP_TEXT = (
     "<code>.setup</code> - on a NEW account: rebuild it from the newest backup (or reply to a "
     "backup ZIP); preview first, then <code>.setup confirm</code>. Username and gifts are not moved\n"
     "<b>Separator</b> (any chat)\n"
-    "<code>.separator on|off|status</code> - new DMs from outside India go to the "
-    "<b>Videshi</b> folder (created automatically); Indian DMs stay put\n"
+    "<code>.separator on|off|status</code> - DMs from outside India go to the "
+    "<b>Videshi</b> folder (created automatically) and leave your Unread folder; "
+    "Indian DMs stay put. <code>.separator scan</code> sorts existing DMs; "
+    "<code>.separator check</code> in a DM shows its country in Saved Messages\n"
     "<code>.gdpa</code> - in a customer's DM: deletes itself and puts their country's "
     "per capita income ($) in your draft, without sending it\n"
     "<b>Block</b>\n"
@@ -4024,14 +4029,20 @@ _sep_tasks: set = set()
 def _separator_status_text() -> str:
     filed = len(_sep_state.filed) if _sep_state else 0
     state = "ON" if _state["separator"] else "OFF"
-    return (f"Separator is {state}. While ON, new DMs from outside India go to the "
-            f"'{separator.FOLDER_TITLE}' folder and Indian DMs stay where they are. "
-            f"{filed} chat(s) filed so far.")
+    return (f"Separator is {state}. While ON, DMs from outside India go to the "
+            f"'{separator.FOLDER_TITLE}' folder and are taken out of your Unread folder; "
+            f"Indian DMs stay where they are. {filed} chat(s) filed so far.")
+
+
+_sep_scan: dict = {}
 
 
 async def cmd_separator(event) -> None:
-    """`.separator on|off|status`, persisted as SEPARATOR in .env."""
+    """`.separator on|off|status|scan|check`, persisted as SEPARATOR in .env."""
     choice = (_SEPARATOR_RE.match((event.raw_text or "").strip().lower()).group(1) or "status")
+    if choice == "check":
+        await _separator_check(event)
+        return
     if choice in ("on", "off"):
         enabled = choice == "on"
         try:
@@ -4039,31 +4050,155 @@ async def cmd_separator(event) -> None:
         except OSError as error:
             ui.warn(f"Couldn't persist SEPARATOR: {error}")
         _state["separator"] = enabled
+    if (choice == "scan" or (choice == "on")) and _state["separator"]:
+        started = _start_separator_scan(event.chat_id)
+        await _ack(event, _separator_status_text() + (
+            "\nSorting your existing DMs now; the result is sent here when done."
+            if started else "\nA scan of existing DMs is already running."))
+        return
+    if choice == "scan":
+        await _ack(event, "Turn it on first: .separator on")
+        return
     await _ack(event, _separator_status_text())
+
+
+async def _file_user(peer, user, *, fresh=False) -> tuple[str, str | None]:
+    """File one private-chat user. Returns (outcome, country).
+
+    outcome: "skip" (bot/self/guard), "india", "unknown", "already", or the
+    Videshi folder title the chat was just added to.
+    """
+    skip = [_state["source_id"]] if _state["source_id"] else []
+    if not separator.should_check(user, _state["self_id"], skip):
+        return "skip", None
+    if str(user.id) in _sep_state.filed and not fresh:
+        return "already", None
+    country = await separator.country_for(client, _sep_state, peer, user.id, user, fresh=fresh)
+    if country is None:
+        return "unknown", None
+    if country == separator.HOME_COUNTRY:
+        return "india", country
+    title, _added = await _sep_folders.add(peer)
+    _sep_state.filed[str(user.id)] = title
+    _sep_state.save()
+    changed, problems = await _sep_folders.remove_from_unread([peer])
+    for problem in problems:
+        ui.warn(f"[separator] Unread folder: {problem}")
+    print(ui.green("[separator] ") + f"{user.id} ({country}) -> {title}"
+          + (f", removed from {', '.join(changed)}" if changed else ""), flush=True)
+    return title, country
 
 
 async def _separate_dm(event) -> None:
     """Add a foreign private chat to the Videshi folder (once per user)."""
     try:
         sender = await event.get_sender()
-        skip = [_state["source_id"]] if _state["source_id"] else []
-        if not separator.should_check(sender, _state["self_id"], skip):
-            return
-        if str(sender.id) in _sep_state.filed:
+        if sender is None or str(sender.id) in _sep_state.filed:
             return
         peer = await event.get_input_chat()
-        country = await separator.country_for(client, _sep_state, peer, sender.id, sender)
-        if country is None or country == separator.HOME_COUNTRY:
-            return  # Indian, or unknown: leave the chat where it is
-        title, added = await _sep_folders.add(peer)
-        _sep_state.filed[str(sender.id)] = title
-        _sep_state.save()
-        if added:
-            print(ui.green("[separator] ") + f"{sender.id} ({country}) -> {title}", flush=True)
+        outcome, _country = await _file_user(peer, sender)
+        if outcome == "unknown":
+            print(ui.dim(f"[separator] {sender.id}: Telegram shows no phone country yet; "
+                         "retrying on a later message"), flush=True)
     except FloodWaitError as error:
         ui.warn(f"[separator] flood wait {error.seconds}s; will retry on their next message")
     except Exception as error:  # noqa: BLE001
         ui.error(f"[separator] failed for {event.chat_id}: {type(error).__name__}: {error}")
+
+
+SCAN_DIALOG_LIMIT = 1000   # most recent private chats checked by a scan
+SCAN_DELAY = 1.0           # seconds between lookups, to stay clear of flood limits
+
+
+def _start_separator_scan(report_chat) -> bool:
+    task = _sep_scan.get("task")
+    if task is not None and not task.done():
+        return False
+    _sep_scan["task"] = asyncio.create_task(_separator_scan(report_chat))
+    return True
+
+
+async def _separator_scan(report_chat) -> None:
+    """File existing DMs, and take already-filed chats out of Unread."""
+    counts = {"filed": 0, "india": 0, "unknown": 0, "already": 0}
+    filed_peers = []
+    try:
+        async for dialog in client.iter_dialogs(limit=SCAN_DIALOG_LIMIT):
+            if not _state["separator"]:
+                break
+            if not dialog.is_user:
+                continue
+            user = dialog.entity
+            peer = dialog.input_entity
+            if str(getattr(user, "id", 0)) in _sep_state.filed:
+                counts["already"] += 1
+                filed_peers.append(peer)
+                continue
+            hit, _c = _sep_state.cached_country(getattr(user, "id", 0))
+            for attempt in range(2):
+                try:
+                    outcome, _country = await _file_user(peer, user)
+                    break
+                except FloodWaitError as error:
+                    if attempt or error.seconds > 300:
+                        raise
+                    await asyncio.sleep(error.seconds + 1)
+            if outcome in counts:
+                counts[outcome] += 1
+            elif outcome != "skip":
+                counts["filed"] += 1
+            if not hit and outcome != "skip":
+                await asyncio.sleep(SCAN_DELAY)  # only real lookups are throttled
+        changed, problems = await _sep_folders.remove_from_unread(filed_peers)
+        text = (f"Separator scan done: {counts['filed']} newly moved to "
+                f"{separator.FOLDER_TITLE}, {counts['already']} already there, "
+                f"{counts['india']} Indian (left alone), {counts['unknown']} unknown country "
+                "(checked again when they message you).")
+        if changed:
+            text += f"\nRemoved Videshi chats from: {', '.join(sorted(set(changed)))}."
+        if problems:
+            text += "\nUnread folder: " + "; ".join(problems)
+    except Exception as error:  # noqa: BLE001
+        text = (f"Separator scan stopped: {type(error).__name__}: {error}. "
+                f"So far {counts['filed']} moved. Send .separator scan to continue.")
+        ui.error(f"[separator] {text}")
+    print(ui.green("[separator] ") + text, flush=True)
+    if report_chat is None:  # startup scan: console only
+        return
+    try:
+        await client.send_message(report_chat, text)
+    except Exception:  # noqa: BLE001
+        await client.send_message("me", text)
+
+
+async def _separator_check(event) -> None:
+    """`.separator check` in a DM: fresh lookup, report to Saved Messages only."""
+    if not event.is_private or event.chat_id == _state["self_id"]:
+        await _ack(event, "Send .separator check inside the customer's DM.")
+        return
+    try:
+        await event.delete()  # the customer must not see it
+    except Exception:  # noqa: BLE001
+        pass
+    user = await event.get_chat()
+    peer = await event.get_input_chat()
+    name = getattr(user, "first_name", None) or event.chat_id
+    country, source = await separator.detect_country(client, peer, user)
+    _sep_state.remember(user.id, country, source)
+    _sep_state.save()
+    lines = [f"Separator check for {name} ({event.chat_id}):",
+             f"Country: {country or 'unknown'} (from {source})"]
+    if not _state["separator"]:
+        lines.append("Separator is OFF, so nothing was moved (.separator on).")
+    elif country and country != separator.HOME_COUNTRY:
+        outcome, _c = await _file_user(peer, user, fresh=True)
+        lines.append(f"Filed in {outcome}; removed from any Unread folder.")
+    elif country == separator.HOME_COUNTRY:
+        lines.append("Indian number, so it stays where it is.")
+    else:
+        lines.append("Telegram doesn't show this user's phone country (it usually only "
+                     "does for non-contacts) and their number is hidden, so it can't be sorted.")
+    await client.send_message("me", "\n".join(lines))
 
 
 async def _prefetch_country(event) -> None:
@@ -4347,6 +4482,8 @@ async def main() -> None:
         _payment_recovery_loop(), name="payment-channel-recovery"
     )
     ss_task = asyncio.create_task(_ss_archive_loop(), name="payment-screenshot-zips")
+    if _state["separator"]:
+        _start_separator_scan(None)  # file DMs that arrived while offline
     try:
         await client.run_until_disconnected()
     finally:

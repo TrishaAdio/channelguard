@@ -254,15 +254,17 @@ Send these yourself, in any chat:
 
 | Command | Effect |
 |---------|--------|
-| `.separator on` / `.separator off` | When on, every new incoming DM from outside India is added to a chat folder named **Videshi** (created on first use). Indian DMs aren't moved. The setting is saved as `SEPARATOR` in `.env`. |
+| `.separator on` / `.separator off` | When on, every DM from outside India is added to a chat folder named **Videshi** (created on first use) and taken out of any folder with "Unread" in its name. Indian DMs aren't moved. Turning it on also sorts your existing DMs. The setting is saved as `SEPARATOR` in `.env`. |
+| `.separator scan` | Sorts your existing DMs (the 1,000 most recent) again and reports the counts in the same chat. It also runs by itself at startup. |
+| `.separator check` (inside a DM) | Deletes itself and sends that user's detected country, and where it came from, to your Saved Messages. Files the chat if it's foreign. |
 | `.separator` / `.separator status` | Shows whether it's on and how many chats have been filed. |
 | `.gdpa` (inside a customer's DM) | Deletes the `.gdpa` message for both sides and puts their country's per capita income in your message box as a draft, e.g. `🇺🇸 United States - per capita income: $90,027 (2025)`. Nothing is sent. |
 
 - **How the country is found:** from the phone country Telegram shows on the "Not a contact" card. For contacts who share their number, it's read from the number instead.
-- **If the country can't be found,** the chat isn't moved, and it's checked again after 6 hours. For `.gdpa`, a note is sent to your Saved Messages instead.
+- **If the country can't be found,** the chat isn't moved, and it's checked again on their next message (at most every 5 minutes). For `.gdpa`, a note is sent to your Saved Messages instead.
 - **Folders:** a folder is a view, so filed chats still show in All Chats. Each user is filed once, so if you take a chat out of Videshi it stays out. When Telegram says a folder is full (100 chats, or 200 with Premium), `Videshi 2`, `Videshi 3` and so on are created.
 - **Bots and service accounts** are skipped, and so is the guard account.
-- **Existing chats:** only DMs that arrive after `.separator on` are filed.
+- **Unread folder:** a chat filed in Videshi is removed from the Unread folder's chat list, or added to its excluded chats when the folder includes chats by type (e.g. "Non-contacts"). Telegram allows 100 excluded chats per folder (200 with Premium); past that the bot logs a warning.
 - **Data:** the figures come from the World Bank: GDP per capita in current US$, falling back to GNI per capita (Atlas) where that's missing. They're a fixed chart in `per_capita_chart.py` (214 countries), so `.gdpa` never goes online for them. Each customer's country is also remembered when they DM you, so `.gdpa` usually needs no Telegram lookup either. Taiwan and a few other economies have no World Bank figure.
 - State is kept in `data/separator.json`.
 

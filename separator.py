@@ -27,6 +27,7 @@ from telethon.tl.functions.messages import (
     GetPeerSettingsRequest,
     UpdateDialogFilterRequest,
 )
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import DialogFilter, InputPeerUser, TextWithEntities
 
 try:
@@ -38,8 +39,10 @@ HOME_COUNTRY = "IN"
 FOLDER_TITLE = "Videshi"
 _FOLDER_RE = re.compile(rf"^{FOLDER_TITLE}(?:\s+(\d+))?$", re.IGNORECASE)
 # Unknown countries are re-checked at most this often (Telegram may start
-# reporting phone_country later, e.g. once the chat has messages).
-UNKNOWN_RETRY_SECONDS = 6 * 3600
+# reporting phone_country a little later, e.g. once the chat has messages).
+UNKNOWN_RETRY_SECONDS = 5 * 60
+# Folders whose title contains this word lose every chat filed into Videshi.
+UNREAD_WORD = "unread"
 # Telegram service notifications.
 _SKIP_IDS = {777000}
 # Chats per folder before Telegram refuses more (200 with Premium). A refusal
@@ -98,20 +101,40 @@ def _country_from_phone(phone: str | None):
     return HOME_COUNTRY if digits.startswith("91") else None
 
 
+def _iso2(code) -> str | None:
+    code = (code or "").strip().upper()
+    return code if len(code) == 2 and code.isalpha() else None
+
+
 async def detect_country(client, peer, user=None) -> tuple[str | None, str]:
-    """(ISO2 country or None, how it was found) for a private-chat user."""
+    """(ISO2 country or None, how it was found) for a private-chat user.
+
+    Tries, in order: the chat's peer settings (the "Not a contact" card),
+    the full user profile's settings (same field, other request), and the
+    phone number when the user shares it.
+    """
     try:
         result = await client(GetPeerSettingsRequest(peer=peer))
-        code = getattr(result.settings, "phone_country", None)
+        code = _iso2(getattr(result.settings, "phone_country", None))
         if code:
-            return code.strip().upper(), "telegram"
+            return code, "telegram"
     except errors.RPCError:
         pass
-    if user is None:
+    try:
+        full = await client(GetFullUserRequest(peer))
+        code = _iso2(getattr(getattr(full.full_user, "settings", None), "phone_country", None))
+        if code:
+            return code, "telegram"
+        for u in getattr(full, "users", None) or []:
+            if getattr(u, "id", None) == _peer_key(peer) and getattr(u, "phone", None):
+                user = u
+    except errors.RPCError:
+        pass
+    if user is None or not getattr(user, "phone", None):
         try:
             user = await client.get_entity(peer)
-        except (ValueError, errors.RPCError):
-            user = None
+        except (ValueError, TypeError, errors.RPCError):
+            pass
     country = _country_from_phone(getattr(user, "phone", None))
     return (country, "phone") if country else (None, "unknown")
 
@@ -191,6 +214,45 @@ class FolderManager:
                         raise
             next_number = max((n for n, _f in numbered), default=0) + 1
             return await self._create(folders, next_number, peer), True
+
+    async def remove_from_unread(self, peers) -> tuple[list[str], list[str]]:
+        """Take these users out of every folder named like "Unread".
+
+        A chat is listed in a folder either explicitly (include/pinned list)
+        or because the folder includes a whole chat type (e.g. "non-contacts"
+        with "exclude read"). The first is removed, the second gets the chat
+        in the folder's exclude list. Returns (changed titles, problems).
+        """
+        ids = {_peer_key(p): p for p in peers if _peer_key(p)}
+        if not ids:
+            return [], []
+        changed, problems = [], []
+        async with self.lock:
+            for f in await self._folders():
+                title = _title_text(f.title)
+                if UNREAD_WORD not in title.lower() or _FOLDER_RE.match(title):
+                    continue
+                updated = copy.copy(f)
+                updated.include_peers = [p for p in f.include_peers if _peer_key(p) not in ids]
+                updated.pinned_peers = [p for p in f.pinned_peers if _peer_key(p) not in ids]
+                by_type = any(getattr(f, flag, False) for flag in
+                              ("contacts", "non_contacts", "groups", "broadcasts", "bots"))
+                excluded = {_peer_key(p) for p in f.exclude_peers}
+                missing = [p for uid, p in ids.items() if uid not in excluded] if by_type else []
+                updated.exclude_peers = list(f.exclude_peers) + missing
+                if (len(updated.include_peers) == len(f.include_peers)
+                        and len(updated.pinned_peers) == len(f.pinned_peers) and not missing):
+                    continue
+                if not by_type and not updated.include_peers:
+                    problems.append(f"'{title}' would be empty, so it was left as is")
+                    continue
+                try:
+                    await self.client(UpdateDialogFilterRequest(id=f.id, filter=updated))
+                    changed.append(title)
+                except errors.RPCError as error:
+                    problems.append(f"'{title}': {error.message or type(error).__name__}"
+                                    + (" (its exclude list is full)" if len(f.exclude_peers) >= FOLDER_FULL_AT else ""))
+        return changed, problems
 
 
 def should_check(user, self_id: int, skip_ids=()) -> bool:
