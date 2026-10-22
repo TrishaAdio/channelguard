@@ -53,6 +53,13 @@ Backup + screenshot ZIPs (Saved Messages):
   .ssto <@channel|id>            where the daily ZIPs go (default @ohthatsthepoint)
   .help                          show every command and template parameter
 
+DM country separator (any chat):
+  .separator on|off|status       file new DMs from outside India into the
+                                 "Videshi" folder; Indian DMs stay put
+  .gdpa                          in a DM: delete the command and put the
+                                 user's country's per capita income ($) in
+                                 the draft (not sent)
+
 Business quick replies require Telegram Premium (the payment logger does not).
 
 Run:  python quickreply.py    (Ctrl+C to stop)
@@ -92,6 +99,7 @@ from telethon.tl.functions.messages import (
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
     HideChatJoinRequestRequest,
+    SaveDraftRequest,
     SendMessageRequest,
     SendQuickReplyMessagesRequest,
 )
@@ -121,6 +129,8 @@ from bot.utils import (
 from runtime_lock import ProcessLock
 import quickreply_extras as extras
 import quickreply_restore as restore
+import percapita
+import separator
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -139,6 +149,7 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 # `/setchannelpostofpayment`.
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_SEPARATOR_RE = re.compile(r"^[./]separator(?:\s+(on|off|status))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -194,6 +205,7 @@ _state = {
     "owner_active_until": 0.0,
     "activity_generation": 0,
     "ss_auto": config.SS_AUTO,
+    "separator": config.SEPARATOR,
 }
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
@@ -3300,6 +3312,11 @@ HELP_TEXT = (
     "<code>.ssto &lt;@channel|id&gt;</code> - where it goes\n"
     "<code>.setup</code> - on a NEW account: rebuild it from the newest backup (or reply to a "
     "backup ZIP); preview first, then <code>.setup confirm</code>. Username and gifts are not moved\n"
+    "<b>Separator</b> (any chat)\n"
+    "<code>.separator on|off|status</code> - new DMs from outside India go to the "
+    "<b>Videshi</b> folder (created automatically); Indian DMs stay put\n"
+    "<code>.gdpa</code> - in a customer's DM: deletes itself and puts their country's "
+    "per capita income ($) in your draft, without sending it\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3648,6 +3665,12 @@ async def _handle_outgoing(event):
     if low_cmd in (".help", "/help", "/commands", "/start"):
         await _ack(event, HELP_TEXT, parse_mode="html")
         return
+    if _SEPARATOR_RE.match(low_cmd):
+        await cmd_separator(event)
+        return
+    if low_cmd in (".gdpa", "/gdpa"):
+        await cmd_gdpa(event)
+        return
     if low_cmd.startswith("/add"):
         async with _payment_lock:
             await cmd_add(event)
@@ -3988,6 +4011,103 @@ async def cmd_setup(event) -> None:
                       "Send .setup confirm within 10 minutes to apply, or .setup cancel."[:4000])
 
 
+# --------------------------------------------------------------------------
+# .separator on|off - file foreign DMs into the "Videshi" folder
+# .gdpa            - per capita income of this DM's country, as a draft
+# (country detection + folder logic live in separator.py)
+# --------------------------------------------------------------------------
+_sep_state: separator.SeparatorState | None = None
+_sep_folders: separator.FolderManager | None = None
+_sep_tasks: set = set()
+
+
+def _separator_status_text() -> str:
+    filed = len(_sep_state.filed) if _sep_state else 0
+    state = "ON" if _state["separator"] else "OFF"
+    return (f"Separator is {state}. While ON, new DMs from outside India go to the "
+            f"'{separator.FOLDER_TITLE}' folder and Indian DMs stay where they are. "
+            f"{filed} chat(s) filed so far.")
+
+
+async def cmd_separator(event) -> None:
+    """`.separator on|off|status`, persisted as SEPARATOR in .env."""
+    choice = (_SEPARATOR_RE.match((event.raw_text or "").strip().lower()).group(1) or "status")
+    if choice in ("on", "off"):
+        enabled = choice == "on"
+        try:
+            config.save_env({"SEPARATOR": "1" if enabled else "0"})
+        except OSError as error:
+            ui.warn(f"Couldn't persist SEPARATOR: {error}")
+        _state["separator"] = enabled
+    await _ack(event, _separator_status_text())
+
+
+async def _separate_dm(event) -> None:
+    """Add a foreign private chat to the Videshi folder (once per user)."""
+    try:
+        sender = await event.get_sender()
+        skip = [_state["source_id"]] if _state["source_id"] else []
+        if not separator.should_check(sender, _state["self_id"], skip):
+            return
+        if str(sender.id) in _sep_state.filed:
+            return
+        peer = await event.get_input_chat()
+        country = await separator.country_for(client, _sep_state, peer, sender.id, sender)
+        if country is None or country == separator.HOME_COUNTRY:
+            return  # Indian, or unknown: leave the chat where it is
+        title, added = await _sep_folders.add(peer)
+        _sep_state.filed[str(sender.id)] = title
+        _sep_state.save()
+        if added:
+            print(ui.green("[separator] ") + f"{sender.id} ({country}) -> {title}", flush=True)
+    except FloodWaitError as error:
+        ui.warn(f"[separator] flood wait {error.seconds}s; will retry on their next message")
+    except Exception as error:  # noqa: BLE001
+        ui.error(f"[separator] failed for {event.chat_id}: {type(error).__name__}: {error}")
+
+
+def _schedule_separator(event) -> None:
+    """Run the separator beside the greeting logic, never delaying it."""
+    if not _state["separator"] or _sep_state is None:
+        return
+    task = asyncio.create_task(_separate_dm(event))
+    _sep_tasks.add(task)
+    task.add_done_callback(_sep_tasks.discard)
+
+
+async def cmd_gdpa(event) -> None:
+    """`.gdpa` in a DM: delete the command, put the per capita income in the draft.
+
+    Nothing is sent to the other person; problems are reported in Saved Messages.
+    """
+    chat_id = event.chat_id
+    if not event.is_private or chat_id == _state["self_id"]:
+        await _ack(event, "Use .gdpa inside a private chat with a customer.")
+        return
+    try:
+        await event.delete()  # revoke: the customer must not see ".gdpa"
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[gdpa] couldn't delete the command in {chat_id}: {error}")
+    try:
+        user = await event.get_chat()
+        peer = await event.get_input_chat()
+        country = await separator.country_for(client, _sep_state, peer, chat_id, user)
+        if country is None:  # don't trust a cached "unknown" for a manual request
+            country = await separator.country_for(client, _sep_state, peer, chat_id, user, fresh=True)
+        text = percapita.per_capita_text(country) if country else None
+        if text is None:
+            name = getattr(user, "first_name", None) or chat_id
+            reason = (f"no per capita data for country {country}" if country
+                      else "Telegram doesn't show their phone country")
+            await client.send_message("me", f".gdpa for {name}: {reason}.")
+            return
+        await client(SaveDraftRequest(peer=peer, message=text))
+        print(ui.green("[gdpa] ") + f"{chat_id} ({country}) draft: {text}", flush=True)
+    except Exception as error:  # noqa: BLE001
+        ui.error(f"[gdpa] failed for {chat_id}: {type(error).__name__}: {error}")
+        await client.send_message("me", f".gdpa failed for chat {chat_id}: {type(error).__name__}: {error}")
+
+
 def _command_identity(event) -> str:
     """Stable identity used to prevent two workers handling one command twice."""
     text = (getattr(event, "raw_text", "") or "").strip()
@@ -4067,6 +4187,7 @@ def _is_guard_demo_link(sender_id: int, link: str) -> bool:
 async def on_msg(event):
     if not event.is_private:
         return
+    _schedule_separator(event)
     sender = event.sender_id
     src = _state["source_id"]
 
@@ -4137,9 +4258,11 @@ async def main() -> None:
         raise SystemExit(1)
     _state["self_id"] = me.id
 
-    global _greeted, _pay
+    global _greeted, _pay, _sep_state, _sep_folders
     _greeted = _load_greeted()
     _pay = _load_pay()
+    _sep_state = separator.SeparatorState(config.DATA_DIR / "separator.json")
+    _sep_folders = separator.FolderManager(client)
     await _recover_pending_payments()
 
     src_raw = config.LINK_SOURCE_RAW.strip()
@@ -4195,6 +4318,8 @@ async def main() -> None:
     print(ui.dim("Ctrl+C to stop."))
     ui.info("Backup: .save  |  screenshot ZIPs: .sszip [day], daily auto "
             + (f"ON -> {config.SS_CHANNEL_RAW}" if _state["ss_auto"] else "OFF (.ssauto on)"))
+    ui.info(f"Separator: {'ON' if _state['separator'] else 'OFF'} "
+            + ui.dim(f"(foreign DMs -> '{separator.FOLDER_TITLE}' folder; .separator on|off, .gdpa)"))
     recovery_task = asyncio.create_task(
         _payment_recovery_loop(), name="payment-channel-recovery"
     )

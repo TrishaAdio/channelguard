@@ -299,10 +299,13 @@ async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, p
         value = profile.get(key)
         if value and value.get("color") is not None:
             live = getattr(me, key, None)
-            await step(key.replace("_", " "), lambda v=value, lv=live: lv is not None and lv.color == v["color"]
-                       and lv.background_emoji_id == v.get("background_emoji_id"),
+            # Layer 200+: UpdateColorRequest takes a PeerColor object.
+            await step(key.replace("_", " "), lambda v=value, lv=live: lv is not None
+                       and getattr(lv, "color", None) == v["color"]
+                       and getattr(lv, "background_emoji_id", None) == v.get("background_emoji_id"),
                        lambda v=value, fp=for_profile: _call(client, UpdateColorRequest(
-                           for_profile=fp, color=v["color"], background_emoji_id=v.get("background_emoji_id")), sleep),
+                           for_profile=fp, color=T.PeerColor(
+                               color=v["color"], background_emoji_id=v.get("background_emoji_id"))), sleep),
                        needs_premium=True)
     status = profile.get("emoji_status")
     if status and status.get("document_id"):
