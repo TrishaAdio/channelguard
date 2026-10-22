@@ -55,6 +55,9 @@ GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "n
 # A manual outgoing message means the owner is active for this long. Telegram's
 # live UserStatusOnline is checked too; this window covers delayed status updates.
 ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
+# DM country separator: file non-Indian private chats into the "Videshi"
+# folder. Toggle live with .separator on|off (saved here). Default off.
+SEPARATOR = os.getenv("SEPARATOR", "0").strip().lower() not in ("0", "false", "no", "")
 
 # --- Payment logger (quickreply.py extension) -----------------------------
 # Persistent fallback for the payment upload channel. ``.setchannel`` writes

@@ -248,6 +248,24 @@ by order id and retried from `pay.json`.
 The revenue split, timezone, and share basis are configured via
 `RIO_PCT`, `MARCO_PCT`, `SHARE_BASE`, and `TZ` in `.env`.
 
+### DM country separator (`quickreply.py`)
+
+Send these yourself, in any chat:
+
+| Command | Effect |
+|---------|--------|
+| `.separator on` / `.separator off` | When on, every new incoming DM from outside India is added to a chat folder named **Videshi** (created on first use). Indian DMs aren't moved. The setting is saved as `SEPARATOR` in `.env`. |
+| `.separator` / `.separator status` | Shows whether it's on and how many chats have been filed. |
+| `.gdpa` (inside a customer's DM) | Deletes the `.gdpa` message for both sides and puts their country's per capita income in your message box as a draft, e.g. `🇺🇸 United States - per capita income: $90,027 (2025)`. Nothing is sent. |
+
+- **How the country is found:** from the phone country Telegram shows on the "Not a contact" card. For contacts who share their number, it's read from the number instead.
+- **If the country can't be found,** the chat isn't moved, and it's checked again after 6 hours. For `.gdpa`, a note is sent to your Saved Messages instead.
+- **Folders:** a folder is a view, so filed chats still show in All Chats. Each user is filed once, so if you take a chat out of Videshi it stays out. When Telegram says a folder is full (100 chats, or 200 with Premium), `Videshi 2`, `Videshi 3` and so on are created.
+- **Bots and service accounts** are skipped, and so is the guard account.
+- **Existing chats:** only DMs that arrive after `.separator on` are filed.
+- **Data:** the figures come from the World Bank: GDP per capita in current US$, falling back to GNI per capita (Atlas) where that's missing. They're bundled in `per_capita.json`. Run `python percapita.py` to refresh them. Taiwan and a few other economies have no World Bank figure.
+- State is kept in `data/separator.json`.
+
 ## Files
 
 | File            | Role                                                          |
@@ -259,6 +277,8 @@ The revenue split, timezone, and share basis are configured via
 | `quickreply.py` | 2nd userbot: keep `/demo` quick reply = the latest link       |
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
 | `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
+| `separator.py`  | Country detection + Videshi folder filing (`.separator`)      |
+| `percapita.py`  | Per capita lookup for `.gdpa`; `python percapita.py` refreshes `per_capita.json` |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`
 (auto-falls back to plain text if it isn't installed).
@@ -297,6 +317,7 @@ host-wide lock prevents two infrastructure launchers from running at once.
 | `LINK_SOURCE`    | (quickreply) account that sends the link; blank = any |
 | `SHORTCUT`       | (quickreply) quick reply name (default `demo`)      |
 | `GREET_NEW`      | (quickreply) first-contact away replies (`1`/`0`)    |
+| `SEPARATOR`      | (quickreply) file non-Indian DMs into the Videshi folder (`1`/`0`, default 0) |
 | `ONLINE_MINUTES` | (quickreply) active window after manual sends (default 2) |
 | `ORDER_PREFIX`   | (payment logger) `{orderid}` prefix (default `ANI`) |
 | `ORDER_ID_LENGTH`| (payment logger) `{orderid}` random suffix length (default 6) |

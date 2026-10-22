@@ -69,7 +69,7 @@ class FreshAccount:
         elif name == "UpdateBirthdayRequest":
             self.full.birthday = r.birthday
         elif name == "UpdateColorRequest":
-            self.user.color = T.PeerColor(color=r.color, background_emoji_id=r.background_emoji_id)
+            self.user.color = r.color
         elif name == "UpdateEmojiStatusRequest":
             self.user.emoji_status = r.emoji_status
         return True

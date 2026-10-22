@@ -1,3 +1,4 @@
-telethon==1.36.0
+telethon==1.45.0
 python-dotenv==1.0.1
 colorama==0.4.6
+phonenumbers>=8.13

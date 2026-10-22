@@ -74,7 +74,7 @@ class FakeClient:
                 for n, sid, m in self.shortcuts], messages=[], chats=[], users=[])
         if name == "GetQuickReplyMessagesRequest":
             msgs = next(m for _n, sid, m in self.shortcuts if sid == request.shortcut_id)
-            return T.messages.Messages(messages=msgs, chats=[], users=[])
+            return T.messages.Messages(messages=msgs, topics=[], chats=[], users=[])
         if name == "GetBusinessChatLinksRequest":
             return T.account.BusinessChatLinks(links=[], chats=[], users=[])
         raise NotImplementedError(name)
