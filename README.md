@@ -381,3 +381,22 @@ It never includes the session file, `API_ID`/`API_HASH` or tokens, or your phone
 **Not moved:** the username and gifts stay with the old account. The payment log and greeted list aren't copied either, because they belong to the old account's chats. Inline buttons are dropped, since user accounts can't send them.
 
 Quick replies and Business features need Premium on the new account; without it they're reported as skipped. Each step is reported separately, and one failure doesn't stop the rest.
+
+## Purger (`purger.py`) — wipe a chat from a point onward
+
+A tiny standalone userbot. Log in your account, then **reply** to any message
+with `.purge`: that message and everything sent after it in the same chat are
+deleted (the `.purge` message included).
+
+```bash
+python purger.py      # first run asks for phone + login code (+ 2FA if set)
+```
+
+- Uses `API_ID` / `API_HASH` from `.env` and its own `purger.session`; it does
+  not touch the guard or quick-reply logins.
+- Deletes **for everyone** where Telegram allows it: both sides in a private
+  chat, and every message in a group/channel where you are an admin with
+  "Delete messages" (otherwise only your own messages).
+- Only a plain, non-forwarded `.purge` (or `/purge`) that **replies** to a
+  message can trigger it, so it never fires by accident.
+- This cannot be undone. A confirmation is written to your Saved Messages.
