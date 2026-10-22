@@ -263,7 +263,7 @@ Send these yourself, in any chat:
 - **Folders:** a folder is a view, so filed chats still show in All Chats. Each user is filed once, so if you take a chat out of Videshi it stays out. When Telegram says a folder is full (100 chats, or 200 with Premium), `Videshi 2`, `Videshi 3` and so on are created.
 - **Bots and service accounts** are skipped, and so is the guard account.
 - **Existing chats:** only DMs that arrive after `.separator on` are filed.
-- **Data:** the figures come from the World Bank: GDP per capita in current US$, falling back to GNI per capita (Atlas) where that's missing. They're bundled in `per_capita.json`. Run `python percapita.py` to refresh them. Taiwan and a few other economies have no World Bank figure.
+- **Data:** the figures come from the World Bank: GDP per capita in current US$, falling back to GNI per capita (Atlas) where that's missing. They're a fixed chart in `per_capita_chart.py` (214 countries), so `.gdpa` never goes online for them. Each customer's country is also remembered when they DM you, so `.gdpa` usually needs no Telegram lookup either. Taiwan and a few other economies have no World Bank figure.
 - State is kept in `data/separator.json`.
 
 ## Files
@@ -278,7 +278,7 @@ Send these yourself, in any chat:
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
 | `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
 | `separator.py`  | Country detection + Videshi folder filing (`.separator`)      |
-| `percapita.py`  | Per capita lookup for `.gdpa`; `python percapita.py` refreshes `per_capita.json` |
+| `percapita.py`  | Per capita lookup for `.gdpa` (reads `per_capita_chart.py`, offline) |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`
 (auto-falls back to plain text if it isn't installed).

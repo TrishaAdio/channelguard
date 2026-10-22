@@ -4066,11 +4066,27 @@ async def _separate_dm(event) -> None:
         ui.error(f"[separator] failed for {event.chat_id}: {type(error).__name__}: {error}")
 
 
+async def _prefetch_country(event) -> None:
+    """Remember a DM sender's country in the background so .gdpa is instant."""
+    try:
+        user_id = event.sender_id
+        if not user_id or user_id == _state["self_id"]:
+            return
+        hit, _country = _sep_state.cached_country(user_id)
+        if hit:
+            return
+        peer = await event.get_input_chat()
+        await separator.country_for(client, _sep_state, peer, user_id)
+    except Exception:  # noqa: BLE001 - best effort; .gdpa looks it up itself
+        pass
+
+
 def _schedule_separator(event) -> None:
-    """Run the separator beside the greeting logic, never delaying it."""
-    if not _state["separator"] or _sep_state is None:
+    """Run the separator (or a country prefetch) beside the greeting logic."""
+    if _sep_state is None:
         return
-    task = asyncio.create_task(_separate_dm(event))
+    work = _separate_dm(event) if _state["separator"] else _prefetch_country(event)
+    task = asyncio.create_task(work)
     _sep_tasks.add(task)
     task.add_done_callback(_sep_tasks.discard)
 
@@ -4084,18 +4100,23 @@ async def cmd_gdpa(event) -> None:
     if not event.is_private or chat_id == _state["self_id"]:
         await _ack(event, "Use .gdpa inside a private chat with a customer.")
         return
+    async def _delete():
+        try:
+            await event.delete()  # revoke: the customer must not see ".gdpa"
+        except Exception as error:  # noqa: BLE001
+            ui.warn(f"[gdpa] couldn't delete the command in {chat_id}: {error}")
+
+    # Delete the command while the country is looked up, not one after the other.
+    delete_task = asyncio.create_task(_delete())
     try:
-        await event.delete()  # revoke: the customer must not see ".gdpa"
-    except Exception as error:  # noqa: BLE001
-        ui.warn(f"[gdpa] couldn't delete the command in {chat_id}: {error}")
-    try:
-        user = await event.get_chat()
-        peer = await event.get_input_chat()
-        country = await separator.country_for(client, _sep_state, peer, chat_id, user)
-        if country is None:  # don't trust a cached "unknown" for a manual request
-            country = await separator.country_for(client, _sep_state, peer, chat_id, user, fresh=True)
-        text = percapita.per_capita_text(country) if country else None
+        peer = await event.get_input_chat()  # from Telethon's cache, no request
+        hit, country = _sep_state.cached_country(chat_id)  # instant when cached
+        if country is None:  # not cached, or cached "unknown": ask Telegram once
+            country = await separator.country_for(client, _sep_state, peer, chat_id, fresh=True)
+        text = percapita.per_capita_text(country) if country else None  # local chart
         if text is None:
+            await delete_task
+            user = await event.get_chat()
             name = getattr(user, "first_name", None) or chat_id
             reason = (f"no per capita data for country {country}" if country
                       else "Telegram doesn't show their phone country")
@@ -4103,7 +4124,9 @@ async def cmd_gdpa(event) -> None:
             return
         await client(SaveDraftRequest(peer=peer, message=text))
         print(ui.green("[gdpa] ") + f"{chat_id} ({country}) draft: {text}", flush=True)
+        await delete_task
     except Exception as error:  # noqa: BLE001
+        await asyncio.gather(delete_task, return_exceptions=True)
         ui.error(f"[gdpa] failed for {chat_id}: {type(error).__name__}: {error}")
         await client.send_message("me", f".gdpa failed for chat {chat_id}: {type(error).__name__}: {error}")
 
