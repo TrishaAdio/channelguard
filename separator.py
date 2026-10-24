@@ -1,15 +1,17 @@
-"""DM country separator for quickreply.py (``.separator on|off`` and ``.gdpa``).
+"""DM country separator for quickreply.py (``.separator`` and ``.gdpa``).
 
-* Country of a private chat: Telegram's own ``PeerSettings.phone_country``
-  (what the app shows on the "Not a contact" card), falling back to the
-  phone number when it is visible (contacts who share their number).
-* Foreign (non-India) DMs are added to a chat folder named ``Videshi``. When
-  Telegram refuses another chat in a full folder, ``Videshi 2``, ``Videshi 3``,
-  ... are created. Indian DMs, and DMs whose country can't be determined, are
-  left where they are.
+* Country of a private chat, cheapest source first: the phone number when the
+  user shares it, Telegram's ``PeerSettings.phone_country`` (the "Not a
+  contact" card), then the same field on the full user profile.
+* Foreign (non-India) DMs go into ONE chat folder named ``Videshi``. Telegram
+  caps a folder at 200 chats (100 without Premium), so when it is full the
+  least active chats (silent for days, few messages, few words) leave and new
+  customers take their places. Videshi chats are kept out of every folder
+  with "Unread" in its name; chats that leave Videshi go back there.
+* Folder edits are rate limited by Telegram, so they are batched: one edit
+  per folder however many chats change.
 
-State is kept in ``data/separator.json`` so each user is looked up and filed
-only once.
+State is kept in ``data/separator.json``.
 """
 from __future__ import annotations
 
@@ -28,30 +30,38 @@ from telethon.tl.functions.messages import (
     UpdateDialogFilterRequest,
 )
 from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import DialogFilter, InputPeerUser, TextWithEntities
+from telethon.tl.types import DialogFilter, TextWithEntities
 
 try:
     import phonenumbers
-except ImportError:  # optional: only needed for contacts without phone_country
+except ImportError:  # optional: only needed for numbers outside India
     phonenumbers = None
 
 HOME_COUNTRY = "IN"
 FOLDER_TITLE = "Videshi"
 _FOLDER_RE = re.compile(rf"^{FOLDER_TITLE}(?:\s+(\d+))?$", re.IGNORECASE)
-# Unknown countries are re-checked at most this often (Telegram may start
-# reporting phone_country a little later, e.g. once the chat has messages).
+# Unknown countries are re-checked at most this often.
 UNKNOWN_RETRY_SECONDS = 5 * 60
 # Folders whose title contains this word lose every chat filed into Videshi.
 UNREAD_WORD = "unread"
 # Telegram service notifications.
 _SKIP_IDS = {777000}
-# Chats per folder before Telegram refuses more (200 with Premium). A refusal
-# at or above this size starts the next "Videshi N" folder.
+# Chats per folder (and excluded chats per folder) without Premium; Premium
+# doubles it to 200. FolderManager is told which one applies.
 FOLDER_FULL_AT = 100
+# Activity ranking (who stays in Videshi when it is full):
+INACTIVE_DAYS = 7        # no message for this long -> leaves first
+NEW_GRACE_HOURS = 48     # a newcomer who is talking is protected this long
+STATS_SAMPLE = 50        # recent messages read to count words
+STATS_MAX_AGE = 12 * 3600  # re-read a chat's history at most this often
+# Longer flood waits are not slept through; the work is retried later.
+MAX_FLOOD_SLEEP = 120
 
 
 class SeparatorState:
-    """{users: {id: {country, source, checked}}, filed: {id: folder title}}."""
+    """users: {id: {country, source, checked}}, filed: {id: folder title},
+    stats: {id: {total, words, last, at}}, joined: {id: ts entered Videshi},
+    excluded: [ids this bot put in Unread folders' excluded chats]."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -61,12 +71,17 @@ class SeparatorState:
             data = {}
         self.users: dict = data.get("users") or {}
         self.filed: dict = data.get("filed") or {}
+        self.stats: dict = data.get("stats") or {}
+        self.joined: dict = data.get("joined") or {}
+        self.excluded: set = {int(x) for x in data.get("excluded") or []}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"users": self.users, "filed": self.filed},
-                                  ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps({
+            "users": self.users, "filed": self.filed, "stats": self.stats,
+            "joined": self.joined, "excluded": sorted(self.excluded),
+        }, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.path)
 
     def cached_country(self, user_id: int):
@@ -81,11 +96,53 @@ class SeparatorState:
     def remember(self, user_id: int, country, source: str) -> None:
         self.users[str(user_id)] = {"country": country, "source": source, "checked": int(time.time())}
 
+    def touch(self, user_id: int, text: str, ts: float) -> None:
+        """A message in a tracked chat: update its activity without any request."""
+        stat = self.stats.get(str(user_id))
+        if stat is None:
+            return
+        stat["total"] = stat.get("total", 0) + 1
+        stat["words"] = stat.get("words", 0) + len((text or "").split())
+        stat["last"] = max(stat.get("last", 0), int(ts))
+
+
+def rank(stat: dict | None, joined: float | None, now: float) -> tuple:
+    """Sort key for Videshi; the LOWEST ranks leave first when it is full.
+
+    1. Silent for INACTIVE_DAYS or more -> lowest tier.
+    2. Everyone else.
+    3. Newcomers (entered Videshi < NEW_GRACE_HOURS ago and talking in that
+       time) -> protected, so new customers really do come in.
+    Within a tier: fewer messages + words (messages + words/10) leave first,
+    then the one that has been quiet longest. A chat whose history couldn't be
+    read is kept (never evicted on missing data).
+    """
+    if not stat:
+        return (3, 0.0, now)
+    last = stat.get("last", 0)
+    grace = NEW_GRACE_HOURS * 3600
+    if joined and now - joined < grace and now - last < grace:
+        tier = 2
+    elif now - last >= INACTIVE_DAYS * 86400:
+        tier = 0
+    else:
+        tier = 1
+    return (tier, stat.get("total", 0) + stat.get("words", 0) / 10, last)
+
+
+async def chat_stats(client, peer) -> dict:
+    """{total, words, last, at} from ONE history request."""
+    messages = await client.get_messages(peer, limit=STATS_SAMPLE)
+    total = getattr(messages, "total", None) or len(messages)
+    words = sum(len((getattr(m, "message", "") or "").split()) for m in messages)
+    last = max((m.date.timestamp() for m in messages if getattr(m, "date", None)), default=0)
+    return {"total": int(total), "words": int(words), "last": int(last), "at": int(time.time())}
+
 
 def _country_from_phone(phone: str | None):
     if not phone:
         return None
-    digits = phone.lstrip("+")
+    digits = str(phone).lstrip("+")
     if phonenumbers is not None:
         try:
             number = phonenumbers.parse("+" + digits)
@@ -109,15 +166,19 @@ def _iso2(code) -> str | None:
 async def detect_country(client, peer, user=None) -> tuple[str | None, str]:
     """(ISO2 country or None, how it was found) for a private-chat user.
 
-    Tries, in order: the chat's peer settings (the "Not a contact" card),
-    the full user profile's settings (same field, other request), and the
-    phone number when the user shares it.
+    FloodWaitError is raised, never turned into "unknown": a rate-limited
+    lookup must be retried, not remembered as a user without a country.
     """
+    country = _country_from_phone(getattr(user, "phone", None))
+    if country:
+        return country, "phone"
     try:
         result = await client(GetPeerSettingsRequest(peer=peer))
         code = _iso2(getattr(result.settings, "phone_country", None))
         if code:
             return code, "telegram"
+    except errors.FloodWaitError:
+        raise
     except errors.RPCError:
         pass
     try:
@@ -126,28 +187,35 @@ async def detect_country(client, peer, user=None) -> tuple[str | None, str]:
         if code:
             return code, "telegram"
         for u in getattr(full, "users", None) or []:
-            if getattr(u, "id", None) == _peer_key(peer) and getattr(u, "phone", None):
-                user = u
+            if getattr(u, "id", None) == _peer_key(peer):
+                country = _country_from_phone(getattr(u, "phone", None))
+                if country:
+                    return country, "phone"
+    except errors.FloodWaitError:
+        raise
     except errors.RPCError:
         pass
-    if user is None or not getattr(user, "phone", None):
-        try:
-            user = await client.get_entity(peer)
-        except (ValueError, TypeError, errors.RPCError):
-            pass
-    country = _country_from_phone(getattr(user, "phone", None))
-    return (country, "phone") if country else (None, "unknown")
+    return None, "unknown"
 
 
-async def country_for(client, state: SeparatorState, peer, user_id: int, user=None, *, fresh=False):
+async def country_for(client, state: SeparatorState, peer, user_id: int, user=None, *,
+                      fresh=False, save=True):
     """Cached detect_country; ``fresh`` forces a new lookup."""
+    phone_country = _country_from_phone(getattr(user, "phone", None))
+    if phone_country:  # free and authoritative
+        if state.users.get(str(user_id), {}).get("country") != phone_country:
+            state.remember(user_id, phone_country, "phone")
+            if save:
+                state.save()
+        return phone_country
     if not fresh:
         hit, country = state.cached_country(user_id)
         if hit:
             return country
     country, source = await detect_country(client, peer, user)
     state.remember(user_id, country, source)
-    state.save()
+    if save:
+        state.save()
     return country
 
 
@@ -160,10 +228,11 @@ def _peer_key(peer) -> int | None:
 
 
 class FolderManager:
-    """Adds users to the Videshi folder(s), creating them when needed."""
+    """Batched edits of the Videshi folder(s) and the Unread folder(s)."""
 
-    def __init__(self, client):
+    def __init__(self, client, limit: int = FOLDER_FULL_AT):
         self.client = client
+        self.limit = limit
         self.lock = asyncio.Lock()
 
     async def _folders(self):
@@ -180,79 +249,110 @@ class FolderManager:
                 found.append((int(match.group(1) or 1), f))
         return sorted(found, key=lambda item: item[0])
 
-    async def _create(self, folders, number: int, peer):
-        used = {f.id for f in folders}
-        folder_id = next(i for i in range(2, 256) if i not in used)
-        title = FOLDER_TITLE if number == 1 else f"{FOLDER_TITLE} {number}"
-        new = DialogFilter(id=folder_id, title=TextWithEntities(text=title, entities=[]),
-                           pinned_peers=[], include_peers=[peer], exclude_peers=[])
-        await self.client(UpdateDialogFilterRequest(id=folder_id, filter=new))
-        return title
+    async def _write(self, folder_id: int, folder) -> None:
+        for attempt in range(3):
+            try:
+                await self.client(UpdateDialogFilterRequest(id=folder_id, filter=folder))
+                return
+            except errors.FloodWaitError as error:
+                if attempt == 2 or error.seconds > MAX_FLOOD_SLEEP:
+                    raise
+                await asyncio.sleep(error.seconds + 1)
 
-    async def add(self, peer: InputPeerUser) -> tuple[str, bool]:
-        """(folder title, newly added). Raises RPCError if Telegram refuses."""
+    async def members(self) -> dict:
+        """{user id: InputPeer} of every chat in any Videshi folder right now."""
+        async with self.lock:
+            folders = await self._folders()
+        found = {}
+        for _n, f in self._videshi(folders):
+            for p in list(f.pinned_peers) + list(f.include_peers):
+                uid = _peer_key(p)
+                if uid:
+                    found.setdefault(uid, p)
+        return found
+
+    async def apply(self, wanted: dict, ours_excluded: set):
+        """Make Videshi hold exactly ``wanted`` ({uid: peer}, <= limit chats).
+
+        * One "Videshi" folder: created if missing; extra "Videshi 2/3..."
+          folders from older versions are merged into it and deleted.
+        * Unread folders: wanted chats are removed/excluded; chats this bot
+          excluded earlier that are no longer in Videshi are let back in.
+
+        Returns (new ours_excluded set, changed folder titles, problems).
+        """
+        wanted = dict(list(wanted.items())[: self.limit])
+        changed, problems = [], []
         async with self.lock:
             folders = await self._folders()
             numbered = self._videshi(folders)
-            videshi = [f for _n, f in numbered]
-            user_id = _peer_key(peer)
-            for f in videshi:
-                if any(_peer_key(p) == user_id for p in f.include_peers):
-                    return _title_text(f.title), False
-            if videshi:  # only the newest folder can still have room
-                newest = videshi[-1]
-                existing = list(newest.include_peers)
-                updated = copy.copy(newest)  # keep the fetched folder untouched on refusal
-                updated.include_peers = existing + [peer]
-                try:
-                    await self.client(UpdateDialogFilterRequest(id=newest.id, filter=updated))
-                    return _title_text(newest.title), True
-                except errors.RPCError:
-                    # Telegram refuses a full folder (100 chats, 200 with
-                    # Premium); on a smaller folder the error is real.
-                    if len(existing) < FOLDER_FULL_AT:
-                        raise
-            next_number = max((n for n, _f in numbered), default=0) + 1
-            return await self._create(folders, next_number, peer), True
+            main = next((f for n, f in numbered if n == 1), None) or (numbered[0][1] if numbered else None)
+            current = set()
+            if main is not None:
+                current = {_peer_key(p) for p in list(main.include_peers) + list(main.pinned_peers)}
+            if main is None:
+                if wanted:
+                    used = {f.id for f in folders}
+                    folder_id = next(i for i in range(2, 256) if i not in used)
+                    await self._write(folder_id, DialogFilter(
+                        id=folder_id, title=TextWithEntities(text=FOLDER_TITLE, entities=[]),
+                        pinned_peers=[], include_peers=list(wanted.values()), exclude_peers=[]))
+                    changed.append(FOLDER_TITLE)
+            elif current != set(wanted):
+                updated = copy.copy(main)
+                updated.pinned_peers = [p for p in main.pinned_peers if _peer_key(p) in wanted]
+                pinned = {_peer_key(p) for p in updated.pinned_peers}
+                updated.include_peers = [p for uid, p in wanted.items() if uid not in pinned]
+                if updated.include_peers or updated.pinned_peers:
+                    await self._write(main.id, updated)
+                else:  # Telegram refuses an empty folder: delete it
+                    await self.client(UpdateDialogFilterRequest(id=main.id))
+                changed.append(_title_text(main.title))
+            for _n, extra in numbered:
+                if main is not None and extra.id == main.id:
+                    continue
+                await self.client(UpdateDialogFilterRequest(id=extra.id))  # merged above
+                changed.append(f"{_title_text(extra.title)} (merged into {FOLDER_TITLE}, deleted)")
 
-    async def remove_from_unread(self, peers) -> tuple[list[str], list[str]]:
-        """Take these users out of every folder named like "Unread".
-
-        A chat is listed in a folder either explicitly (include/pinned list)
-        or because the folder includes a whole chat type (e.g. "non-contacts"
-        with "exclude read"). The first is removed, the second gets the chat
-        in the folder's exclude list. Returns (changed titles, problems).
-        """
-        ids = {_peer_key(p): p for p in peers if _peer_key(p)}
-        if not ids:
-            return [], []
-        changed, problems = [], []
-        async with self.lock:
-            for f in await self._folders():
+            # ours = exclusions this bot owns; chats that left Videshi drop out
+            new_ours = {uid for uid in ours_excluded if uid in wanted}
+            for f in folders:
                 title = _title_text(f.title)
                 if UNREAD_WORD not in title.lower() or _FOLDER_RE.match(title):
                     continue
                 updated = copy.copy(f)
-                updated.include_peers = [p for p in f.include_peers if _peer_key(p) not in ids]
-                updated.pinned_peers = [p for p in f.pinned_peers if _peer_key(p) not in ids]
+                updated.include_peers = [p for p in f.include_peers if _peer_key(p) not in wanted]
+                updated.pinned_peers = [p for p in f.pinned_peers if _peer_key(p) not in wanted]
                 by_type = any(getattr(f, flag, False) for flag in
                               ("contacts", "non_contacts", "groups", "broadcasts", "bots"))
-                excluded = {_peer_key(p) for p in f.exclude_peers}
-                missing = [p for uid, p in ids.items() if uid not in excluded] if by_type else []
-                updated.exclude_peers = list(f.exclude_peers) + missing
-                if (len(updated.include_peers) == len(f.include_peers)
-                        and len(updated.pinned_peers) == len(f.pinned_peers) and not missing):
+                if by_type:
+                    # let back in: chats we excluded that left Videshi
+                    keep = [p for p in f.exclude_peers
+                            if _peer_key(p) not in ours_excluded or _peer_key(p) in wanted]
+                    present = {_peer_key(p) for p in keep}
+                    missing = [p for uid, p in wanted.items() if uid not in present]
+                    room = max(0, self.limit - len(keep))
+                    if len(missing) > room:
+                        problems.append(f"'{title}' can exclude only {self.limit} chats; "
+                                        f"{len(missing) - room} Videshi chat(s) still show there")
+                        missing = missing[:room]
+                    updated.exclude_peers = keep + missing
+                    new_ours |= {_peer_key(p) for p in missing}
+                if ([_peer_key(p) for p in updated.include_peers] == [_peer_key(p) for p in f.include_peers]
+                        and [_peer_key(p) for p in updated.pinned_peers] == [_peer_key(p) for p in f.pinned_peers]
+                        and [_peer_key(p) for p in updated.exclude_peers] == [_peer_key(p) for p in f.exclude_peers]):
                     continue
-                if not by_type and not updated.include_peers:
+                if not by_type and not updated.include_peers and not updated.pinned_peers:
                     problems.append(f"'{title}' would be empty, so it was left as is")
                     continue
                 try:
-                    await self.client(UpdateDialogFilterRequest(id=f.id, filter=updated))
+                    await self._write(f.id, updated)
                     changed.append(title)
+                except errors.FloodWaitError:
+                    raise
                 except errors.RPCError as error:
-                    problems.append(f"'{title}': {error.message or type(error).__name__}"
-                                    + (" (its exclude list is full)" if len(f.exclude_peers) >= FOLDER_FULL_AT else ""))
-        return changed, problems
+                    problems.append(f"'{title}': {error.message or type(error).__name__}")
+        return new_ours, changed, problems
 
 
 def should_check(user, self_id: int, skip_ids=()) -> bool:
