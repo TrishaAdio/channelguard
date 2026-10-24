@@ -4082,7 +4082,13 @@ async def cmd_separator(event) -> None:
     if choice == "scan":
         await _ack(event, "Turn it on first: .separator on")
         return
-    await _ack(event, _separator_status_text())
+    text = _separator_status_text()
+    try:
+        members = await _sep_folders.members()
+        text += "\n\nUnread folder:\n" + "\n".join(await _sep_folders.unread_report(members))
+    except Exception as error:  # noqa: BLE001
+        text += f"\n\nCouldn't read your folders: {type(error).__name__}: {error}"
+    await _ack(event, text)
 
 
 def _sep_skip_ids() -> list:
@@ -4143,13 +4149,23 @@ async def _sep_commit(peers: dict, *, live: bool = False) -> tuple[list, list, l
             wanted = {uid: pool[uid] for uid in ordered[:limit]}
         else:
             wanted = pool
-        ours, changed, problems = await _sep_folders.apply(wanted, _sep_state.excluded)
+        ours, changed, problems, placed = await _sep_folders.apply(wanted, _sep_state.excluded)
         _sep_state.excluded = ours
-        _sep_state.filed = {str(uid): separator.FOLDER_TITLE for uid in wanted}
+        _sep_state.filed = {str(uid): separator.FOLDER_TITLE for uid in placed}
+        wanted = {uid: wanted[uid] for uid in placed}
         _sep_state.save()
     added = [uid for uid in wanted if uid not in members]
     for problem in problems:
         ui.warn(f"[separator] {problem}")
+    note = "; ".join(problems)
+    if note and note != _state.get("sep_last_problem"):
+        _state["sep_last_problem"] = note  # tell the owner once per new problem
+        try:
+            await client.send_message("me", f"Separator couldn't fully update Unread: {note}")
+        except Exception:  # noqa: BLE001
+            pass
+    elif not note:
+        _state.pop("sep_last_problem", None)
     return added, evicted, changed, problems
 
 

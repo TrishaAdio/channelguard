@@ -227,6 +227,19 @@ def _peer_key(peer) -> int | None:
     return getattr(peer, "user_id", None)
 
 
+def is_unread_folder(f) -> bool:
+    """A folder that shows unread chats: named like "Unread", or set to hide read chats."""
+    title = _title_text(f.title)
+    if _FOLDER_RE.match(title):
+        return False
+    return UNREAD_WORD in title.lower() or bool(getattr(f, "exclude_read", False))
+
+
+def _by_type(f) -> bool:
+    return any(getattr(f, flag, False) for flag in
+               ("contacts", "non_contacts", "groups", "broadcasts", "bots"))
+
+
 class FolderManager:
     """Batched edits of the Videshi folder(s) and the Unread folder(s)."""
 
@@ -259,6 +272,52 @@ class FolderManager:
                     raise
                 await asyncio.sleep(error.seconds + 1)
 
+    async def _write_adding(self, folder_id, base, field: str, keep: list, adds: list,
+                            budget: list):
+        """Write ``base`` with ``field = keep + adds``; if Telegram refuses,
+        split ``adds`` in halves so one bad chat (deleted account, invalid
+        peer) or a lower limit only loses those chats, not all of them.
+
+        Returns (accepted adds, first error or None).
+        """
+        trial = copy.copy(base)
+        setattr(trial, field, list(keep) + list(adds))
+        try:
+            await self._write(folder_id, trial)
+            return list(adds), None
+        except errors.FloodWaitError:
+            raise
+        except errors.RPCError as error:
+            budget[0] -= 1
+            if len(adds) <= 1 or budget[0] <= 0:
+                return [], error
+            mid = len(adds) // 2
+            ok1, e1 = await self._write_adding(folder_id, base, field, keep, adds[:mid], budget)
+            ok2, e2 = await self._write_adding(folder_id, base, field, list(keep) + ok1,
+                                               adds[mid:], budget)
+            return ok1 + ok2, (e1 or e2 or error)
+
+    async def unread_report(self, member_ids) -> list[str]:
+        """Human-readable state of every Unread folder vs. Videshi."""
+        async with self.lock:
+            folders = await self._folders()
+        lines = []
+        for f in folders:
+            if not is_unread_folder(f):
+                continue
+            title = _title_text(f.title)
+            if _by_type(f):
+                hidden = {_peer_key(p) for p in f.exclude_peers}
+                showing = [u for u in member_ids if u not in hidden]
+                lines.append(f"'{title}' (chats by type): {len(f.exclude_peers)}/{self.limit} "
+                             f"excluded, {len(showing)} Videshi chat(s) still in it")
+            else:
+                listed = {_peer_key(p) for p in list(f.include_peers) + list(f.pinned_peers)}
+                showing = [u for u in member_ids if u in listed]
+                lines.append(f"'{title}' (hand-picked chats): {len(showing)} Videshi chat(s) still in it")
+        return lines or ["No Unread folder found (a folder named 'Unread' or set to "
+                         "'exclude read chats')."]
+
     async def members(self) -> dict:
         """{user id: InputPeer} of every chat in any Videshi folder right now."""
         async with self.lock:
@@ -279,7 +338,8 @@ class FolderManager:
         * Unread folders: wanted chats are removed/excluded; chats this bot
           excluded earlier that are no longer in Videshi are let back in.
 
-        Returns (new ours_excluded set, changed folder titles, problems).
+        Returns (new ours_excluded set, changed folder titles, problems,
+        ids actually in Videshi).
         """
         wanted = dict(list(wanted.items())[: self.limit])
         changed, problems = [], []
@@ -290,24 +350,41 @@ class FolderManager:
             current = set()
             if main is not None:
                 current = {_peer_key(p) for p in list(main.include_peers) + list(main.pinned_peers)}
+            rejected = []
             if main is None:
                 if wanted:
                     used = {f.id for f in folders}
                     folder_id = next(i for i in range(2, 256) if i not in used)
-                    await self._write(folder_id, DialogFilter(
+                    base = DialogFilter(
                         id=folder_id, title=TextWithEntities(text=FOLDER_TITLE, entities=[]),
-                        pinned_peers=[], include_peers=list(wanted.values()), exclude_peers=[]))
-                    changed.append(FOLDER_TITLE)
+                        pinned_peers=[], include_peers=[], exclude_peers=[])
+                    accepted, error = await self._write_adding(
+                        folder_id, base, "include_peers", [], list(wanted.values()), budget=[12])
+                    rejected = [uid for uid in wanted if uid not in {_peer_key(p) for p in accepted}]
+                    if accepted:
+                        changed.append(FOLDER_TITLE)
+                    elif error is not None:
+                        raise error
             elif current != set(wanted):
                 updated = copy.copy(main)
                 updated.pinned_peers = [p for p in main.pinned_peers if _peer_key(p) in wanted]
                 pinned = {_peer_key(p) for p in updated.pinned_peers}
-                updated.include_peers = [p for uid, p in wanted.items() if uid not in pinned]
-                if updated.include_peers or updated.pinned_peers:
-                    await self._write(main.id, updated)
+                stay = [p for p in main.include_peers if _peer_key(p) in wanted and _peer_key(p) not in pinned]
+                have = pinned | {_peer_key(p) for p in stay}
+                adds = [p for uid, p in wanted.items() if uid not in have]
+                if stay or adds or updated.pinned_peers:
+                    accepted, error = await self._write_adding(
+                        main.id, updated, "include_peers", stay, adds, budget=[12])
+                    rejected = [_peer_key(p) for p in adds if p not in accepted]
+                    if error is not None and not accepted and adds and not stay and not updated.pinned_peers:
+                        raise error
                 else:  # Telegram refuses an empty folder: delete it
                     await self.client(UpdateDialogFilterRequest(id=main.id))
                 changed.append(_title_text(main.title))
+            if rejected:
+                problems.append(f"Telegram refused {len(rejected)} chat(s) in {FOLDER_TITLE} "
+                                "(deleted or invalid accounts)")
+                wanted = {uid: p for uid, p in wanted.items() if uid not in set(rejected)}
             for _n, extra in numbered:
                 if main is not None and extra.id == main.id:
                     continue
@@ -317,14 +394,15 @@ class FolderManager:
             # ours = exclusions this bot owns; chats that left Videshi drop out
             new_ours = {uid for uid in ours_excluded if uid in wanted}
             for f in folders:
-                title = _title_text(f.title)
-                if UNREAD_WORD not in title.lower() or _FOLDER_RE.match(title):
+                if not is_unread_folder(f):
                     continue
+                title = _title_text(f.title)
                 updated = copy.copy(f)
                 updated.include_peers = [p for p in f.include_peers if _peer_key(p) not in wanted]
                 updated.pinned_peers = [p for p in f.pinned_peers if _peer_key(p) not in wanted]
-                by_type = any(getattr(f, flag, False) for flag in
-                              ("contacts", "non_contacts", "groups", "broadcasts", "bots"))
+                by_type = _by_type(f)
+                keep = list(f.exclude_peers)
+                missing = []
                 if by_type:
                     # let back in: chats we excluded that left Videshi
                     keep = [p for p in f.exclude_peers
@@ -336,28 +414,29 @@ class FolderManager:
                         problems.append(f"'{title}' can exclude only {self.limit} chats; "
                                         f"{len(missing) - room} Videshi chat(s) still show there")
                         missing = missing[:room]
-                    updated.exclude_peers = keep + missing
-                    new_ours |= {_peer_key(p) for p in missing}
-                if ([_peer_key(p) for p in updated.include_peers] == [_peer_key(p) for p in f.include_peers]
-                        and [_peer_key(p) for p in updated.pinned_peers] == [_peer_key(p) for p in f.pinned_peers]
-                        and [_peer_key(p) for p in updated.exclude_peers] == [_peer_key(p) for p in f.exclude_peers]):
+                same = lambda a, b: [_peer_key(p) for p in a] == [_peer_key(p) for p in b]  # noqa: E731
+                if (same(updated.include_peers, f.include_peers) and same(updated.pinned_peers, f.pinned_peers)
+                        and same(keep, f.exclude_peers) and not missing):
                     continue
                 if not by_type and not updated.include_peers and not updated.pinned_peers:
                     problems.append(f"'{title}' would be empty, so it was left as is")
                     continue
-                try:
-                    await self._write(f.id, updated)
+                accepted, error = await self._write_adding(
+                    f.id, updated, "exclude_peers", keep, missing, budget=[12])
+                if error is None or accepted:
                     changed.append(title)
-                except errors.FloodWaitError:
-                    raise
-                except errors.RPCError as error:
-                    problems.append(f"'{title}': {error.message or type(error).__name__}")
-        return new_ours, changed, problems
+                new_ours |= {_peer_key(p) for p in accepted}
+                if error is not None:
+                    lost = len(missing) - len(accepted)
+                    problems.append(f"'{title}': Telegram refused {lost or 'the update for'} "
+                                    f"chat(s) ({error.message or type(error).__name__})")
+        return new_ours, changed, problems, set(wanted)
 
 
 def should_check(user, self_id: int, skip_ids=()) -> bool:
     """Only real people: no bots, no self, no service/guard accounts."""
-    if user is None or getattr(user, "bot", False) or getattr(user, "is_self", False):
+    if (user is None or getattr(user, "bot", False) or getattr(user, "is_self", False)
+            or getattr(user, "deleted", False)):  # deleted accounts can't be put in folders
         return False
     uid = getattr(user, "id", None)
     return bool(uid) and uid != self_id and uid not in _SKIP_IDS and uid not in set(skip_ids)
