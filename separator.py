@@ -74,13 +74,15 @@ class SeparatorState:
         self.stats: dict = data.get("stats") or {}
         self.joined: dict = data.get("joined") or {}
         self.excluded: set = {int(x) for x in data.get("excluded") or []}
+        # {id: ts of their latest unread message}; cleared when you reply/read
+        self.unread: dict = data.get("unread") or {}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({
             "users": self.users, "filed": self.filed, "stats": self.stats,
-            "joined": self.joined, "excluded": sorted(self.excluded),
+            "joined": self.joined, "excluded": sorted(self.excluded), "unread": self.unread,
         }, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.path)
 
@@ -95,6 +97,10 @@ class SeparatorState:
 
     def remember(self, user_id: int, country, source: str) -> None:
         self.users[str(user_id)] = {"country": country, "source": source, "checked": int(time.time())}
+
+    def foreign_ids(self) -> set:
+        return {int(uid) for uid, e in self.users.items()
+                if e.get("country") and e.get("country") != HOME_COUNTRY}
 
     def touch(self, user_id: int, text: str, ts: float) -> None:
         """A message in a tracked chat: update its activity without any request."""
@@ -297,7 +303,7 @@ class FolderManager:
                                                adds[mid:], budget)
             return ok1 + ok2, (e1 or e2 or error)
 
-    async def unread_report(self, member_ids) -> list[str]:
+    async def unread_report(self, member_ids, ours=frozenset()) -> list[str]:
         """Human-readable state of every Unread folder vs. Videshi."""
         async with self.lock:
             folders = await self._folders()
@@ -309,8 +315,12 @@ class FolderManager:
             if _by_type(f):
                 hidden = {_peer_key(p) for p in f.exclude_peers}
                 showing = [u for u in member_ids if u not in hidden]
+                mine = sum(1 for p in f.exclude_peers
+                           if _peer_key(p) not in ours and _peer_key(p) not in member_ids)
                 lines.append(f"'{title}' (chats by type): {len(f.exclude_peers)}/{self.limit} "
-                             f"excluded, {len(showing)} Videshi chat(s) still in it")
+                             f"excluded ({mine} added by you), {len(showing)} Videshi chat(s) "
+                             "not excluded" + (" - read ones don't show anyway"
+                                               if getattr(f, "exclude_read", False) else ""))
             else:
                 listed = {_peer_key(p) for p in list(f.include_peers) + list(f.pinned_peers)}
                 showing = [u for u in member_ids if u in listed]
@@ -330,13 +340,19 @@ class FolderManager:
                     found.setdefault(uid, p)
         return found
 
-    async def apply(self, wanted: dict, ours_excluded: set):
+    async def apply(self, wanted: dict, ours_excluded: set, *, priority=None,
+                    unread=frozenset(), foreign_known=frozenset()):
         """Make Videshi hold exactly ``wanted`` ({uid: peer}, <= limit chats).
 
         * One "Videshi" folder: created if missing; extra "Videshi 2/3..."
           folders from older versions are merged into it and deleted.
         * Unread folders: wanted chats are removed/excluded; chats this bot
           excluded earlier that are no longer in Videshi are let back in.
+          Exclusions are capped (200), so they go to the chats that need them
+          most: ``priority`` order (unread first, then most recent). A folder
+          that hides read chats doesn't need read chats excluded at all.
+          Exclusions of users in ``foreign_known`` (added by older versions
+          without being recorded) are treated as the bot's own.
 
         Returns (new ours_excluded set, changed folder titles, problems,
         ids actually in Videshi).
@@ -391,8 +407,9 @@ class FolderManager:
                 await self.client(UpdateDialogFilterRequest(id=extra.id))  # merged above
                 changed.append(f"{_title_text(extra.title)} (merged into {FOLDER_TITLE}, deleted)")
 
-            # ours = exclusions this bot owns; chats that left Videshi drop out
-            new_ours = {uid for uid in ours_excluded if uid in wanted}
+            order = [uid for uid in (priority or list(wanted)) if uid in wanted]
+            order += [uid for uid in wanted if uid not in set(order)]
+            new_ours: set = set()
             for f in folders:
                 if not is_unread_folder(f):
                     continue
@@ -401,33 +418,38 @@ class FolderManager:
                 updated.include_peers = [p for p in f.include_peers if _peer_key(p) not in wanted]
                 updated.pinned_peers = [p for p in f.pinned_peers if _peer_key(p) not in wanted]
                 by_type = _by_type(f)
-                keep = list(f.exclude_peers)
-                missing = []
+                keep, adds = list(f.exclude_peers), []
                 if by_type:
-                    # let back in: chats we excluded that left Videshi
-                    keep = [p for p in f.exclude_peers
-                            if _peer_key(p) not in ours_excluded or _peer_key(p) in wanted]
-                    present = {_peer_key(p) for p in keep}
-                    missing = [p for uid, p in wanted.items() if uid not in present]
-                    room = max(0, self.limit - len(keep))
-                    if len(missing) > room:
-                        problems.append(f"'{title}' can exclude only {self.limit} chats; "
-                                        f"{len(missing) - room} Videshi chat(s) still show there")
-                        missing = missing[:room]
+                    def ours(uid):
+                        return uid in ours_excluded or uid in foreign_known or uid in wanted
+                    own = [p for p in f.exclude_peers if not ours(_peer_key(p))]
+                    room = max(0, self.limit - len(own))
+                    target = order[:room]
+                    present = {_peer_key(p): p for p in f.exclude_peers}
+                    keep = own + [present[uid] for uid in target if uid in present]
+                    adds = [wanted[uid] for uid in target if uid not in present]
+                    hidden_read = bool(getattr(f, "exclude_read", False))
+                    left = [uid for uid in order[room:] if uid in unread or not hidden_read]
+                    if left:
+                        problems.append(
+                            f"'{title}': {len(left)} {'unread ' if hidden_read else ''}Videshi chat(s) "
+                            f"still show there - its excluded list is full ({self.limit}, "
+                            f"{len(own)} of them added by you)")
                 same = lambda a, b: [_peer_key(p) for p in a] == [_peer_key(p) for p in b]  # noqa: E731
                 if (same(updated.include_peers, f.include_peers) and same(updated.pinned_peers, f.pinned_peers)
-                        and same(keep, f.exclude_peers) and not missing):
+                        and same(keep, f.exclude_peers) and not adds):
+                    new_ours |= {_peer_key(p) for p in keep if _peer_key(p) in wanted}
                     continue
                 if not by_type and not updated.include_peers and not updated.pinned_peers:
                     problems.append(f"'{title}' would be empty, so it was left as is")
                     continue
                 accepted, error = await self._write_adding(
-                    f.id, updated, "exclude_peers", keep, missing, budget=[12])
+                    f.id, updated, "exclude_peers", keep, adds, budget=[12])
                 if error is None or accepted:
                     changed.append(title)
-                new_ours |= {_peer_key(p) for p in accepted}
+                    new_ours |= {_peer_key(p) for p in keep + accepted if _peer_key(p) in wanted}
                 if error is not None:
-                    lost = len(missing) - len(accepted)
+                    lost = len(adds) - len(accepted)
                     problems.append(f"'{title}': Telegram refused {lost or 'the update for'} "
                                     f"chat(s) ({error.message or type(error).__name__})")
         return new_ours, changed, problems, set(wanted)

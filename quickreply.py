@@ -4085,7 +4085,8 @@ async def cmd_separator(event) -> None:
     text = _separator_status_text()
     try:
         members = await _sep_folders.members()
-        text += "\n\nUnread folder:\n" + "\n".join(await _sep_folders.unread_report(members))
+        text += "\n\nUnread folder:\n" + "\n".join(
+            await _sep_folders.unread_report(set(members), _sep_state.excluded | _sep_state.foreign_ids()))
     except Exception as error:  # noqa: BLE001
         text += f"\n\nCouldn't read your folders: {type(error).__name__}: {error}"
     await _ack(event, text)
@@ -4149,7 +4150,13 @@ async def _sep_commit(peers: dict, *, live: bool = False) -> tuple[list, list, l
             wanted = {uid: pool[uid] for uid in ordered[:limit]}
         else:
             wanted = pool
-        ours, changed, problems, placed = await _sep_folders.apply(wanted, _sep_state.excluded)
+        def need(uid):  # who most needs hiding from Unread: unread, then most recent
+            ts = _sep_state.unread.get(str(uid))
+            last = _sep_state.stats.get(str(uid), {}).get("last", 0)
+            return (ts is not None, ts or last)
+        ours, changed, problems, placed = await _sep_folders.apply(
+            wanted, _sep_state.excluded, priority=sorted(wanted, key=need, reverse=True),
+            unread={int(u) for u in _sep_state.unread}, foreign_known=_sep_state.foreign_ids())
         _sep_state.excluded = ours
         _sep_state.filed = {str(uid): separator.FOLDER_TITLE for uid in placed}
         wanted = {uid: wanted[uid] for uid in placed}
@@ -4169,12 +4176,25 @@ async def _sep_commit(peers: dict, *, live: bool = False) -> tuple[list, list, l
     return added, evicted, changed, problems
 
 
-def _sep_touch(chat_id, text, date) -> None:
-    """Count a DM message toward that chat's activity (no request)."""
+def _sep_touch(chat_id, text, date, *, incoming=False) -> None:
+    """Count a DM message toward that chat's activity (no request).
+
+    Incoming = that chat is unread now; your own message = you've read it.
+    """
     if _sep_state is None or not chat_id or chat_id == _state["self_id"]:
         return
     ts = date.timestamp() if date else time.time()
     _sep_state.touch(chat_id, text, ts)
+    if incoming:
+        _sep_state.unread[str(chat_id)] = int(ts)
+    else:
+        _sep_state.unread.pop(str(chat_id), None)
+
+
+async def on_inbox_read(event) -> None:
+    """You read a DM (on any device): it no longer needs hiding from Unread."""
+    if _sep_state is not None and event.is_private:
+        _sep_state.unread.pop(str(event.chat_id), None)
 
 
 async def _sep_flush_loop() -> None:
@@ -4236,6 +4256,11 @@ async def _separator_scan(report_chat) -> None:
             if dialog.is_user and separator.should_check(
                     dialog.entity, _state["self_id"], _sep_skip_ids()):
                 candidates.append((dialog.entity, dialog.input_entity))
+                uid = str(dialog.entity.id)
+                if dialog.unread_count or getattr(dialog.dialog, "unread_mark", False):
+                    _sep_state.unread[uid] = int(dialog.date.timestamp()) if dialog.date else int(time.time())
+                else:
+                    _sep_state.unread.pop(uid, None)
                 stat = _sep_state.stats.get(str(dialog.entity.id))
                 if stat is not None and dialog.date:  # free last-activity refresh
                     stat["last"] = max(stat.get("last", 0), int(dialog.date.timestamp()))
@@ -4305,6 +4330,9 @@ async def _separate_dm(event) -> None:
         if not separator.should_check(sender, _state["self_id"], _sep_skip_ids()):
             return
         if str(sender.id) in _sep_state.filed:
+            if sender.id not in _sep_state.excluded:  # unread now: hide it from Unread
+                _sep_pending[sender.id] = await event.get_input_chat()
+                _sep_wake.set()
             return
         peer = await event.get_input_chat()
         country = await separator.country_for(client, _sep_state, peer, sender.id, sender)
@@ -4376,7 +4404,7 @@ def _schedule_separator(event) -> None:
     """Run the separator (or a country prefetch) beside the greeting logic."""
     if _sep_state is None:
         return
-    _sep_touch(event.chat_id, event.raw_text, getattr(event, "date", None))
+    _sep_touch(event.chat_id, event.raw_text, getattr(event, "date", None), incoming=True)
     work = _separate_dm(event) if _state["separator"] else _prefetch_country(event)
     task = asyncio.create_task(work)
     _sep_tasks.add(task)
@@ -4599,6 +4627,7 @@ async def main() -> None:
     # Saved Messages controls, and the private-chat L action.
     client.add_event_handler(on_msg, events.NewMessage(incoming=True))
     client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
+    client.add_event_handler(on_inbox_read, events.MessageRead(inbox=True))
 
     where = (f"from {src_raw}" if _state["source_id"]
              else "from local guard.py handoff only")
