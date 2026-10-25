@@ -26,7 +26,9 @@ from pathlib import Path
 from telethon.tl.functions.messages import GetQuickRepliesRequest, GetQuickReplyMessagesRequest
 
 RESET_WINDOW = 60      # seconds: two uses this close = delete both + reset
-GROUP_WINDOW = 8       # seconds: messages of one multi-message quick reply
+GROUP_WINDOW = 8       # seconds: late messages of one quick-reply send
+SIBLING_WINDOW = 5     # seconds around the trigger that belong to the same send
+SETTLE = 1.5           # seconds to wait for the rest of a quick reply to arrive
 REFRESH = 60           # seconds between re-reads of the shortcut content
 
 
@@ -72,7 +74,8 @@ class CategoryGuard:
             self.chats = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.chats = {}                # {chat_id: {"ts": first use, "ids": [msg ids]}}
-        self.groups: dict = {}             # {chat_id: {"ts", "ids", "seen", "action"}} live use
+        self.groups: dict = {}             # {chat_id: {"ts", "ids", "action"}} last send
+        self.ignore: set = set()           # ids of messages we sent ourselves (/forgein)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,32 +107,64 @@ class CategoryGuard:
                 return index
         return None
 
+    async def _siblings(self, chat_id, message) -> list[int]:
+        """Ids of every message of this quick-reply send (all of them, even
+        ones whose text/media don't match: e.g. a re-uploaded photo).
+
+        A quick reply's messages are sent together, so they are our outgoing
+        messages in this chat within SIBLING_WINDOW seconds of the trigger.
+        """
+        ids = {message.id}
+        date = getattr(message, "date", None)
+        if date is None:
+            return sorted(ids)
+        await asyncio.sleep(SETTLE)  # let the rest of the quick reply arrive
+        try:
+            recent = await self.client.get_messages(chat_id, limit=max(10, 3 * len(self.prints)))
+        except Exception:  # noqa: BLE001
+            return sorted(ids)
+        for m in recent:
+            if (m is not None and getattr(m, "out", False) and m.id not in self.ignore
+                    and getattr(m, "date", None) is not None
+                    and abs((m.date - date).total_seconds()) <= SIBLING_WINDOW):
+                ids.add(m.id)
+        return sorted(ids)
+
     async def on_outgoing(self, chat_id: int, message) -> str | None:
-        """Handle one outgoing message. Returns what happened, or None."""
-        if not fingerprints(message):
+        """Handle one outgoing message. Returns what happened, or None.
+
+        One quick-reply send = ONE use, however many messages it has: the
+        first matching message decides, all its messages are handled
+        together, and later messages of the same send are ignored.
+        """
+        if message.id in self.ignore:
             return None
         async with self.lock:
+            if message.id in self.ignore:      # sent by us while we held the lock
+                return None
+            key = str(chat_id)
+            group = self.groups.get(key)
+            if group and message.id in group["ids"]:
+                return None                       # already handled with its group
+            if not fingerprints(message):
+                return None
             try:
                 await self.refresh()
             except Exception:  # noqa: BLE001 - keep the last known content
                 pass
-            index = self._match(message)
-            if index is None:
+            if self._match(message) is None:
                 return None
             now = self.clock()
-            key = str(chat_id)
-            group = self.groups.get(key)
-            if group and now - group["ts"] <= GROUP_WINDOW and index not in group["seen"]:
-                group["seen"].add(index)          # next message of the same use
-                group["ids"].append(message.id)
-                action = group["action"]
-                if action == "allowed":
+            if group and now - group["ts"] <= GROUP_WINDOW:
+                # another message of the send we just handled (arrived late)
+                group["ids"].add(message.id)
+                if group["action"] == "allowed":
                     self.chats[key]["ids"].append(message.id)
                     self.save()
-                    return "allowed"
-                await self._delete(chat_id, [message.id])
-                return action
-            # a new use
+                else:
+                    await self._delete(chat_id, [message.id])
+                return None
+            ids = await self._siblings(chat_id, message)
             record = self.chats.get(key)
             foreign = False
             if self.is_foreign is not None:
@@ -138,31 +173,34 @@ class CategoryGuard:
                 except Exception:  # noqa: BLE001 - unknown country: normal rules
                     foreign = False
             if foreign:
-                await self._delete(chat_id, [message.id])
+                await self._delete(chat_id, ids)
                 fkey = "f:" + key
                 action = "foreign-kept"
                 if fkey not in self.chats and self.send_foreign is not None:
-                    await self.send_foreign(chat_id)
-                    self.chats[fkey] = {"ts": now, "ids": []}
+                    sent = await self.send_foreign(chat_id) or []
+                    self.ignore.update(sent)
+                    self.chats[fkey] = {"ts": now, "ids": list(sent)}
                     self.save()
                     action = "foreign"
             elif record is None:
-                self.chats[key] = {"ts": now, "ids": [message.id]}
+                self.chats[key] = {"ts": now, "ids": ids}
                 self.save()
                 action = "allowed"
             elif now - record["ts"] <= RESET_WINDOW:
-                await self._delete(chat_id, list(record["ids"]) + [message.id])
+                await self._delete(chat_id, list(record["ids"]) + ids)
                 del self.chats[key]
                 self.save()
                 action = "reset"
             else:
-                await self._delete(chat_id, [message.id])
+                await self._delete(chat_id, ids)
                 action = "duplicate"
-            self.groups[key] = {"ts": now, "ids": [message.id], "seen": {index}, "action": action}
+            self.groups[key] = {"ts": now, "ids": set(ids), "action": action}
             return action
 
     async def _delete(self, chat_id, ids) -> None:
-        await self.client.delete_messages(chat_id, ids, revoke=True)
+        ids = [i for i in dict.fromkeys(ids) if i]
+        if ids:
+            await self.client.delete_messages(chat_id, ids, revoke=True)
 
     def forget(self, chat_id: int) -> bool:
         removed = self.chats.pop(str(chat_id), None) is not None

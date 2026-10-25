@@ -4097,6 +4097,7 @@ async def _send_foreign_reply(chat_id) -> None:
         _cancel_automatic_outgoing(chat_id, marker)
         raise
     _finish_automatic_outgoing(chat_id, marker, result)
+    return sorted(_sent_message_ids(result))
 
 
 async def cmd_categoryguard(event) -> None:
