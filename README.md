@@ -283,6 +283,7 @@ Your Business quick reply `/category` can be sent once in each chat:
 | Again in that chat, more than 1 minute later | The new copy is deleted for both sides. The first one stays. |
 | Twice within 1 minute | Both copies are deleted, and the next `/category` in that chat is allowed. |
 
+- **People outside India:** in a chat with someone whose country isn't India, `/category` is always deleted and your `/forgein` quick reply is sent instead, once per chat. The country comes from the separator's lookup (phone country on the "Not a contact" card, or their number). If the country is unknown, `/category` follows the normal rules above. The shortcut name is `FOREIGN_SHORTCUT` in `.env` (default `forgein,foreign`: the first one that exists is used; blank turns the redirect off).
 - `.categoryguard reset` inside a chat allows `/category` there again; `.categoryguard` shows the status.
 - A quick reply with several messages counts as one use.
 - The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.

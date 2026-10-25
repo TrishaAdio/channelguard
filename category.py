@@ -7,6 +7,9 @@ Rules, per chat:
   * /category twice within RESET_WINDOW is a deliberate "undo": BOTH copies
     are deleted and the chat is reset, so the next /category is allowed.
 
+Foreign chats (the user's country isn't India): /category is always
+deleted and the /forgein quick reply is sent instead, once per chat.
+
 A quick reply sent from the Telegram app reaches us as ordinary outgoing
 messages, so a use is recognised by matching their text/media against the
 shortcut's messages (re-read every REFRESH seconds). A multi-message quick
@@ -52,7 +55,12 @@ def fingerprints(message) -> set:
 
 
 class CategoryGuard:
-    def __init__(self, client, shortcut: str, path: Path, *, clock=time.time):
+    def __init__(self, client, shortcut: str, path: Path, *, clock=time.time,
+                 is_foreign=None, send_foreign=None):
+        """``is_foreign(chat_id) -> bool`` and ``send_foreign(chat_id)`` turn on
+        the foreign redirect (both async)."""
+        self.is_foreign = is_foreign
+        self.send_foreign = send_foreign
         self.client = client
         self.shortcut = shortcut.lstrip("/")
         self.path = Path(path)
@@ -123,7 +131,22 @@ class CategoryGuard:
                 return action
             # a new use
             record = self.chats.get(key)
-            if record is None:
+            foreign = False
+            if self.is_foreign is not None:
+                try:
+                    foreign = bool(await self.is_foreign(chat_id))
+                except Exception:  # noqa: BLE001 - unknown country: normal rules
+                    foreign = False
+            if foreign:
+                await self._delete(chat_id, [message.id])
+                fkey = "f:" + key
+                action = "foreign-kept"
+                if fkey not in self.chats and self.send_foreign is not None:
+                    await self.send_foreign(chat_id)
+                    self.chats[fkey] = {"ts": now, "ids": []}
+                    self.save()
+                    action = "foreign"
+            elif record is None:
                 self.chats[key] = {"ts": now, "ids": [message.id]}
                 self.save()
                 action = "allowed"
@@ -143,6 +166,7 @@ class CategoryGuard:
 
     def forget(self, chat_id: int) -> bool:
         removed = self.chats.pop(str(chat_id), None) is not None
+        removed = (self.chats.pop("f:" + str(chat_id), None) is not None) or removed
         if removed:
             self.save()
         return removed

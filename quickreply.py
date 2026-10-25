@@ -3329,7 +3329,8 @@ HELP_TEXT = (
     "per capita income ($) in your draft, without sending it\n"
     "<b>/category</b> (Business quick reply)\n"
     "Once per chat. Sent again later: the new copy is deleted. Sent twice within 1 minute: "
-    "both are deleted and the next one is allowed. <code>.categoryguard reset</code> in a chat "
+    "both are deleted and the next one is allowed. Outside India, /category is deleted and "
+    "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
     "allows it again there; <code>.categoryguard</code> shows the status\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
@@ -4046,16 +4047,56 @@ def _watch_category(event) -> None:
     async def run():
         try:
             action = await _category.on_outgoing(event.chat_id, event.message)
-            if action in ("duplicate", "reset"):
-                print(ui.yellow(f"[category] {event.chat_id}: ")
-                      + ("already sent here - deleted the new copy" if action == "duplicate"
-                         else "sent twice within 1 min - deleted both, next one allowed"),
-                      flush=True)
+            notes = {
+                "duplicate": "already sent here - deleted the new copy",
+                "reset": "sent twice within 1 min - deleted both, next one allowed",
+                "foreign": "foreign chat - deleted /category, sent the foreign quick reply",
+                "foreign-kept": "foreign chat - deleted /category (foreign reply already sent)",
+            }
+            if action in notes:
+                print(ui.yellow(f"[category] {event.chat_id}: ") + notes[action], flush=True)
         except Exception as error:  # noqa: BLE001
             ui.error(f"[category] {event.chat_id}: {type(error).__name__}: {error}")
     task = asyncio.create_task(run())
     _category_tasks.add(task)
     task.add_done_callback(_category_tasks.discard)
+
+
+async def _category_is_foreign(chat_id) -> bool:
+    """Outside India (unknown country = not foreign, /category stays)."""
+    if not config.FOREIGN_SHORTCUT or _sep_state is None:
+        return False
+    entity = await client.get_entity(chat_id)
+    if not isinstance(entity, tl_types.User) or entity.bot:
+        return False
+    peer = await client.get_input_entity(chat_id)
+    country = await separator.country_for(client, _sep_state, peer, chat_id, entity)
+    return bool(country) and country != separator.HOME_COUNTRY
+
+
+async def _send_foreign_reply(chat_id) -> None:
+    """Send the first existing FOREIGN_SHORTCUT quick reply to this chat."""
+    names = [n.strip().lstrip("/").lower() for n in config.FOREIGN_SHORTCUT.split(",") if n.strip()]
+    res = await client(GetQuickRepliesRequest(hash=0))
+    shortcuts = {getattr(q, "shortcut", "").lower(): q for q in getattr(res, "quick_replies", []) or []}
+    target = next((shortcuts[n] for n in names if n in shortcuts), None)
+    if target is None:
+        raise ValueError(f"quick reply /{names[0] if names else 'forgein'} not found")
+    msgs = await client(GetQuickReplyMessagesRequest(shortcut_id=target.shortcut_id, hash=0, id=None))
+    shortcut_msgs = sorted(getattr(msgs, "messages", []) or [], key=lambda m: m.id)
+    ids = [m.id for m in shortcut_msgs]
+    if not ids:
+        raise ValueError(f"quick reply /{target.shortcut} is empty")
+    peer = await client.get_input_entity(chat_id)
+    marker = _expect_automatic_outgoing(chat_id, [getattr(m, "message", "") or "" for m in shortcut_msgs])
+    try:
+        result = await client(SendQuickReplyMessagesRequest(
+            peer=peer, shortcut_id=target.shortcut_id, id=ids,
+            random_id=[random.randrange(-(2 ** 63), 2 ** 63) for _ in ids]))
+    except Exception:
+        _cancel_automatic_outgoing(chat_id, marker)
+        raise
+    _finish_automatic_outgoing(chat_id, marker, result)
 
 
 async def cmd_categoryguard(event) -> None:
@@ -4637,8 +4678,9 @@ async def main() -> None:
     _sep_init(bool(getattr(me, "premium", False)))
     global _category
     if config.CATEGORY_SHORTCUT:
-        _category = category.CategoryGuard(client, config.CATEGORY_SHORTCUT,
-                                           config.DATA_DIR / "category.json")
+        _category = category.CategoryGuard(
+            client, config.CATEGORY_SHORTCUT, config.DATA_DIR / "category.json",
+            is_foreign=_category_is_foreign, send_foreign=_send_foreign_reply)
         try:
             if not await _category.refresh(force=True):
                 ui.warn(f"Quick reply /{config.CATEGORY_SHORTCUT} not found yet; "

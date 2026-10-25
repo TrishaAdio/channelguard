@@ -59,6 +59,9 @@ ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 # folder. Toggle live with .separator on|off (saved here). Default off.
 # Business quick reply allowed once per chat (category.py). Blank disables.
 CATEGORY_SHORTCUT = os.getenv("CATEGORY_SHORTCUT", "category").strip().lstrip("/")
+# Sent instead of /category to people outside India. Comma = alternatives
+# (the first one that exists is used). Blank turns the redirect off.
+FOREIGN_SHORTCUT = os.getenv("FOREIGN_SHORTCUT", "forgein,foreign").strip()
 SEPARATOR = os.getenv("SEPARATOR", "0").strip().lower() not in ("0", "false", "no", "")
 
 # --- Payment logger (quickreply.py extension) -----------------------------
