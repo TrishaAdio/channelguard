@@ -136,6 +136,7 @@ import quickreply_extras as extras
 import quickreply_restore as restore
 import percapita
 import separator
+import category
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -154,6 +155,7 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 # `/setchannelpostofpayment`.
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.IGNORECASE)
 _SEPARATOR_RE = re.compile(r"^[./]separator(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
@@ -3325,6 +3327,11 @@ HELP_TEXT = (
     "<code>.separator check</code> in a DM shows its country in Saved Messages\n"
     "<code>.gdpa</code> - in a customer's DM: deletes itself and puts their country's "
     "per capita income ($) in your draft, without sending it\n"
+    "<b>/category</b> (Business quick reply)\n"
+    "Once per chat. Sent again later: the new copy is deleted. Sent twice within 1 minute: "
+    "both are deleted and the next one is allowed. Outside India, /category is deleted and "
+    "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
+    "allows it again there; <code>.categoryguard</code> shows the status\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3659,6 +3666,8 @@ async def _handle_outgoing(event):
     # the exact message body we registered, not every send in that chat.
     if chat_id != _state["self_id"] and await _consume_automatic_outgoing(event):
         return
+    if _category is not None and chat_id != _state["self_id"]:
+        _watch_category(event)
 
     _mark_owner_active()
     if event.is_private:
@@ -3674,6 +3683,9 @@ async def _handle_outgoing(event):
         return
     if low_cmd in (".help", "/help", "/commands", "/start"):
         await _ack(event, HELP_TEXT, parse_mode="html")
+        return
+    if _CATEGORY_RE.match(low_cmd):
+        await cmd_categoryguard(event)
         return
     if _SEPARATOR_RE.match(low_cmd):
         await cmd_separator(event)
@@ -4026,6 +4038,93 @@ async def cmd_setup(event) -> None:
 # .gdpa            - per capita income of this DM's country, as a draft
 # (country detection + folder logic live in separator.py)
 # --------------------------------------------------------------------------
+_category: category.CategoryGuard | None = None
+_category_tasks: set = set()
+
+
+def _watch_category(event) -> None:
+    """Check an outgoing message against /category without delaying anything."""
+    async def run():
+        try:
+            action = await _category.on_outgoing(event.chat_id, event.message)
+            notes = {
+                "duplicate": "already sent here - deleted the new copy",
+                "reset": "sent twice within 1 min - deleted both, next one allowed",
+                "foreign": "foreign chat - deleted /category, sent the foreign quick reply",
+                "foreign-kept": "foreign chat - deleted /category (foreign reply already sent)",
+            }
+            if action in notes:
+                print(ui.yellow(f"[category] {event.chat_id}: ") + notes[action], flush=True)
+        except Exception as error:  # noqa: BLE001
+            ui.error(f"[category] {event.chat_id}: {type(error).__name__}: {error}")
+    task = asyncio.create_task(run())
+    _category_tasks.add(task)
+    task.add_done_callback(_category_tasks.discard)
+
+
+async def _category_is_foreign(chat_id) -> bool:
+    """Outside India (unknown country = not foreign, /category stays)."""
+    if not config.FOREIGN_SHORTCUT or _sep_state is None:
+        return False
+    entity = await client.get_entity(chat_id)
+    if not isinstance(entity, tl_types.User) or entity.bot:
+        return False
+    peer = await client.get_input_entity(chat_id)
+    country = await separator.country_for(client, _sep_state, peer, chat_id, entity)
+    return bool(country) and country != separator.HOME_COUNTRY
+
+
+async def _send_foreign_reply(chat_id) -> None:
+    """Send the first existing FOREIGN_SHORTCUT quick reply to this chat."""
+    names = [n.strip().lstrip("/").lower() for n in config.FOREIGN_SHORTCUT.split(",") if n.strip()]
+    res = await client(GetQuickRepliesRequest(hash=0))
+    shortcuts = {getattr(q, "shortcut", "").lower(): q for q in getattr(res, "quick_replies", []) or []}
+    target = next((shortcuts[n] for n in names if n in shortcuts), None)
+    if target is None:
+        raise ValueError(f"quick reply /{names[0] if names else 'forgein'} not found")
+    msgs = await client(GetQuickReplyMessagesRequest(shortcut_id=target.shortcut_id, hash=0, id=None))
+    shortcut_msgs = sorted(getattr(msgs, "messages", []) or [], key=lambda m: m.id)
+    ids = [m.id for m in shortcut_msgs]
+    if not ids:
+        raise ValueError(f"quick reply /{target.shortcut} is empty")
+    peer = await client.get_input_entity(chat_id)
+    marker = _expect_automatic_outgoing(chat_id, [getattr(m, "message", "") or "" for m in shortcut_msgs])
+    try:
+        result = await client(SendQuickReplyMessagesRequest(
+            peer=peer, shortcut_id=target.shortcut_id, id=ids,
+            random_id=[random.randrange(-(2 ** 63), 2 ** 63) for _ in ids]))
+    except Exception:
+        _cancel_automatic_outgoing(chat_id, marker)
+        raise
+    _finish_automatic_outgoing(chat_id, marker, result)
+
+
+async def cmd_categoryguard(event) -> None:
+    """`.categoryguard [reset|status]`: reset allows /category again in this chat."""
+    if _category is None:
+        await _ack(event, "The /category guard is off (CATEGORY_SHORTCUT is blank).")
+        return
+    choice = _CATEGORY_RE.match((event.raw_text or "").strip()).group(1) or "status"
+    if choice == "reset":
+        if event.chat_id == _state["self_id"]:
+            await _ack(event, "Send .categoryguard reset inside the chat to reset.")
+            return
+        done = _category.forget(event.chat_id)
+        try:
+            await event.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        if not done:
+            await client.send_message("me", "/category hadn't been used in that chat yet.")
+        return
+    found = await _category.refresh(force=True)
+    await _ack(event, (f"/{_category.shortcut} guard: used in {len(_category.chats)} chat(s). "
+                       if found else f"Quick reply /{_category.shortcut} not found. ")
+               + "Once per chat; again later = new copy deleted; twice within 1 min = "
+               "both deleted and the next one is allowed. "
+               ".categoryguard reset (in a chat) allows it again there.")
+
+
 _sep_state: separator.SeparatorState | None = None
 _sep_folders: separator.FolderManager | None = None
 _sep_tasks: set = set()
@@ -4577,6 +4676,17 @@ async def main() -> None:
     _greeted = _load_greeted()
     _pay = _load_pay()
     _sep_init(bool(getattr(me, "premium", False)))
+    global _category
+    if config.CATEGORY_SHORTCUT:
+        _category = category.CategoryGuard(
+            client, config.CATEGORY_SHORTCUT, config.DATA_DIR / "category.json",
+            is_foreign=_category_is_foreign, send_foreign=_send_foreign_reply)
+        try:
+            if not await _category.refresh(force=True):
+                ui.warn(f"Quick reply /{config.CATEGORY_SHORTCUT} not found yet; "
+                        "the once-per-chat guard starts when you create it.")
+        except Exception as error:  # noqa: BLE001
+            ui.warn(f"/category guard: couldn't read quick replies ({error})")
     await _recover_pending_payments()
 
     src_raw = config.LINK_SOURCE_RAW.strip()
