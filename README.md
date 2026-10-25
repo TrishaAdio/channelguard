@@ -273,6 +273,21 @@ Send these yourself, in any chat:
 - **Data:** the figures come from the World Bank: GDP per capita in current US$, falling back to GNI per capita (Atlas) where that's missing. They're a fixed chart in `per_capita_chart.py` (214 countries), so `.gdpa` never goes online for them. Each customer's country is also remembered when they DM you, so `.gdpa` usually needs no Telegram lookup either. Taiwan and a few other economies have no World Bank figure.
 - State is kept in `data/separator.json`.
 
+### `/category` once per chat (`quickreply.py`)
+
+Your Business quick reply `/category` can be sent once in each chat:
+
+| You send `/category` | What happens |
+|---|---|
+| First time in a chat | Sent normally and remembered. |
+| Again in that chat, more than 1 minute later | The new copy is deleted for both sides. The first one stays. |
+| Twice within 1 minute | Both copies are deleted, and the next `/category` in that chat is allowed. |
+
+- `.categoryguard reset` inside a chat allows `/category` there again; `.categoryguard` shows the status.
+- A quick reply with several messages counts as one use.
+- The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.
+- The shortcut name is `CATEGORY_SHORTCUT` in `.env` (default `category`; blank turns this off). State is kept in `data/category.json`.
+
 ## Files
 
 | File            | Role                                                          |
@@ -285,6 +300,7 @@ Send these yourself, in any chat:
 | `ui.py`         | Colored terminal output (colorama, with no-color fallback)    |
 | `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
 | `separator.py`  | Country detection + Videshi folder filing (`.separator`)      |
+| `category.py`   | `/category` once-per-chat guard                               |
 | `percapita.py`  | Per capita lookup for `.gdpa` (reads `per_capita_chart.py`, offline) |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`

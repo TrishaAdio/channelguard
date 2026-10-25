@@ -57,6 +57,8 @@ GREET_NEW = os.getenv("GREET_NEW", "1").strip().lower() not in ("0", "false", "n
 ONLINE_MINUTES = _float("ONLINE_MINUTES", 2.0, minimum=0.0)
 # DM country separator: file non-Indian private chats into the "Videshi"
 # folder. Toggle live with .separator on|off (saved here). Default off.
+# Business quick reply allowed once per chat (category.py). Blank disables.
+CATEGORY_SHORTCUT = os.getenv("CATEGORY_SHORTCUT", "category").strip().lstrip("/")
 SEPARATOR = os.getenv("SEPARATOR", "0").strip().lower() not in ("0", "false", "no", "")
 
 # --- Payment logger (quickreply.py extension) -----------------------------
