@@ -4,8 +4,8 @@ Rules, per chat:
   * The first /category is allowed and remembered.
   * /category again later (more than RESET_WINDOW after it) is a duplicate:
     the new copy is deleted for both sides.
-  * /category twice within RESET_WINDOW is a deliberate "undo": BOTH copies
-    are deleted and the chat is reset, so the next /category is allowed.
+  * /category twice within RESET_WINDOW: only the 2nd copy is deleted (the
+    first always stays), and the next /category after that is allowed.
 
 Foreign chats (the user's country isn't India): /category is always
 deleted and the /forgein quick reply is sent instead, once per chat.
@@ -224,12 +224,18 @@ class CategoryGuard:
             self.chats[key] = {"ts": now, "ids": list(ids)}
             self.save()
             return "allowed"
+        if record.get("allow_next"):
+            # the send after a quick repeat is allowed; the first one stays too
+            record["ids"] = list(record["ids"]) + list(ids)
+            record.pop("allow_next", None)
+            record["ts"] = now
+            self.save()
+            return "allowed"
+        await self._delete(chat_id, ids)  # the first send is never deleted
         if now - record["ts"] <= RESET_WINDOW:
-            await self._delete(chat_id, list(record["ids"]) + list(ids))
-            del self.chats[key]
+            record["allow_next"] = True
             self.save()
             return "reset"
-        await self._delete(chat_id, ids)
         return "duplicate"
 
     async def _delete(self, chat_id, ids) -> None:
