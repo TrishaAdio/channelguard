@@ -268,3 +268,85 @@ def test_setup_reply_to_non_zip_is_rejected(tmp_path, monkeypatch):
         assert "quickreply_backup" in event.edits[-1] and fresh.user.first_name == "New"
 
     asyncio.run(run())
+
+
+def _write_backup(tmp_path, quick_replies):
+    """Minimal valid backup ZIP with the given quick replies (JSON escaped,
+    so a lone surrogate survives as text the way Telegram would reject it)."""
+    import json
+    import zipfile
+
+    doc = {
+        "format": "quickreply-backup", "version": 1,
+        "profile": {"id": 111, "first_name": "Alice", "last_name": "", "about": ""},
+        "profile_photos": [], "quick_replies": quick_replies, "business": {},
+        "data_files": [],
+    }
+    path = tmp_path / "backups" / "quickreply_backup_2026-10-20_060000.zip"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("backup.json", json.dumps(doc, ensure_ascii=True))
+    return path
+
+
+def _msg(text="", media=None, entities=None, grouped_id=None):
+    return {"text": text, "media": media, "entities": entities or [], "grouped_id": grouped_id}
+
+
+def test_empty_text_message_is_skipped_shortcut_still_created(tmp_path):
+    path = _write_backup(tmp_path, [
+        {"name": "category", "command": "/category", "order": 0, "shortcut_id": 1,
+         "messages": [_msg(""), _msg("Welcome"), _msg("   ")]},   # empty skipped; text + spaces kept
+    ])
+    fresh = FreshAccount()
+    backup = restore.Backup(path)
+
+    async def nosleep(_):
+        return None
+
+    report, _ = asyncio.run(restore.run(fresh, backup, dry_run=False, data_dir=tmp_path, sleep=nosleep))
+    backup.close()
+    assert "restored: quick reply /category" in report.text()
+    assert not report.failed
+    assert fresh.shortcuts["category"] == ["Welcome", "   "]      # empty one dropped, not sent
+    assert "empty" in report.text()
+
+
+def test_invalid_utf8_text_is_cleaned(tmp_path):
+    path = _write_backup(tmp_path, [
+        {"name": "forgein", "command": "/forgein", "order": 0, "shortcut_id": 1,
+         "messages": [_msg("A\ud800B")]},                          # lone surrogate -> cleaned to "AB"
+    ])
+    fresh = FreshAccount()
+    backup = restore.Backup(path)
+
+    async def nosleep(_):
+        return None
+
+    report, _ = asyncio.run(restore.run(fresh, backup, dry_run=False, data_dir=tmp_path, sleep=nosleep))
+    backup.close()
+    assert fresh.shortcuts["forgein"] == ["AB"] and not report.failed
+
+
+def test_shortcut_with_only_empty_messages_fails_cleanly(tmp_path):
+    path = _write_backup(tmp_path, [
+        {"name": "blank", "command": "/blank", "order": 0, "shortcut_id": 1,
+         "messages": [_msg(""), _msg("")]},
+    ])
+    fresh = FreshAccount()
+    backup = restore.Backup(path)
+
+    async def nosleep(_):
+        return None
+
+    report, _ = asyncio.run(restore.run(fresh, backup, dry_run=False, data_dir=tmp_path, sleep=nosleep))
+    backup.close()
+    assert "blank" not in fresh.shortcuts                          # nothing sent
+    assert "quick reply /blank" in report.failed[0]                # reported, no crash
+
+
+def test_clean_text_helper():
+    assert restore._clean_text("A\ud800B\udfffC") == "ABC"
+    assert restore._clean_text("hi\x00") == "hi"
+    assert restore._clean_text("") == "" and restore._clean_text(None) == ""
+    assert restore._clean_text("  spaces  ") == "  spaces  "       # whitespace is valid, kept
