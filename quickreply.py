@@ -3321,9 +3321,10 @@ HELP_TEXT = (
     "<code>.setup</code> - on a NEW account: <b>reply to a backup ZIP</b> and it transforms this "
     "account to match it right away. With no reply it previews the newest local backup, then "
     "<code>.setup confirm</code>. Username and gifts are not moved\n"
-    "<code>.qrlast &lt;name...&gt;</code> - reorder the live quick replies: move these to the bottom "
-    "(e.g. <code>.qrlast category forgein</code>). Also <code>.qrtop</code> / "
-    "<code>.qrorder</code>; no name shows the current order\n"
+    "<code>.qrfirst &lt;name&gt;</code> - make a quick reply show FIRST when you type / "
+    "(e.g. <code>.qrfirst category</code>). <code>.qrlast</code> sends to the bottom, "
+    "<code>.qrorder</code> sets an exact order; no name shows the current order. Fully restart "
+    "Telegram afterwards - it caches the / list\n"
     "<b>Separator</b> (any chat)\n"
     "<code>.separator on|off|status</code> - DMs from outside India go to the "
     "<b>Videshi</b> folder and leave your Unread folder; when it is full (200) the "
@@ -3768,7 +3769,7 @@ async def _handle_outgoing(event):
     if command == ".setup":
         await cmd_setup(event)
         return
-    if command in (".qrlast", ".qrtop", ".qrorder"):
+    if command in (".qrlast", ".qrtop", ".qrfirst", ".qrorder"):
         await cmd_qr_reorder(event, command)
         return
     if low.startswith("/broadcast"):
@@ -4021,15 +4022,15 @@ async def _apply_setup(event, path) -> None:
 def _plan_qr_order(current_names: list[str], action: str, wanted: list[str]) -> list[str]:
     """New order of shortcut names. ``current_names`` is the live order.
 
-    .qrlast  -> move ``wanted`` to the end (in the order given)
-    .qrtop   -> move ``wanted`` to the front
-    .qrorder -> ``wanted`` first in that exact order, the rest kept after
+    .qrlast           -> move ``wanted`` to the end (in the order given)
+    .qrtop/.qrfirst   -> move ``wanted`` to the front (first in the / popup)
+    .qrorder          -> ``wanted`` first in that exact order, the rest kept after
     Names not present are ignored; each name is used once.
     """
     present = list(dict.fromkeys(n for n in wanted if n in current_names))  # unique, order kept
     seen = set(present)
     rest = [n for n in current_names if n not in seen]
-    if action == ".qrtop" or action == ".qrorder":
+    if action in (".qrtop", ".qrfirst", ".qrorder"):
         return present + rest
     return rest + present   # .qrlast
 
@@ -4053,8 +4054,8 @@ async def cmd_qr_reorder(event, command: str) -> None:
     if not wanted:
         listing = "\n".join(f"{i + 1}. /{name}" for i, name in enumerate(current))
         await _ack(event, "Current quick-reply order:\n" + (listing or "(none)")
-                   + "\n\nMove some to the bottom:  .qrlast category forgein"
-                   + "\nTo the top:  .qrtop <name...>   Exact order:  .qrorder <name...>")
+                   + "\n\nMake one show FIRST when you type /:  .qrfirst category"
+                   + "\nMove to the bottom:  .qrlast <name...>   Exact order:  .qrorder <name...>")
         return
 
     missing = [name for name in wanted if name not in by_name]
@@ -4077,10 +4078,10 @@ async def cmd_qr_reorder(event, command: str) -> None:
     tail = f"\nUnknown (ignored): {', '.join('/' + m for m in missing)}" if missing else ""
     if applied:
         head = "New quick-reply order (saved on Telegram):"
-        tip = ("\n\nIf your app still shows the old order, fully close and reopen it - the "
-               "quick-replies panel is cached. If the moved ones appear at the TOP instead, "
-               "your app shows the list reversed, so use the opposite command "
-               "(.qrtop <-> .qrlast).")
+        tip = ("\n\nTelegram caches the / autocomplete, so FULLY QUIT the app and reopen it "
+               "(on desktop: tray icon -> Quit, not just closing the window; on phone: swipe "
+               "it away). The / popup follows this same order, so #1 above shows first when "
+               "you type /.")
     else:
         head = "Telegram did not store the new order (it kept its own). Current order:"
         tip = "\n\nTelegram sometimes pins quick replies to creation order; reordering may not stick."
