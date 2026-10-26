@@ -30,19 +30,38 @@ GROUP_WINDOW = 8       # seconds: late messages of one quick-reply send
 SIBLING_WINDOW = 5     # seconds around the trigger that belong to the same send
 SETTLE = 1.5           # seconds to wait for the rest of a quick reply to arrive
 REFRESH = 60           # seconds between re-reads of the shortcut content
+MISS_REFRESH = 5       # an unmatched message forces a re-read at most this often
 
 
 def _norm(text) -> str:
     return " ".join((text or "").split())
 
 
-def _media_key(message):
+def _media_keys(message) -> set:
+    """Media identity that survives a re-send: the id when Telegram keeps it,
+    plus the content shape (photo resolution + bytes, file size + type),
+    because a quick reply that was edited/re-created is sent with new ids."""
     media = getattr(message, "media", None)
-    for attr in ("photo", "document"):
-        obj = getattr(media, attr, None)
-        if obj is not None and getattr(obj, "id", None):
-            return f"{attr}:{obj.id}"
-    return None
+    keys = set()
+    photo = getattr(media, "photo", None)
+    if photo is not None:
+        if getattr(photo, "id", None):
+            keys.add(f"photo:{photo.id}")
+        best = None
+        for size in getattr(photo, "sizes", None) or []:
+            w, h = getattr(size, "w", 0), getattr(size, "h", 0)
+            nbytes = getattr(size, "size", None) or max(getattr(size, "sizes", None) or [0])
+            if w and h and (best is None or w * h > best[0] * best[1]):
+                best = (w, h, nbytes)
+        if best:
+            keys.add("photoshape:%dx%d:%d" % best)
+    document = getattr(media, "document", None)
+    if document is not None:
+        if getattr(document, "id", None):
+            keys.add(f"doc:{document.id}")
+        if getattr(document, "size", None):
+            keys.add(f"docshape:{document.size}:{getattr(document, 'mime_type', '')}")
+    return keys
 
 
 def fingerprints(message) -> set:
@@ -50,10 +69,17 @@ def fingerprints(message) -> set:
     text = _norm(getattr(message, "message", ""))
     if text:
         keys.add("t:" + text)
-    media = _media_key(message)
-    if media:
-        keys.add("m:" + media)
+    keys |= {"m:" + k for k in _media_keys(message)}
     return keys
+
+
+def describe(message) -> str:
+    text = _norm(getattr(message, "message", ""))
+    media = getattr(message, "media", None)
+    kind = ("photo" if getattr(media, "photo", None) is not None else
+            "file/video" if getattr(media, "document", None) is not None else
+            type(media).__name__ if media is not None else "text")
+    return kind + (f' "{text[:30]}"' if text else "")
 
 
 class CategoryGuard:
@@ -69,6 +95,7 @@ class CategoryGuard:
         self.clock = clock
         self.lock = asyncio.Lock()
         self.prints: list[set] = []        # one fingerprint set per shortcut message
+        self.contents: list[str] = []      # human description, for .categoryguard
         self.loaded_at = 0.0
         try:
             self.chats = json.loads(self.path.read_text(encoding="utf-8"))
@@ -97,6 +124,7 @@ class CategoryGuard:
             shortcut_id=target.shortcut_id, hash=0, id=None))
         ordered = sorted(getattr(msgs, "messages", []) or [], key=lambda m: m.id)
         self.prints = [p for p in (fingerprints(m) for m in ordered) if p]
+        self.contents = [describe(m) for m in ordered]
         self.loaded_at = self.clock()
         return True
 
@@ -153,7 +181,15 @@ class CategoryGuard:
             except Exception:  # noqa: BLE001 - keep the last known content
                 pass
             if self._match(message) is None:
-                return None
+                # maybe the quick reply was just edited: re-read it and retry
+                if self.clock() - self.loaded_at < MISS_REFRESH:
+                    return None
+                try:
+                    await self.refresh(force=True)
+                except Exception:  # noqa: BLE001
+                    return None
+                if self._match(message) is None:
+                    return None
             now = self.clock()
             if group and now - group["ts"] <= GROUP_WINDOW:
                 # another message of the send we just handled (arrived late)
