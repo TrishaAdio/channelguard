@@ -53,7 +53,7 @@ class FakeEvent:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_trigger_only_on_plain_purge_reply():
