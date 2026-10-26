@@ -4059,7 +4059,7 @@ async def cmd_qr_reorder(event, command: str) -> None:
 
     missing = [name for name in wanted if name not in by_name]
     new_order = _plan_qr_order(current, command, wanted)
-    if [n for n in new_order] == current:
+    if new_order == current:
         note = f" (unknown: {', '.join('/' + m for m in missing)})" if missing else ""
         await _ack(event, "Order unchanged" + note + ".")
         return
@@ -4068,10 +4068,25 @@ async def cmd_qr_reorder(event, command: str) -> None:
     except Exception as error:  # noqa: BLE001
         await _ack(event, f"Reorder failed: {type(error).__name__}: {error}")
         return
-    listing = "\n".join(f"{i + 1}. /{name}" for i, name in enumerate(new_order))
+
+    # Read it back so we report what Telegram actually stored, not a guess.
+    verify = await client(GetQuickRepliesRequest(hash=0))
+    actual = [q.shortcut for q in (getattr(verify, "quick_replies", []) or [])]
+    applied = actual == new_order
+    listing = "\n".join(f"{i + 1}. /{name}" for i, name in enumerate(actual or new_order))
     tail = f"\nUnknown (ignored): {', '.join('/' + m for m in missing)}" if missing else ""
-    await _ack(event, "New quick-reply order:\n" + listing + tail)
-    print(ui.green("[qr] ") + f"reordered -> {', '.join(new_order)}", flush=True)
+    if applied:
+        head = "New quick-reply order (saved on Telegram):"
+        tip = ("\n\nIf your app still shows the old order, fully close and reopen it - the "
+               "quick-replies panel is cached. If the moved ones appear at the TOP instead, "
+               "your app shows the list reversed, so use the opposite command "
+               "(.qrtop <-> .qrlast).")
+    else:
+        head = "Telegram did not store the new order (it kept its own). Current order:"
+        tip = "\n\nTelegram sometimes pins quick replies to creation order; reordering may not stick."
+    await _ack(event, f"{head}\n{listing}{tail}{tip}")
+    print(ui.green("[qr] ") + f"reorder {'applied' if applied else 'NOT applied'} -> "
+          + f"{', '.join(actual or new_order)}", flush=True)
 
 
 async def cmd_setup(event) -> None:
