@@ -3334,8 +3334,8 @@ HELP_TEXT = (
     "<code>.gdpa</code> - in a customer's DM: deletes itself and puts their country's "
     "per capita income ($) in your draft, without sending it\n"
     "<b>/category</b> (Business quick reply)\n"
-    "Once per chat; the first one always stays. Sent again later: the new copy is deleted. "
-    "Sent twice within 1 minute: the 2nd is deleted and the next one is allowed. Outside India, /category is deleted and "
+    "Once per chat; the kept one is never deleted. Every repeat is deleted; send it twice "
+    "within 1 minute (both deleted) and the next one is allowed. Outside India, /category is deleted and "
     "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
     "allows it again there; <code>.categoryguard</code> shows the status\n"
     "<b>Block</b>\n"
@@ -4166,7 +4166,7 @@ def _watch_category(event) -> None:
             action = await _category.on_outgoing(event.chat_id, event.message)
             notes = {
                 "duplicate": "already sent here - deleted the new copy",
-                "reset": "sent twice within 1 min - deleted the 2nd, next one allowed",
+                "unlocked": "2nd try within 1 min - deleted, the next one is allowed",
                 "foreign": "foreign chat - deleted /category, sent the foreign quick reply",
                 "foreign-kept": "foreign chat - deleted /category (foreign reply already sent)",
             }
@@ -4241,8 +4241,8 @@ async def cmd_categoryguard(event) -> None:
                        + (", ".join(_category.contents) or "nothing") + ". "
                        if found else f"Quick reply /{_category.shortcut} not found - check its name "
                        f"(CATEGORY_SHORTCUT={config.CATEGORY_SHORTCUT}). ")
-               + "Once per chat; the first one always stays. Again later = new copy deleted; "
-               "twice within 1 min = the 2nd is deleted and the next one is allowed. "
+               + "Once per chat; the kept one is never deleted. Every repeat is deleted; "
+               "2 deleted tries within 1 min unlock it, so the next one is allowed. "
                ".categoryguard reset (in a chat) allows it again there.")
 
 

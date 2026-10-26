@@ -2,10 +2,10 @@
 
 Rules, per chat:
   * The first /category is allowed and remembered.
-  * /category again later (more than RESET_WINDOW after it) is a duplicate:
-    the new copy is deleted for both sides.
-  * /category twice within RESET_WINDOW: only the 2nd copy is deleted (the
-    first always stays), and the next /category after that is allowed.
+  * After that, every /category in the chat is deleted (only the new copy;
+    the kept one is never touched).
+  * Unlock: two deleted tries within RESET_WINDOW -> the NEXT /category is
+    allowed and stays.
 
 Foreign chats (the user's country isn't India): /category is always
 deleted and the /forgein quick reply is sent instead, once per chat.
@@ -145,7 +145,8 @@ class CategoryGuard:
         for m in recent:
             if len(found) >= count:
                 break
-            if (m is None or not getattr(m, "out", False) or m.id in self.ignore
+            kept = self.chats.get(str(chat_id), {}).get("ids", ())
+            if (m is None or not getattr(m, "out", False) or m.id in self.ignore or m.id in kept
                     or date is None or getattr(m, "date", None) is None
                     or (date - m.date).total_seconds() > ATTACH_WINDOW):
                 break
@@ -225,21 +226,28 @@ class CategoryGuard:
             self.save()
             return "allowed"
         if record.get("allow_next"):
-            # the send after a quick repeat is allowed; the first one stays too
+            # unlocked by two quick tries: this one is allowed and stays
             record["ids"] = list(record["ids"]) + list(ids)
             record.pop("allow_next", None)
+            record.pop("last_try", None)
             record["ts"] = now
             self.save()
             return "allowed"
-        await self._delete(chat_id, ids)  # the first send is never deleted
-        if now - record["ts"] <= RESET_WINDOW:
-            record["allow_next"] = True
+        # already sent here: delete ONLY this new copy (kept sends are protected)
+        await self._delete(chat_id, ids, keep=record["ids"])
+        last_try = record.get("last_try")
+        if last_try is not None and now - last_try <= RESET_WINDOW:
+            record["allow_next"] = True      # 2nd deleted try within 1 min: unlock
+            record.pop("last_try", None)
             self.save()
-            return "reset"
+            return "unlocked"
+        record["last_try"] = now
+        self.save()
         return "duplicate"
 
-    async def _delete(self, chat_id, ids) -> None:
-        ids = [i for i in dict.fromkeys(ids) if i]
+    async def _delete(self, chat_id, ids, keep=()) -> None:
+        keep = set(keep)
+        ids = [i for i in dict.fromkeys(ids) if i and i not in keep]
         if ids:
             await self.client.delete_messages(chat_id, ids, revoke=True)
 
