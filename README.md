@@ -280,9 +280,9 @@ Your Business quick reply `/category` can be sent once in each chat:
 
 | You send `/category` | What happens |
 |---|---|
-| First time in a chat | Sent normally and remembered. |
-| Again in that chat, more than 1 minute later | The new copy is deleted for both sides. The first one stays. |
-| Twice within 1 minute | Only the 2nd copy is deleted (the first always stays), and the next `/category` in that chat is allowed. |
+| First time in a chat | Sent normally and kept. It's never deleted. |
+| Again in that chat | The new copy is deleted. The kept one stays. |
+| Twice within 1 minute (both deleted) | Unlocked: the **next** `/category` in that chat is allowed and kept. |
 
 - **People outside India:** in a chat with someone whose country isn't India, `/category` is always deleted and your `/forgein` quick reply is sent instead, once per chat. The country comes from the separator's lookup (phone country on the "Not a contact" card, or their number). If the country is unknown, `/category` follows the normal rules above. The shortcut name is `FOREIGN_SHORTCUT` in `.env` (default `forgein,foreign`: the first one that exists is used; blank turns the redirect off).
 - `.categoryguard reset` inside a chat allows `/category` there again; `.categoryguard` shows the status.
