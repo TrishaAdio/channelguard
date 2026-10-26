@@ -4220,8 +4220,11 @@ async def cmd_categoryguard(event) -> None:
             await client.send_message("me", "/category hadn't been used in that chat yet.")
         return
     found = await _category.refresh(force=True)
-    await _ack(event, (f"/{_category.shortcut} guard: used in {len(_category.chats)} chat(s). "
-                       if found else f"Quick reply /{_category.shortcut} not found. ")
+    used = sum(1 for k in _category.chats if not k.startswith("f:"))
+    await _ack(event, (f"/{_category.shortcut} guard: used in {used} chat(s). Content it watches: "
+                       + (", ".join(_category.contents) or "nothing") + ". "
+                       if found else f"Quick reply /{_category.shortcut} not found - check its name "
+                       f"(CATEGORY_SHORTCUT={config.CATEGORY_SHORTCUT}). ")
                + "Once per chat; again later = new copy deleted; twice within 1 min = "
                "both deleted and the next one is allowed. "
                ".categoryguard reset (in a chat) allows it again there.")
