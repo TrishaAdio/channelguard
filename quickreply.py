@@ -3317,8 +3317,9 @@ HELP_TEXT = (
     "<code>.sszip [today|yesterday|YYYY-MM-DD]</code> - that IST day's payment screenshots as a ZIP\n"
     "<code>.ssauto [on|off]</code> - auto-send each finished day's ZIP; "
     "<code>.ssto &lt;@channel|id&gt;</code> - where it goes\n"
-    "<code>.setup</code> - on a NEW account: rebuild it from the newest backup (or reply to a "
-    "backup ZIP); preview first, then <code>.setup confirm</code>. Username and gifts are not moved\n"
+    "<code>.setup</code> - on a NEW account: <b>reply to a backup ZIP</b> and it transforms this "
+    "account to match it right away. With no reply it previews the newest local backup, then "
+    "<code>.setup confirm</code>. Username and gifts are not moved\n"
     "<b>Separator</b> (any chat)\n"
     "<code>.separator on|off|status</code> - DMs from outside India go to the "
     "<b>Videshi</b> folder and leave your Unread folder; when it is full (200) the "
@@ -3967,25 +3968,56 @@ _pending_setup: dict = {}
 
 
 async def _setup_source(event):
-    """Replied backup ZIP (downloaded) or the newest data/backups ZIP."""
+    """Return ``(path, from_reply)``.
+
+    Replying to a ``.zip`` downloads it (and means "apply now"); no reply uses
+    the newest ``data/backups`` ZIP (and keeps the preview + confirm safety).
+    """
     reply = await event.get_reply_message()
     if reply is not None and getattr(reply, "file", None) is not None:
         name = getattr(reply.file, "name", "") or ""
-        if not name.endswith(".zip"):
+        if not name.lower().endswith(".zip"):
             raise ValueError("Reply to a quickreply_backup_*.zip file.")
-        target = config.DATA_DIR / "backups" / Path(name).name
+        target = config.DATA_DIR / "backups" / (Path(name).name or "replied_backup.zip")
         target.parent.mkdir(parents=True, exist_ok=True)
         await client.download_media(reply, file=str(target))
-        return target
+        return target, True
+    if reply is not None:
+        raise ValueError("Reply to a backup ZIP file (the one .save produced), or send .setup "
+                         "with no reply to use the newest local backup.")
     path = restore.newest_backup(config.DATA_DIR)
     if path is None:
         raise ValueError("No backup found. Run .save on the old account first, or forward its "
                          "quickreply_backup_*.zip here and reply to it with .setup")
-    return path
+    return path, False
+
+
+async def _apply_setup(event, path) -> None:
+    """Transform the logged-in account to match the backup ZIP at ``path``."""
+    backup = restore.Backup(path)
+    await _ack(event, f"Transforming this account from {path.name} ... "
+                      "this takes a minute (photos and media are uploaded).")
+    try:
+        async with _payment_lock:
+            report, greeting = await restore.run(
+                client, backup, dry_run=False, data_dir=config.DATA_DIR,
+                sleep=asyncio.sleep, pay_store=_pay)
+            _save_pay()
+    finally:
+        backup.close()
+    if greeting:
+        _save_greeting(greeting["chat_id"], greeting["message_id"])
+    head = "SETUP DONE" if not report.failed else f"SETUP DONE WITH {len(report.failed)} PROBLEM(S)"
+    await _ack(event, f"{head}\n\n{report.text()}"[:4000])
 
 
 async def cmd_setup(event) -> None:
-    """`.setup` preview, `.setup confirm` apply, `.setup cancel`."""
+    """`.setup` applies a backup to the logged-in account.
+
+    Reply to a backup ZIP with ``.setup`` -> transforms this account to match
+    it immediately. ``.setup`` with no reply previews the newest local backup
+    and waits for ``.setup confirm``; ``.setup cancel`` drops a pending preview.
+    """
     parts = (event.raw_text or "").lower().split()
     sub = parts[1] if len(parts) > 1 else ""
     if sub == "cancel":
@@ -3998,23 +4030,28 @@ async def cmd_setup(event) -> None:
             await _ack(event, "Nothing to confirm (or it expired). Send .setup first.")
             return
         _pending_setup.clear()
-        await _ack(event, "Restoring... this takes a minute (photos and media are uploaded).")
-        backup = restore.Backup(path)
         try:
-            async with _payment_lock:
-                report, greeting = await restore.run(client, backup, dry_run=False,
-                                                     data_dir=config.DATA_DIR, sleep=asyncio.sleep,
-                                                     pay_store=_pay)
-                _save_pay()
-        finally:
-            backup.close()
-        if greeting:
-            _save_greeting(greeting["chat_id"], greeting["message_id"])
-        head = ("SETUP DONE" if not report.failed else f"SETUP DONE WITH {len(report.failed)} PROBLEM(S)")
-        await _ack(event, f"{head}\n\n{report.text()}"[:4000])
+            await _apply_setup(event, path)
+        except Exception as error:  # noqa: BLE001
+            await _ack(event, f"Setup failed: {type(error).__name__}: {error}")
         return
     try:
-        path = await _setup_source(event)
+        path, from_reply = await _setup_source(event)
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Setup: {error}")
+        return
+
+    # Replying to a ZIP is an explicit choice -> transform straight away.
+    if from_reply:
+        _pending_setup.clear()
+        try:
+            await _apply_setup(event, path)
+        except Exception as error:  # noqa: BLE001
+            await _ack(event, f"Setup failed: {type(error).__name__}: {error}")
+        return
+
+    # No reply: preview the newest local backup, then wait for .setup confirm.
+    try:
         backup = restore.Backup(path)
     except Exception as error:  # noqa: BLE001
         await _ack(event, f"Setup: {error}")
@@ -4030,7 +4067,8 @@ async def cmd_setup(event) -> None:
     _pending_setup.update(path=path, until=time.monotonic() + 600)
     warn = ("\nNOTE: this backup is from THIS account; restoring adds the photos again.\n" if same else "")
     await _ack(event, f"SETUP PREVIEW (nothing changed yet)\n{info}{warn}\n\n{report.text()}\n\n"
-                      "Send .setup confirm within 10 minutes to apply, or .setup cancel."[:4000])
+                      "Send .setup confirm within 10 minutes to apply, or .setup cancel.\n"
+                      "(Tip: reply to a backup ZIP with .setup to apply it immediately.)"[:4000])
 
 
 # --------------------------------------------------------------------------
