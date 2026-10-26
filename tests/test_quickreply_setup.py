@@ -203,3 +203,68 @@ def test_setup_command_preview_confirm_flow(tmp_path, monkeypatch):
 
     asyncio.run(run())
     assert datetime.now(timezone.utc)
+
+
+def test_setup_reply_to_zip_applies_immediately(tmp_path, monkeypatch):
+    import shutil
+
+    path, data = backup_zip(tmp_path)
+    # the forwarded ZIP the operator replies to, stored outside data/backups
+    incoming = tmp_path / "forwarded.zip"
+    shutil.copy(path, incoming)
+
+    fresh = FreshAccount()
+
+    async def download_media(message, file):
+        shutil.copy(incoming, file)      # Telethon writes the replied file to `file`
+        return file
+
+    fresh.download_media = download_media
+    monkeypatch.setattr(quickreply, "client", fresh)
+    monkeypatch.setattr(quickreply.config, "DATA_DIR", data)
+    monkeypatch.setattr(quickreply, "_save_pay", lambda: None)
+    saved_greeting = {}
+    monkeypatch.setattr(quickreply, "_save_greeting", lambda c, m: saved_greeting.update(chat=c, msg=m))
+    quickreply._state["self_id"] = 222
+    quickreply._pay = quickreply._default_pay()
+    quickreply._pending_setup.clear()
+
+    zip_msg = SimpleNamespace(file=SimpleNamespace(name="quickreply_backup_2026-10-20_060000.zip"))
+
+    class E(Event):
+        async def get_reply_message(self):
+            return zip_msg
+
+    async def run():
+        event = E(".setup", chat_id=222)
+        await quickreply._handle_outgoing(event)
+        # one step: no "SETUP PREVIEW", goes straight to transforming + done
+        assert any("Transforming this account" in e for e in event.edits)
+        assert event.edits[-1].startswith("SETUP DONE"), event.edits[-1]
+        assert fresh.user.first_name == "Alice" and fresh.shortcuts
+        assert saved_greeting == {"chat": 222, "msg": 901}
+        assert quickreply._pending_setup == {}          # nothing left pending
+
+    asyncio.run(run())
+
+
+def test_setup_reply_to_non_zip_is_rejected(tmp_path, monkeypatch):
+    _path, data = backup_zip(tmp_path)
+    fresh = FreshAccount()
+    monkeypatch.setattr(quickreply, "client", fresh)
+    monkeypatch.setattr(quickreply.config, "DATA_DIR", data)
+    quickreply._state["self_id"] = 222
+    quickreply._pay = quickreply._default_pay()
+
+    photo_msg = SimpleNamespace(file=SimpleNamespace(name="photo.jpg"))
+
+    class E(Event):
+        async def get_reply_message(self):
+            return photo_msg
+
+    async def run():
+        event = E(".setup", chat_id=222)
+        await quickreply._handle_outgoing(event)
+        assert "quickreply_backup" in event.edits[-1] and fresh.user.first_name == "New"
+
+    asyncio.run(run())
