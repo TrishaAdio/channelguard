@@ -3325,6 +3325,9 @@ HELP_TEXT = (
     "(e.g. <code>.qrfirst category</code>). <code>.qrlast</code> sends to the bottom, "
     "<code>.qrorder</code> sets an exact order; no name shows the current order. Fully restart "
     "Telegram afterwards - it caches the / list\n"
+    "<code>.qrrebuild &lt;name&gt;</code> - if reordering won't stick: backs up all quick replies, "
+    "deletes them, and recreates them with that one first (then <code>.qrrebuild confirm</code>). "
+    "The backup can be restored with .setup\n"
     "<b>Separator</b> (any chat)\n"
     "<code>.separator on|off|status</code> - DMs from outside India go to the "
     "<b>Videshi</b> folder and leave your Unread folder; when it is full (200) the "
@@ -3772,6 +3775,9 @@ async def _handle_outgoing(event):
     if command in (".qrlast", ".qrtop", ".qrfirst", ".qrorder"):
         await cmd_qr_reorder(event, command)
         return
+    if command == ".qrrebuild":
+        await cmd_qr_rebuild(event)
+        return
     if low.startswith("/broadcast"):
         reply = await event.get_reply_message()
         if reply is None:
@@ -4088,6 +4094,83 @@ async def cmd_qr_reorder(event, command: str) -> None:
     await _ack(event, f"{head}\n{listing}{tail}{tip}")
     print(ui.green("[qr] ") + f"reorder {'applied' if applied else 'NOT applied'} -> "
           + f"{', '.join(actual or new_order)}", flush=True)
+
+
+_pending_rebuild: dict = {}
+
+
+async def cmd_qr_rebuild(event) -> None:
+    """`.qrrebuild <name...>` - back up, delete ALL quick replies, then recreate
+    them with the named one(s) first so they lead the / list.
+
+    Two steps on purpose (it deletes everything first): `.qrrebuild category`
+    makes a verified backup and shows the plan; `.qrrebuild confirm` runs it.
+    `.qrrebuild cancel` drops it.
+    """
+    parts = (event.raw_text or "").split()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub == "cancel":
+        _pending_rebuild.clear()
+        await _ack(event, "Rebuild cancelled - nothing was changed.")
+        return
+
+    if sub == "confirm":
+        pending = dict(_pending_rebuild)
+        if not pending.get("path") or time.monotonic() > pending.get("until", 0):
+            await _ack(event, "Nothing to confirm (or it expired). Send .qrrebuild <name> first.")
+            return
+        _pending_rebuild.clear()
+        await _ack(event, "Rebuilding quick replies (delete + recreate)... this takes a minute.")
+        backup = restore.Backup(pending["path"])
+        try:
+            report, final = await restore.rebuild_quick_replies(
+                client, backup, pending["firsts"], sleep=asyncio.sleep)
+        finally:
+            backup.close()
+        listing = "\n".join(f"{i + 1}. /{name}" for i, name in enumerate(final))
+        head = "QUICK REPLIES REBUILT" if not report.failed else \
+            f"REBUILT WITH {len(report.failed)} PROBLEM(S)"
+        restore_hint = ("" if not report.failed else
+                        f"\n\nSome parts failed. Your backup is safe at "
+                        f"data/backups/{Path(pending['path']).name} - reply to it with .setup to restore.")
+        await _ack(event, f"{head}\nNew order:\n{listing}{restore_hint}\n\n"
+                          "Now FULLY quit and reopen Telegram (tray -> Quit / swipe away on phone); "
+                          "the / list is cached. #1 above shows first when you type /."[:4000])
+        return
+
+    firsts = [token.lstrip("/").strip() for token in parts[1:] if token.strip()]
+    if not firsts:
+        await _ack(event, "Usage: .qrrebuild <name...>  e.g.  .qrrebuild category\n"
+                          "It backs up all quick replies, deletes them, and recreates them with "
+                          "those first. Then send .qrrebuild confirm.")
+        return
+
+    await _ack(event, "Backing up every quick reply first (downloading media)...")
+    try:
+        result = await extras.save_everything(
+            client, data_dir=config.DATA_DIR, env_path=config.ENV_PATH, greeting_ref=_load_greeting())
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Backup failed, so nothing was deleted: {type(error).__name__}: {error}")
+        return
+
+    backup = restore.Backup(result["path"])
+    try:
+        order = restore.rebuild_plan(backup, firsts)
+        known = {s["name"] for s in backup.doc.get("quick_replies") or []}
+    finally:
+        backup.close()
+    missing = [n for n in firsts if n not in known]
+    if len(known) == 0:
+        await _ack(event, "No quick replies found to rebuild.")
+        return
+    _pending_rebuild.update(path=str(result["path"]), firsts=firsts, until=time.monotonic() + 600)
+    listing = "\n".join(f"{i + 1}. /{name}" for i, name in enumerate(order))
+    warn = f"\nUnknown (ignored): {', '.join('/' + m for m in missing)}" if missing else ""
+    status = "complete" if result["complete"] else "PARTIAL - check it before confirming"
+    await _ack(event, f"Backup saved: data/backups/{result['path'].name} ({status}).\n"
+                      f"This will DELETE all {len(known)} quick replies and recreate them as:\n"
+                      f"{listing}{warn}\n\nSend .qrrebuild confirm within 10 minutes, or .qrrebuild cancel."[:4000])
 
 
 async def cmd_setup(event) -> None:

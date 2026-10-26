@@ -39,7 +39,9 @@ from telethon.tl.functions.account import (
     UpdateProfileRequest,
 )
 from telethon.tl.functions.messages import (
+    DeleteQuickReplyShortcutRequest,
     GetQuickRepliesRequest,
+    ReorderQuickRepliesRequest,
     SendMediaRequest,
     SendMessageRequest,
     SendMultiMediaRequest,
@@ -489,6 +491,59 @@ async def _business(client, report, business, new_ids, dry_run, sleep):
             link=T.InputBusinessChatLink(message=link.get("message") or "",
                                          entities=_entities(link.get("entities")) or None,
                                          title=link.get("title"))))
+
+
+def rebuild_plan(backup: Backup, first_names: list[str]) -> list[str]:
+    """Desired quick-reply order: ``first_names`` (that exist in the backup)
+    first, then the rest in the backup's stored order."""
+    shortcuts = sorted(backup.doc.get("quick_replies") or [], key=lambda s: s.get("order", 0))
+    names = [s["name"] for s in shortcuts]
+    firsts = list(dict.fromkeys(n for n in first_names if n in names))
+    return firsts + [n for n in names if n not in set(firsts)]
+
+
+async def rebuild_quick_replies(client, backup: Backup, first_names: list[str], *, sleep):
+    """Delete every live quick reply and recreate them from ``backup`` with
+    ``first_names`` created first (so they lead the / list). Returns a Report.
+
+    The backup ZIP is the safety net: if recreation fails, the operator can
+    `.setup` (reply to that ZIP) to restore everything.
+    """
+    report = Report(dry_run=False)
+    desired = rebuild_plan(backup, first_names)
+    by_name = {s["name"]: s for s in backup.doc.get("quick_replies") or []}
+
+    live = list(getattr(await client(GetQuickRepliesRequest(hash=0)), "quick_replies", []) or [])
+    deleted = 0
+    for shortcut in live:
+        try:
+            await _call(client, DeleteQuickReplyShortcutRequest(shortcut_id=shortcut.shortcut_id), sleep)
+            deleted += 1
+        except Exception as error:  # noqa: BLE001
+            report.fail(f"delete /{shortcut.shortcut}", error)
+    report.add("deleted old quick replies", "restored", f"{deleted} removed")
+
+    for name in desired:   # created in this order; the first one leads the / list
+        try:
+            notes = await _send_shortcut(client, backup, name, by_name[name]["messages"], sleep)
+            report.add(f"quick reply /{name}", "restored", "; ".join(dict.fromkeys(notes)))
+            await sleep(1)
+        except Exception as error:  # noqa: BLE001
+            report.fail(f"quick reply /{name}", error)
+
+    # Enforce the order explicitly too, in case the client sorts by it.
+    res = list(getattr(await client(GetQuickRepliesRequest(hash=0)), "quick_replies", []) or [])
+    ids = {q.shortcut: q.shortcut_id for q in res}
+    order = [ids[n] for n in desired if n in ids]
+    order += [q.shortcut_id for q in res if q.shortcut_id not in set(order)]
+    if order:
+        try:
+            await _call(client, ReorderQuickRepliesRequest(order=order), sleep)
+        except Exception as error:  # noqa: BLE001
+            report.fail("reorder", error)
+
+    final = [q.shortcut for q in getattr(await client(GetQuickRepliesRequest(hash=0)), "quick_replies", []) or []]
+    return report, final
 
 
 def describe(backup: Backup) -> str:
