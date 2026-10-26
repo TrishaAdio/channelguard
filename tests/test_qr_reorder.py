@@ -14,9 +14,10 @@ LIVE = ["w", "category", "forgein", "qr3", "qr2", "fix", "payments", "qr", "all"
 
 
 class FakeClient:
-    def __init__(self, names):
+    def __init__(self, names, apply=True):
         self.names = list(names)
         self.reordered = None
+        self.apply = apply   # whether Telegram "stores" the new order
 
     async def __call__(self, request):
         name = type(request).__name__
@@ -28,6 +29,8 @@ class FakeClient:
         if name == "ReorderQuickRepliesRequest":
             id_to_name = {100 + i: n for i, n in enumerate(self.names)}
             self.reordered = [id_to_name[i] for i in request.order]
+            if self.apply:
+                self.names = list(self.reordered)   # server stores it; re-read matches
             return True
         raise NotImplementedError(name)
 
@@ -59,8 +62,8 @@ def test_plan_ignores_unknown_and_dedupes():
     assert out.count("category") == 1 and out[-1] == "category" and "nope" not in out
 
 
-def _run_cmd(text, names=LIVE):
-    client = FakeClient(names)
+def _run_cmd(text, names=LIVE, apply=True):
+    client = FakeClient(names, apply=apply)
     quickreply.client = client
     quickreply._state["self_id"] = 1
     event = Event(text, chat_id=1)
@@ -71,8 +74,15 @@ def _run_cmd(text, names=LIVE):
 def test_qrlast_command_reorders_live_list_and_reports():
     client, event = _run_cmd(".qrlast category forgein")
     assert client.reordered[-2:] == ["category", "forgein"]
-    assert "New quick-reply order" in event.edits[-1]
-    assert event.edits[-1].rstrip().endswith("/forgein")       # listed last
+    assert "saved on Telegram" in event.edits[-1]
+    assert "12. /forgein" in event.edits[-1]                   # verified last
+
+
+def test_reports_when_telegram_does_not_store_the_order():
+    client, event = _run_cmd(".qrlast category forgein", apply=False)
+    assert client.reordered is not None                        # we did send it
+    assert "did not store" in event.edits[-1]
+    assert client.names[:3] == ["w", "category", "forgein"]    # unchanged server order
 
 
 def test_no_args_shows_current_order_without_reordering():
