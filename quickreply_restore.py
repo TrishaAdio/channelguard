@@ -210,44 +210,71 @@ def _groups(messages):
         yield group
 
 
+def _clean_text(text) -> str:
+    """Drop lone surrogates (invalid UTF-8 Telegram rejects) and trailing NULs."""
+    if not text:
+        return ""
+    return "".join(ch for ch in text if not 0xD800 <= ord(ch) <= 0xDFFF).replace("\x00", "")
+
+
 async def _send_shortcut(client, backup: Backup, name: str, messages: list, sleep) -> list[str]:
+    """Send a shortcut's messages. One bad message is skipped with a note; it
+    never aborts the rest, and an empty text-only message is never sent."""
     notes = []
+    sent = 0
     shortcut = T.InputQuickReplyShortcut(shortcut=name)
-    for group in _groups(messages):
+    for index, group in enumerate(_groups(messages), 1):
         if any(m.get("reply_markup") for m in group):
             notes.append("buttons dropped (user accounts can't send them)")
-        if len(group) > 1:
-            singles = []
-            for message in group:
-                media = await _input_media(client, backup, message.get("media"))
-                uploaded = await _call(client, UploadMediaRequest(peer=T.InputPeerSelf(), media=media), sleep)
-                singles.append(T.InputSingleMedia(media=tl_utils.get_input_media(uploaded), random_id=_rid(),
-                                                  message=message.get("text") or "",
-                                                  entities=_entities(message.get("entities")) or None))
-            await _call(client, SendMultiMediaRequest(peer=T.InputPeerSelf(), multi_media=singles,
-                                                      quick_reply_shortcut=shortcut), sleep)
-            continue
-        message = group[0]
-        entities = _entities(message.get("entities"))
-        media = await _input_media(client, backup, message.get("media"))
-        for attempt in (entities, [e for e in entities if not isinstance(e, T.MessageEntityCustomEmoji)]):
-            try:
-                if media is None:
-                    request = SendMessageRequest(peer=T.InputPeerSelf(), message=message.get("text") or "",
-                                                 entities=attempt or None, random_id=_rid(),
-                                                 no_webpage=not message.get("link_preview"),
-                                                 quick_reply_shortcut=shortcut)
-                else:
-                    request = SendMediaRequest(peer=T.InputPeerSelf(), media=media,
-                                               message=message.get("text") or "", entities=attempt or None,
-                                               random_id=_rid(), quick_reply_shortcut=shortcut)
-                await _call(client, request, sleep)
-                if len(attempt) != len(entities):
-                    notes.append("custom emoji dropped (rejected by Telegram)")
-                break
-            except Exception as error:  # noqa: BLE001
-                if attempt is not entities or "EMOJI" not in str(error).upper():
-                    raise
+        try:
+            if len(group) > 1:
+                singles = []
+                for message in group:
+                    media = await _input_media(client, backup, message.get("media"))
+                    if media is None:
+                        continue   # an album item must carry media; skip a stray text-only part
+                    uploaded = await _call(client, UploadMediaRequest(peer=T.InputPeerSelf(), media=media), sleep)
+                    singles.append(T.InputSingleMedia(media=tl_utils.get_input_media(uploaded), random_id=_rid(),
+                                                      message=_clean_text(message.get("text")),
+                                                      entities=_entities(message.get("entities")) or None))
+                if not singles:
+                    notes.append(f"message {index} skipped (no usable media)")
+                    continue
+                await _call(client, SendMultiMediaRequest(peer=T.InputPeerSelf(), multi_media=singles,
+                                                          quick_reply_shortcut=shortcut), sleep)
+                sent += 1
+                continue
+
+            message = group[0]
+            entities = _entities(message.get("entities"))
+            media = await _input_media(client, backup, message.get("media"))
+            text = _clean_text(message.get("text"))
+            if media is None and not text:
+                notes.append(f"message {index} skipped (empty - nothing to send)")
+                continue
+            for attempt in (entities, [e for e in entities if not isinstance(e, T.MessageEntityCustomEmoji)]):
+                try:
+                    if media is None:
+                        request = SendMessageRequest(peer=T.InputPeerSelf(), message=text,
+                                                     entities=attempt or None, random_id=_rid(),
+                                                     no_webpage=not message.get("link_preview"),
+                                                     quick_reply_shortcut=shortcut)
+                    else:
+                        request = SendMediaRequest(peer=T.InputPeerSelf(), media=media, message=text,
+                                                   entities=attempt or None, random_id=_rid(),
+                                                   quick_reply_shortcut=shortcut)
+                    await _call(client, request, sleep)
+                    sent += 1
+                    if len(attempt) != len(entities):
+                        notes.append("custom emoji dropped (rejected by Telegram)")
+                    break
+                except Exception as error:  # noqa: BLE001
+                    if attempt is not entities or "EMOJI" not in str(error).upper():
+                        raise
+        except Exception as error:  # noqa: BLE001
+            notes.append(f"message {index} failed ({type(error).__name__}: {error})")
+    if not sent:
+        raise RuntimeError("; ".join(notes) or "no messages could be sent")
     return notes
 
 
