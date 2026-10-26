@@ -51,6 +51,17 @@ def test_plan_qrtop_moves_named_to_front():
     assert "demo" not in _plan(".qrtop", ["demo"])[1:]
 
 
+def test_qrfirst_is_the_same_as_qrtop():
+    assert _plan(".qrfirst", ["category"]) == _plan(".qrtop", ["category"])
+    assert _plan(".qrfirst", ["category"])[0] == "category"   # first in the / popup
+
+
+def test_qrfirst_command_puts_name_at_top():
+    client, event = _run_cmd(".qrfirst category")
+    assert client.reordered[0] == "category"
+    assert "1. /category" in event.edits[-1] and "saved on Telegram" in event.edits[-1]
+
+
 def test_plan_qrorder_sets_exact_leading_order_keeps_rest():
     out = _plan(".qrorder", ["payments", "all"])
     assert out[:2] == ["payments", "all"]
