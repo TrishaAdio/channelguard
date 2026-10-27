@@ -42,6 +42,7 @@ from pathlib import Path
 
 from telethon.errors import FloodWaitError, MessageDeleteForbiddenError
 from telethon.tl import types as tl_types
+from telethon.utils import get_peer_id
 from telethon.tl.functions.messages import (
     GetPeerDialogsRequest,
     GetQuickRepliesRequest,
@@ -59,6 +60,8 @@ ADD_LATER = 50 * 60                  # every later link/file in that chat: 50 mi
 ADD_BATCH = 15                       # sends this close together count as one
 MIN_TEXT = 12                        # shorter texts never match on text alone
 READ_SYNC = 120                      # ask Telegram about unread sends this often
+READ_SYNC_BATCH = 50                 # chats per request (one call covers many)
+READ_SYNC_MAX_AGE = 3 * 24 * 3600    # after this, only live read receipts start the clock
 REFRESH = 300                        # re-read the quick replies at least this often
 MISS_REFRESH = 30                    # an unmatched send re-reads at most this often
 FULL_REFRESH = 1800                  # re-read every shortcut's messages this often
@@ -137,6 +140,7 @@ class AutoDelete:
                     "due": float(item["due"]),
                     "tries": int(item.get("tries", 0)),
                     "why": str(item.get("why", "qr")),
+                    "at": float(item.get("at") or self.clock()),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -286,7 +290,7 @@ class AutoDelete:
         delay = {"add-first": ADD_FIRST, "add-later": ADD_LATER}.get(why)
         due = 0.0 if delay is None else self.clock() + delay
         self.pending.append({"chat": int(chat_id), "ids": ids, "due": due,
-                             "tries": 0, "why": why})
+                             "tries": 0, "why": why, "at": self.clock()})
         self.save()
         self.wake.set()
         when = f"in {round(delay / 60)} min" if delay is not None else (
@@ -351,26 +355,47 @@ class AutoDelete:
         """Ask Telegram which waiting sends have been read since we last looked.
 
         Read events only arrive while the bot is connected, so a customer who
-        opened the chat while it was down would otherwise wait forever.
+        opened the chat while it was down would otherwise wait forever. Up to
+        READ_SYNC_BATCH chats go in one request, so 400 waiting customers cost
+        8 calls every READ_SYNC seconds, not 400. Sends older than
+        READ_SYNC_MAX_AGE are left to live read receipts alone, so customers
+        who never open the chat don't pile up into an ever-growing poll.
         """
-        chats = {item["chat"] for item in self.pending if not item["due"]}
-        if not chats:
-            return 0
+        cutoff = self.clock() - READ_SYNC_MAX_AGE
+        chats = sorted({item["chat"] for item in self.pending
+                        if not item["due"] and item.get("at", 0) >= cutoff})
         started = 0
-        for chat_id in sorted(chats):
+        for start in range(0, len(chats), READ_SYNC_BATCH):
+            batch = chats[start:start + READ_SYNC_BATCH]
+            peers, by_peer = [], {}
+            for chat_id in batch:
+                try:
+                    peer = await self.client.get_input_entity(chat_id)
+                except Exception:  # noqa: BLE001  not cached / gone: skip it
+                    continue
+                peers.append(tl_types.InputDialogPeer(peer=peer))
+                by_peer[chat_id] = chat_id
+            if not peers:
+                continue
             try:
-                peer = await self.client.get_input_entity(chat_id)
-                res = await self.client(GetPeerDialogsRequest(
-                    peers=[tl_types.InputDialogPeer(peer=peer)]))
+                res = await self.client(GetPeerDialogsRequest(peers=peers))
             except FloodWaitError:
                 raise
-            except Exception as error:  # noqa: BLE001  a gone chat must not stop the rest
-                ui.warn(f"[autodel] {chat_id}: couldn't check if it was read ({error})")
+            except Exception as error:  # noqa: BLE001  one bad batch must not stop the rest
+                ui.warn(f"[autodel] couldn't check reads for {len(peers)} chat(s) ({error})")
                 continue
             for dialog in getattr(res, "dialogs", None) or []:
                 max_id = getattr(dialog, "read_outbox_max_id", 0) or 0
-                if max_id:
+                peer = getattr(dialog, "peer", None)
+                chat_id = None
+                if peer is not None:
+                    try:
+                        chat_id = get_peer_id(peer)
+                    except Exception:  # noqa: BLE001
+                        chat_id = None
+                if max_id and chat_id in by_peer:
                     started += self.note_read(chat_id, max_id)
+            await asyncio.sleep(1)  # spread the batches out
         return started
 
     async def _delete(self, chat_id: int, ids: list) -> None:
