@@ -296,10 +296,13 @@ On by default, nothing to configure:
 
 | What | Deleted for both sides |
 |---|---|
-| Every message your `/category` or `/foreign` (`/forgein`) quick reply sends: link lists, zips, files, photos, albums. This includes the `/forgein` the bot sends itself in foreign chats. | 1-2 hours later (random) |
-| Any quick reply you send in a chat within 10 minutes after `/add` there | 30 minutes later |
+| Every message your `/category` or `/foreign` (`/forgein`) quick reply sends: link lists, zips, files, photos, albums. This includes the `/forgein` the bot sends itself in foreign chats. | 60-70 minutes (random) **after the customer has seen it** |
+| In a chat where you sent `/add`: the first links or files you send after it | 3 minutes later |
+| Every later link or file in that same chat | 50 minutes later |
 
-- The `/add` receipt itself is never deleted, and neither is anything you type by hand.
+- **The read clock.** A `/category` or `/foreign` message the customer never opens is never deleted; the timer starts from the read receipt. Reads that happen while the bot is off are picked up on the next start (every chat still waiting is re-checked every 2 minutes).
+- **After `/add` the content decides**, not the quick reply it came from: anything carrying a link (`https://`, `t.me/`, `tg://`, or a linked word) or a file counts. Plain text you type is left alone, and so is the `/add` message itself, which holds the buyer's receipt. The 3-minute rule covers the whole first send, album and all; everything sent later in that chat gets 50 minutes. This stays in force for that chat, across restarts.
+- **These go on time** whether the customer read them or not.
 - Once the kept `/category` in a chat has been deleted, `/category` is allowed there again.
 - `AUTODEL ON` / `AUTODEL OFF` (any chat, any case) is the only control. In a customer's DM the command deletes itself and the confirmation goes to Saved Messages. Turning it off stops new messages being queued; ones already queued still go on time.
 - The queue is kept in `data/autodel.json`, so a restart loses nothing; anything that fell due while the bot was off is deleted when it starts again.
