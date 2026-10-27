@@ -67,9 +67,10 @@ DM country separator (any chat):
 
 Auto delete (on by default, any chat):
   AUTODEL ON | AUTODEL OFF       /category and /foreign messages are deleted
-                                 for both sides 1-2 h after sending; quick
-                                 replies sent within 10 min after /add go
-                                 after 30 min (the /add receipt stays)
+                                 for both sides 60-70 min after the customer
+                                 has seen them; in a chat where you sent /add,
+                                 the first links or files go after 3 min and
+                                 later ones after 50 min
 
 Business quick replies require Telegram Premium (the payment logger does not).
 
@@ -3349,9 +3350,10 @@ HELP_TEXT = (
     "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
     "allows it again there; <code>.categoryguard</code> shows the status\n"
     "<b>Auto delete</b> (on by default)\n"
-    "Every /category and /foreign message is deleted for both sides 1-2 hours after it is sent; "
-    "quick replies sent within 10 minutes after <code>/add</code> are deleted after 30 minutes "
-    "(the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat\n"
+    "Every /category and /foreign message is deleted for both sides 60-70 minutes after the "
+    "customer has seen it (unseen ones stay). In a chat where you sent <code>/add</code>, the "
+    "first links or files you send go after 3 minutes and every later link or file after 50 "
+    "minutes (the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -4347,8 +4349,10 @@ async def cmd_autodel(event, low_cmd: str) -> None:
         return
     turn_on = autodel.COMMAND_RE.match(low_cmd).group(1).lower() == "on"
     _autodel.set_enabled(turn_on)
-    note = (f"Auto delete ON: /category and /foreign go after 1-2 h, quick replies "
-            f"after /add go after 30 min. {_autodel.count} message(s) queued."
+    note = (f"Auto delete ON: /category and /foreign go 60-70 min after the customer "
+            f"sees them; after /add the first links or files go in 3 min and later "
+            f"ones in 50 min. {_autodel.count} message(s) queued "
+            f"({_autodel.unread_count} waiting to be seen)."
             if turn_on else
             f"Auto delete OFF: nothing new is queued. {_autodel.count} already "
             "queued message(s) still go on time.")
@@ -4565,6 +4569,17 @@ async def on_inbox_read(event) -> None:
     """You read a DM (on any device): it no longer needs hiding from Unread."""
     if _sep_state is not None and event.is_private:
         _sep_state.unread.pop(str(event.chat_id), None)
+
+
+async def on_outbox_read(event) -> None:
+    """The customer saw your messages: start the clock on their /category copy."""
+    # A "contents were read" update carries neither chat nor max_id; skip those.
+    if _autodel is None or event.chat_id is None or not getattr(event, "max_id", 0):
+        return
+    try:
+        _autodel.note_read(event.chat_id, event.max_id)
+    except Exception as error:  # noqa: BLE001  a read must never break anything
+        ui.error(f"[autodel] {event.chat_id}: read receipt failed ({error})")
 
 
 async def _sep_flush_loop() -> None:
@@ -5016,6 +5031,7 @@ async def main() -> None:
     client.add_event_handler(on_msg, events.NewMessage(incoming=True))
     client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
     client.add_event_handler(on_inbox_read, events.MessageRead(inbox=True))
+    client.add_event_handler(on_outbox_read, events.MessageRead())  # they read yours
 
     where = (f"from {src_raw}" if _state["source_id"]
              else "from local guard.py handoff only")
@@ -5058,8 +5074,9 @@ async def main() -> None:
     sep_task = asyncio.create_task(_sep_flush_loop(), name="separator-flush")
     autodel_task = asyncio.create_task(_autodel.run(), name="autodel")
     ui.info(f"Auto delete: {'ON' if _autodel.enabled else 'OFF'} "
-            + ui.dim(f"(/category, /foreign after 1-2 h; quick replies after /add after 30 min; "
-                     f"{_autodel.count} queued; AUTODEL ON|OFF)"))
+            + ui.dim(f"(/category, /foreign 60-70 min after the customer sees them; "
+                     f"after /add links and files go in 3 min, later ones in 50 min; "
+                     f"{_autodel.count} queued, {_autodel.unread_count} unseen; AUTODEL ON|OFF)"))
     if _state["separator"]:
         _start_separator_scan(None)  # every boot: sort all recent DMs
     try:
