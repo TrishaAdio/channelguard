@@ -65,6 +65,12 @@ DM country separator (any chat):
                                  user's country's per capita income ($) in
                                  the draft (not sent)
 
+Auto delete (on by default, any chat):
+  AUTODEL ON | AUTODEL OFF       /category and /foreign messages are deleted
+                                 for both sides 1-2 h after sending; quick
+                                 replies sent within 10 min after /add go
+                                 after 30 min (the /add receipt stays)
+
 Business quick replies require Telegram Premium (the payment logger does not).
 
 Run:  python quickreply.py    (Ctrl+C to stop)
@@ -138,6 +144,7 @@ import quickreply_restore as restore
 import percapita
 import separator
 import category
+import autodel
 
 # Shared link store (repo root): the BOT writes links here; this userbot only
 # reads them to fill {link} in the payment message. It never searches groups.
@@ -3341,6 +3348,10 @@ HELP_TEXT = (
     "within 1 minute (both deleted) and the next one is allowed. Outside India, /category is deleted and "
     "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
     "allows it again there; <code>.categoryguard</code> shows the status\n"
+    "<b>Auto delete</b> (on by default)\n"
+    "Every /category and /foreign message is deleted for both sides 1-2 hours after it is sent; "
+    "quick replies sent within 10 minutes after <code>/add</code> are deleted after 30 minutes "
+    "(the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3677,6 +3688,8 @@ async def _handle_outgoing(event):
         return
     if _category is not None and chat_id != _state["self_id"]:
         _watch_category(event)
+    if _autodel is not None and chat_id != _state["self_id"]:
+        _autodel.watch(event)
 
     _mark_owner_active()
     if event.is_private:
@@ -3687,6 +3700,9 @@ async def _handle_outgoing(event):
     # /setdone and /setchannelpostofpayment are matched before /set (Saved
     # Messages) so the longer commands win.
     low_cmd = raw_text.strip().lower()
+    if autodel.COMMAND_RE.match(low_cmd):
+        await cmd_autodel(event, low_cmd)
+        return
     if low_cmd in (".ping", "/ping"):
         await _ack(event, _runtime_status_text())
         return
@@ -3703,6 +3719,8 @@ async def _handle_outgoing(event):
         await cmd_gdpa(event)
         return
     if low_cmd.startswith("/add"):
+        if _autodel is not None and chat_id != _state["self_id"]:
+            _autodel.note_add(chat_id)
         async with _payment_lock:
             await cmd_add(event)
         return
@@ -4297,7 +4315,56 @@ async def _send_foreign_reply(chat_id) -> None:
         _cancel_automatic_outgoing(chat_id, marker)
         raise
     _finish_automatic_outgoing(chat_id, marker, result)
-    return sorted(_sent_message_ids(result))
+    sent = sorted(_sent_message_ids(result))
+    if _autodel is not None:
+        _autodel.schedule(chat_id, sent, "qr")
+    return sent
+
+
+_autodel: autodel.AutoDelete | None = None
+
+
+async def _autodel_deleted(chat_id, ids) -> None:
+    """A kept /category (or the /forgein sent) is gone: allow it again there."""
+    if _category is None:
+        return
+    gone = set(ids)
+    async with _category.lock:
+        changed = False
+        for key in (str(chat_id), "f:" + str(chat_id)):
+            record = _category.chats.get(key)
+            if record and gone & set(record.get("ids") or []):
+                _category.chats.pop(key, None)
+                changed = True
+        if changed:
+            _category.save()
+
+
+async def cmd_autodel(event, low_cmd: str) -> None:
+    """`AUTODEL ON` / `AUTODEL OFF` in any chat."""
+    if _autodel is None:
+        await _ack(event, "Auto delete is not running.")
+        return
+    turn_on = autodel.COMMAND_RE.match(low_cmd).group(1).lower() == "on"
+    _autodel.set_enabled(turn_on)
+    note = (f"Auto delete ON: /category and /foreign go after 1-2 h, quick replies "
+            f"after /add go after 30 min. {_autodel.count} message(s) queued."
+            if turn_on else
+            f"Auto delete OFF: nothing new is queued. {_autodel.count} already "
+            "queued message(s) still go on time.")
+    ui.info(f"[autodel] {'ON' if turn_on else 'OFF'}")
+    if event.chat_id == _state["self_id"]:
+        await _ack(event, note)
+        return
+    # In a customer's DM: remove the command, confirm in Saved Messages.
+    try:
+        await event.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await client.send_message("me", note)
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[autodel] couldn't confirm in Saved Messages ({error})")
 
 
 async def cmd_categoryguard(event) -> None:
@@ -4919,6 +4986,13 @@ async def main() -> None:
                         "the once-per-chat guard starts when you create it.")
         except Exception as error:  # noqa: BLE001
             ui.warn(f"/category guard: couldn't read quick replies ({error})")
+    global _autodel
+    _autodel = autodel.AutoDelete(client, config.DATA_DIR / "autodel.json",
+                                  on_deleted=_autodel_deleted)
+    try:
+        await _autodel.refresh(force=True)
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[autodel] couldn't read quick replies yet ({error}); retrying in the background")
     await _recover_pending_payments()
 
     src_raw = config.LINK_SOURCE_RAW.strip()
@@ -4982,14 +5056,19 @@ async def main() -> None:
     )
     ss_task = asyncio.create_task(_ss_archive_loop(), name="payment-screenshot-zips")
     sep_task = asyncio.create_task(_sep_flush_loop(), name="separator-flush")
+    autodel_task = asyncio.create_task(_autodel.run(), name="autodel")
+    ui.info(f"Auto delete: {'ON' if _autodel.enabled else 'OFF'} "
+            + ui.dim(f"(/category, /foreign after 1-2 h; quick replies after /add after 30 min; "
+                     f"{_autodel.count} queued; AUTODEL ON|OFF)"))
     if _state["separator"]:
         _start_separator_scan(None)  # every boot: sort all recent DMs
     try:
         await client.run_until_disconnected()
     finally:
-        for task in (recovery_task, ss_task, sep_task):
+        for task in (recovery_task, ss_task, sep_task, autodel_task):
             task.cancel()
-        await asyncio.gather(recovery_task, ss_task, sep_task, return_exceptions=True)
+        await asyncio.gather(recovery_task, ss_task, sep_task, autodel_task,
+                             return_exceptions=True)
 
 
 if __name__ == "__main__":
