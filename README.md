@@ -290,6 +290,21 @@ Your Business quick reply `/category` can be sent once in each chat:
 - The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.
 - The shortcut name is `CATEGORY_SHORTCUT` in `.env` (default `category`; blank turns this off). State is kept in `data/category.json`.
 
+### Auto delete (`quickreply.py`)
+
+On by default, nothing to configure:
+
+| What | Deleted for both sides |
+|---|---|
+| Every message your `/category` or `/foreign` (`/forgein`) quick reply sends: link lists, zips, files, photos, albums. This includes the `/forgein` the bot sends itself in foreign chats. | 1-2 hours later (random) |
+| Any quick reply you send in a chat within 10 minutes after `/add` there | 30 minutes later |
+
+- The `/add` receipt itself is never deleted, and neither is anything you type by hand.
+- Once the kept `/category` in a chat has been deleted, `/category` is allowed there again.
+- `AUTODEL ON` / `AUTODEL OFF` (any chat, any case) is the only control. In a customer's DM the command deletes itself and the confirmation goes to Saved Messages. Turning it off stops new messages being queued; ones already queued still go on time.
+- The queue is kept in `data/autodel.json`, so a restart loses nothing; anything that fell due while the bot was off is deleted when it starts again.
+- Quick replies are recognised by their content, like `/category` above. Texts under 12 characters never match on their own.
+
 ## Files
 
 | File            | Role                                                          |
@@ -303,6 +318,7 @@ Your Business quick reply `/category` can be sent once in each chat:
 | `infra.py`      | Supervises guard, quick-reply, and admin-bot processes         |
 | `separator.py`  | Country detection + Videshi folder filing (`.separator`)      |
 | `category.py`   | `/category` once-per-chat guard                               |
+| `autodel.py`    | timed auto delete for `/category`, `/foreign` and after `/add` |
 | `percapita.py`  | Per capita lookup for `.gdpa` (reads `per_capita_chart.py`, offline) |
 
 The setup, channel picker, and runtime output are **colorized** via `colorama`
