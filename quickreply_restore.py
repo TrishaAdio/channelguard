@@ -283,8 +283,18 @@ async def _send_shortcut(client, backup: Backup, name: str, messages: list, slee
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, pay_store: dict | None = None):
-    """Apply ``backup`` to the logged-in account. Returns ``(report, greeting_ref)``."""
+CONTENT_ONLY_SKIPPED = "left as is (.setup ok restores only quick replies, /set post and /add templates)"
+
+
+async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, pay_store: dict | None = None,
+              content_only: bool = False):
+    """Apply ``backup`` to the logged-in account. Returns ``(report, greeting_ref)``.
+
+    ``content_only`` (``.setup ok``) restores just the quick replies, the /set
+    greeting post and the /add + channel post templates with the payment
+    channel; name, bio, birthday, colours, emoji status, photos and Business
+    settings are left untouched.
+    """
     from telethon.tl.functions.users import GetFullUserRequest
 
     doc = backup.doc
@@ -309,6 +319,59 @@ async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, p
         except Exception as error:  # noqa: BLE001
             report.fail(item, error)
 
+    first, last = profile.get("first_name") or "", profile.get("last_name") or ""
+    if content_only:
+        report.add("profile (name, bio, birthday, colours, emoji status, photos)", "skipped",
+                   CONTENT_ONLY_SKIPPED)
+        report.add("business setup", "skipped", CONTENT_ONLY_SKIPPED)
+    else:
+        await _profile(client, backup, report, step, profile, me, full, sleep)
+    new_ids = await _quick_replies(client, backup, report, doc, premium, dry_run, sleep)
+    business = doc.get("business") or {}
+    if not content_only and any(business.get(k) for k in ("work_hours", "location", "intro", "greeting_message",
+                                                          "away_message", "chat_links")):
+        if not premium:
+            report.add("business setup", "skipped", PREMIUM)
+        else:
+            await _business(client, report, business, new_ids, dry_run, sleep)
+
+    post = doc.get("greeting_post")
+    if post:
+        try:
+            if not dry_run:
+                media = await _input_media(client, backup, post.get("media"))
+                entities = _entities(post.get("entities")) or None
+                if media is not None:
+                    sent = await client.send_file("me", file=media, caption=post.get("text") or "",
+                                                  formatting_entities=entities)
+                else:
+                    sent = await client.send_message("me", post.get("text") or "", formatting_entities=entities)
+                greeting_ref = {"chat_id": int(me.id), "message_id": int(sent.id)}
+            report.add("/set greeting post", "restored", "posted in Saved Messages and set as the greeting")
+        except Exception as error:  # noqa: BLE001
+            report.fail("/set greeting post", error)
+
+    pay_raw = backup.file("data/pay.json")
+    if pay_raw and pay_store is not None:
+        try:
+            old = json.loads(pay_raw)
+            values = {k: old[k] for k in PAY_KEYS if k in old and k != "done_ref"}
+            if not dry_run:
+                pay_store.update(values)
+            report.add("payment templates + channel", "restored",
+                       "payment log and greeted list are not copied (they belong to the old account)")
+        except Exception as error:  # noqa: BLE001
+            report.fail("payment templates + channel", error)
+
+    if not dry_run and not content_only:
+        me = await client.get_me()
+        if (me.first_name or "", me.last_name or "") != (first, last):
+            report.fail("name", "Telegram shows a different name after the update")
+    return report, greeting_ref
+
+
+async def _profile(client, backup, report, step, profile, me, full, sleep):
+    doc = backup.doc
     report.add("username", "skipped", "stays with the old account - set a new one in Telegram")
     report.add("gifts", "skipped", "belong to the old account and can't be moved")
 
@@ -364,7 +427,8 @@ async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, p
         await step("public fallback photo", lambda: False,
                    lambda: _upload_fallback(client, backup, fallback, sleep))
 
-    # quick replies
+
+async def _quick_replies(client, backup, report, doc, premium, dry_run, sleep) -> dict[str, int]:
     shortcuts = doc.get("quick_replies") or []
     new_ids: dict[str, int] = {}
     if shortcuts:
@@ -389,51 +453,7 @@ async def run(client, backup: Backup, *, dry_run: bool, data_dir: Path, sleep, p
             if not dry_run:
                 new_ids = {q.shortcut: q.shortcut_id for q in
                            (await client(GetQuickRepliesRequest(hash=0))).quick_replies or []}
-
-    # business
-    business = doc.get("business") or {}
-    if any(business.get(k) for k in ("work_hours", "location", "intro", "greeting_message", "away_message",
-                                     "chat_links")):
-        if not premium:
-            report.add("business setup", "skipped", PREMIUM)
-        else:
-            await _business(client, report, business, new_ids, dry_run, sleep)
-
-    # greeting post -> Saved Messages
-    post = doc.get("greeting_post")
-    if post:
-        try:
-            if not dry_run:
-                media = await _input_media(client, backup, post.get("media"))
-                entities = _entities(post.get("entities")) or None
-                if media is not None:
-                    sent = await client.send_file("me", file=media, caption=post.get("text") or "",
-                                                  formatting_entities=entities)
-                else:
-                    sent = await client.send_message("me", post.get("text") or "", formatting_entities=entities)
-                greeting_ref = {"chat_id": int(me.id), "message_id": int(sent.id)}
-            report.add("/set greeting post", "restored", "posted in Saved Messages and set as the greeting")
-        except Exception as error:  # noqa: BLE001
-            report.fail("/set greeting post", error)
-
-    # payment templates + channel
-    pay_raw = backup.file("data/pay.json")
-    if pay_raw and pay_store is not None:
-        try:
-            old = json.loads(pay_raw)
-            values = {k: old[k] for k in PAY_KEYS if k in old and k != "done_ref"}
-            if not dry_run:
-                pay_store.update(values)
-            report.add("payment templates + channel", "restored",
-                       "payment log and greeted list are not copied (they belong to the old account)")
-        except Exception as error:  # noqa: BLE001
-            report.fail("payment templates + channel", error)
-
-    if not dry_run:
-        me = await client.get_me()
-        if (me.first_name or "", me.last_name or "") != (first, last):
-            report.fail("name", "Telegram shows a different name after the update")
-    return report, greeting_ref
+    return new_ids
 
 
 async def _upload_fallback(client, backup, fallback, sleep):

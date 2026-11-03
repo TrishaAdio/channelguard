@@ -426,6 +426,8 @@ It never includes the session file, `API_ID`/`API_HASH` or tokens, or your phone
 
 Quick replies and Business features need Premium on the new account; without it they're reported as skipped. Each step is reported separately, and one failure doesn't stop the rest.
 
+**`.setup ok`: content only.** Use `.setup ok` instead of `.setup` (reply to the ZIP, or send it with no reply and then `.setup confirm`) to restore only the quick replies, the `/set` greeting post, and the `/add` + channel post templates with the payment channel. The name, bio, birthday, colours, emoji status, profile photos, fallback photo and Business settings are left as they are.
+
 ## Purger (`purger.py`) — wipe a chat from a point onward
 
 A tiny standalone userbot. Log in your account, then **reply** to any message
