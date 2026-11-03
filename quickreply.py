@@ -3329,6 +3329,9 @@ HELP_TEXT = (
     "<code>.setup</code> - on a NEW account: <b>reply to a backup ZIP</b> and it transforms this "
     "account to match it right away. With no reply it previews the newest local backup, then "
     "<code>.setup confirm</code>. Username and gifts are not moved\n"
+    "<code>.setup ok</code> - same, but restores ONLY quick replies, the /set greeting post and the "
+    "/add + channel post templates (with the payment channel). Name, photos, bio and Business "
+    "settings are left alone\n"
     "<code>.qrfirst &lt;name&gt;</code> - make a quick reply show FIRST when you type / "
     "(e.g. <code>.qrfirst category</code>). <code>.qrlast</code> sends to the bottom, "
     "<code>.qrorder</code> sets an exact order; no name shows the current order. Fully restart "
@@ -4026,16 +4029,24 @@ async def _setup_source(event):
     return path, False
 
 
-async def _apply_setup(event, path) -> None:
-    """Transform the logged-in account to match the backup ZIP at ``path``."""
+async def _apply_setup(event, path, content_only: bool = False) -> None:
+    """Transform the logged-in account to match the backup ZIP at ``path``.
+
+    ``content_only`` (``.setup ok``) restores only quick replies, the /set
+    greeting post and the /add + channel post templates.
+    """
     backup = restore.Backup(path)
-    await _ack(event, f"Transforming this account from {path.name} ... "
-                      "this takes a minute (photos and media are uploaded).")
+    if content_only:
+        await _ack(event, f"Restoring quick replies, /set post and /add templates from {path.name} ... "
+                          "profile, photos and bio are left as they are.")
+    else:
+        await _ack(event, f"Transforming this account from {path.name} ... "
+                          "this takes a minute (photos and media are uploaded).")
     try:
         async with _payment_lock:
             report, greeting = await restore.run(
                 client, backup, dry_run=False, data_dir=config.DATA_DIR,
-                sleep=asyncio.sleep, pay_store=_pay)
+                sleep=asyncio.sleep, pay_store=_pay, content_only=content_only)
             _save_pay()
     finally:
         backup.close()
@@ -4199,9 +4210,13 @@ async def cmd_setup(event) -> None:
     Reply to a backup ZIP with ``.setup`` -> transforms this account to match
     it immediately. ``.setup`` with no reply previews the newest local backup
     and waits for ``.setup confirm``; ``.setup cancel`` drops a pending preview.
+    ``.setup ok`` works the same way but restores only quick replies, the /set
+    greeting post and the /add + channel post templates (no name, photos, bio
+    or Business settings).
     """
     parts = (event.raw_text or "").lower().split()
     sub = parts[1] if len(parts) > 1 else ""
+    content_only = sub == "ok"
     if sub == "cancel":
         _pending_setup.clear()
         await _ack(event, "Setup cancelled.")
@@ -4211,9 +4226,10 @@ async def cmd_setup(event) -> None:
         if not path or time.monotonic() > _pending_setup.get("until", 0):
             await _ack(event, "Nothing to confirm (or it expired). Send .setup first.")
             return
+        content_only = bool(_pending_setup.get("content_only"))
         _pending_setup.clear()
         try:
-            await _apply_setup(event, path)
+            await _apply_setup(event, path, content_only)
         except Exception as error:  # noqa: BLE001
             await _ack(event, f"Setup failed: {type(error).__name__}: {error}")
         return
@@ -4227,7 +4243,7 @@ async def cmd_setup(event) -> None:
     if from_reply:
         _pending_setup.clear()
         try:
-            await _apply_setup(event, path)
+            await _apply_setup(event, path, content_only)
         except Exception as error:  # noqa: BLE001
             await _ack(event, f"Setup failed: {type(error).__name__}: {error}")
         return
@@ -4240,14 +4256,15 @@ async def cmd_setup(event) -> None:
         return
     try:
         report, _ = await restore.run(client, backup, dry_run=True, data_dir=config.DATA_DIR,
-                                      sleep=asyncio.sleep, pay_store=None)
+                                      sleep=asyncio.sleep, pay_store=None, content_only=content_only)
         info = restore.describe(backup)
         source_id = (backup.doc.get("profile") or {}).get("id")
     finally:
         backup.close()
     same = source_id == _state["self_id"]
-    _pending_setup.update(path=path, until=time.monotonic() + 600)
-    warn = ("\nNOTE: this backup is from THIS account; restoring adds the photos again.\n" if same else "")
+    _pending_setup.update(path=path, until=time.monotonic() + 600, content_only=content_only)
+    warn = ("\nNOTE: this backup is from THIS account; restoring adds the photos again.\n"
+            if same and not content_only else "")
     await _ack(event, f"SETUP PREVIEW (nothing changed yet)\n{info}{warn}\n\n{report.text()}\n\n"
                       "Send .setup confirm within 10 minutes to apply, or .setup cancel.\n"
                       "(Tip: reply to a backup ZIP with .setup to apply it immediately.)"[:4000])
