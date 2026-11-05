@@ -292,6 +292,10 @@ Your Business quick reply `/category` can be sent once in each chat:
 - The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.
 - The shortcut name is `CATEGORY_SHORTCUT` in `.env` (default `category`; blank turns this off). State is kept in `data/category.json`.
 
+### `.mists`: all switches at once
+
+`.mists off` (any chat) turns off the `/category` guard with its `/forgein` auto send (`.fix`), the Videshi separator (`.videshi`) and the delete after `/add` (`.deladd`) together. `.mists on` turns all three back on and re-sorts your DMs into Videshi. `.mists` shows each one's status. You can still switch them one by one afterwards.
+
 ### Auto delete (`quickreply.py`)
 
 On by default, nothing to configure:

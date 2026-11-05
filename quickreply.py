@@ -78,6 +78,10 @@ Auto delete (on by default, any chat):
   .fix off | .fix on             turn off/on the /category once-per-chat
                                  guard and the /forgein auto send
 
+All three at once (any chat):
+  .mists off | .mists on         .fix, .videshi and .deladd together;
+                                 .mists shows their status
+
 Business quick replies require Telegram Premium (the payment logger does not).
 
 Run:  python quickreply.py    (Ctrl+C to stop)
@@ -173,6 +177,7 @@ _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.IGNORECASE)
 _SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 _FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
+_MISTS_RE = re.compile(r"^[./]mists(?:\s+(on|off|status))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -3369,6 +3374,9 @@ HELP_TEXT = (
     "first links or files you send go after 3 minutes and every later link or file after 50 "
     "minutes (the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat. "
     "<code>.deladd off</code> / <code>.deladd on</code> turns off/on only the delete after /add\n"
+    "<b>All at once</b> (any chat)\n"
+    "<code>.mists off</code> / <code>.mists on</code> turns .fix, .videshi and .deladd off or on together; "
+    "<code>.mists</code> shows their status\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3725,6 +3733,9 @@ async def _handle_outgoing(event):
         return
     if _FIX_RE.match(low_cmd):
         await cmd_fix(event, low_cmd)
+        return
+    if _MISTS_RE.match(low_cmd):
+        await cmd_mists(event, low_cmd)
         return
     if low_cmd in (".ping", "/ping"):
         await _ack(event, _runtime_status_text())
@@ -4436,13 +4447,7 @@ async def cmd_fix(event, low_cmd: str) -> None:
     persisted as CATEGORY_FIX in .env."""
     choice = _FIX_RE.match(low_cmd).group(1) or "status"
     if choice in ("on", "off"):
-        enabled = choice == "on"
-        try:
-            config.save_env({"CATEGORY_FIX": "1" if enabled else "0"})
-        except OSError as error:
-            ui.warn(f"Couldn't persist CATEGORY_FIX: {error}")
-        _state["category_fix"] = enabled
-        ui.info(f"[category] fix {choice.upper()}")
+        _set_category_fix(choice == "on")
     if _category is None:
         note = "The /category guard is off (CATEGORY_SHORTCUT is blank), so .fix has nothing to switch."
     elif _state["category_fix"]:
@@ -4452,6 +4457,50 @@ async def cmd_fix(event, low_cmd: str) -> None:
         note = ("/category fix is OFF: /category is never deleted and /forgein is not sent "
                 "automatically. Turn it back on with .fix on")
     await _confirm_in_saved(event, note, "category")
+
+
+def _set_category_fix(enabled: bool) -> None:
+    try:
+        config.save_env({"CATEGORY_FIX": "1" if enabled else "0"})
+    except OSError as error:
+        ui.warn(f"Couldn't persist CATEGORY_FIX: {error}")
+    _state["category_fix"] = enabled
+    ui.info(f"[category] fix {'ON' if enabled else 'OFF'}")
+
+
+def _set_separator(enabled: bool) -> None:
+    try:
+        config.save_env({"SEPARATOR": "1" if enabled else "0"})
+    except OSError as error:
+        ui.warn(f"Couldn't persist SEPARATOR: {error}")
+    _state["separator"] = enabled
+
+
+async def cmd_mists(event, low_cmd: str) -> None:
+    """`.mists on|off|status`: one switch for .fix, .videshi and .deladd together."""
+    choice = _MISTS_RE.match(low_cmd).group(1) or "status"
+    scan_note = ""
+    if choice in ("on", "off"):
+        enabled = choice == "on"
+        _set_category_fix(enabled)
+        _set_separator(enabled)
+        if _autodel is not None:
+            _autodel.set_add_enabled(enabled)
+        if enabled and _sep_folders is not None:
+            started = _start_separator_scan(_state["self_id"])
+            scan_note = ("\nSorting your DMs into Videshi now; the result comes here when done."
+                         if started else "\nA Videshi scan is already running.")
+    def onoff(value) -> str:
+        return "ON" if value else "OFF"
+    deladd = _autodel.add_enabled if _autodel is not None else False
+    head = {"on": "All turned ON.", "off": "All turned OFF."}.get(choice, "Status:")
+    note = (f"{head}\n"
+            f".fix (/category guard + /forgein auto send): {onoff(_state['category_fix'])}\n"
+            f".videshi (foreign DMs -> Videshi folder): {onoff(_state['separator'])}\n"
+            f".deladd (delete after /add): {onoff(deladd)}"
+            + scan_note
+            + "\nTurn them one by one with .fix / .videshi / .deladd on|off.")
+    await _confirm_in_saved(event, note, "mists")
 
 
 async def cmd_categoryguard(event) -> None:
@@ -4524,12 +4573,7 @@ async def cmd_separator(event) -> None:
         await _separator_check(event)
         return
     if choice in ("on", "off"):
-        enabled = choice == "on"
-        try:
-            config.save_env({"SEPARATOR": "1" if enabled else "0"})
-        except OSError as error:
-            ui.warn(f"Couldn't persist SEPARATOR: {error}")
-        _state["separator"] = enabled
+        _set_separator(choice == "on")
     if choice in ("scan", "on") and _state["separator"]:
         started = _start_separator_scan(event.chat_id)
         await _ack(event, _separator_status_text() + (
