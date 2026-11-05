@@ -258,6 +258,7 @@ Send these yourself, in any chat:
 | `.separator scan` | Sorts your 1,000 most recent DMs again and reports the counts in the same chat. **It also runs by itself on every start**, and messages you in Saved Messages only if something moved. |
 | `.separator check` (inside a DM) | Deletes itself and sends that user's detected country, and where it came from, to your Saved Messages. Files the chat if it's foreign. |
 | `.separator` / `.separator status` | Shows whether it's on and how many chats have been filed. |
+| `.videshi off` / `.videshi on` | Same as `.separator off` / `.separator on`: stops (or starts) filing foreign DMs into **Videshi**. `.videshi status`, `.videshi scan` and `.videshi check` work too. |
 | `.gdpa` (inside a customer's DM) | Deletes the `.gdpa` message for both sides and puts their country's per capita income in your message box as a draft, e.g. `🇺🇸 United States - per capita income: $90,027 (2025)`. Nothing is sent. |
 
 - **How the country is found:** from the phone country Telegram shows on the "Not a contact" card. For contacts who share their number, it's read from the number instead.
@@ -286,6 +287,7 @@ Your Business quick reply `/category` can be sent once in each chat:
 
 - **People outside India:** in a chat with someone whose country isn't India, `/category` is always deleted and your `/forgein` quick reply is sent instead, once per chat. The country comes from the separator's lookup (phone country on the "Not a contact" card, or their number). If the country is unknown, `/category` follows the normal rules above. The shortcut name is `FOREIGN_SHORTCUT` in `.env` (default `forgein,foreign`: the first one that exists is used; blank turns the redirect off).
 - `.categoryguard reset` inside a chat allows `/category` there again; `.categoryguard` shows the status.
+- `.fix off` (any chat) turns this whole guard off: `/category` is never deleted and `/forgein` is no longer sent automatically to people outside India. `.fix on` turns it back on, `.fix` shows the status. In a customer's DM the command deletes itself and the confirmation goes to Saved Messages. The setting is saved as `CATEGORY_FIX` in `.env` (default on).
 - A quick reply with several messages counts as one use.
 - The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.
 - The shortcut name is `CATEGORY_SHORTCUT` in `.env` (default `category`; blank turns this off). State is kept in `data/category.json`.
@@ -304,7 +306,8 @@ On by default, nothing to configure:
 - **After `/add` the content decides**, not the quick reply it came from: anything carrying a link (`https://`, `t.me/`, `tg://`, or a linked word) or a file counts. Plain text you type is left alone, and so is the `/add` message itself, which holds the buyer's receipt. The 3-minute rule covers the whole first send, album and all; everything sent later in that chat gets 50 minutes. This stays in force for that chat, across restarts.
 - **These go on time** whether the customer read them or not.
 - Once the kept `/category` in a chat has been deleted, `/category` is allowed there again.
-- `AUTODEL ON` / `AUTODEL OFF` (any chat, any case) is the only control. In a customer's DM the command deletes itself and the confirmation goes to Saved Messages. Turning it off stops new messages being queued; ones already queued still go on time.
+- `.deladd off` (any chat) turns off only the delete after `/add`: links and files after `/add` stay, while `/category` and `/foreign` keep their timer. Turning it off also forgets which chats had `/add`, so after `.deladd on` only chats with a new `/add` are watched. Already queued `/add` deletions still go on time. `.deladd` shows the status; the setting is kept in `data/autodel.json`.
+- `AUTODEL ON` / `AUTODEL OFF` (any chat, any case) turns all of it on or off. In a customer's DM the command deletes itself and the confirmation goes to Saved Messages. Turning it off stops new messages being queued; ones already queued still go on time.
 - The queue is kept in `data/autodel.json`, so a restart loses nothing; anything that fell due while the bot was off is deleted when it starts again.
 - Quick replies are recognised by their content, like `/category` above. Texts under 12 characters never match on their own.
 
