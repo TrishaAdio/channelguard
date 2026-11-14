@@ -82,6 +82,10 @@ All three at once (any chat):
   .mists off | .mists on         .fix, .videshi and .deladd together;
                                  .mists shows their status
 
+Videshi broadcast (any chat):
+  .lelebc                        count the unread DMs in Videshi, then
+  .lelebc confirm                send each of them /forgein
+
 Business quick replies require Telegram Premium (the payment logger does not).
 
 Run:  python quickreply.py    (Ctrl+C to stop)
@@ -118,6 +122,7 @@ from telethon.tl.functions.messages import (
     EditExportedChatInviteRequest,
     EditMessageRequest,
     ExportChatInviteRequest,
+    GetPeerDialogsRequest,
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
     HideChatJoinRequestRequest,
@@ -178,6 +183,7 @@ _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.
 _SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 _FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
 _MISTS_RE = re.compile(r"^[./]mists(?:\s+(on|off|status))?$", re.IGNORECASE)
+_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(confirm|cancel|status))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -3377,6 +3383,9 @@ HELP_TEXT = (
     "<b>All at once</b> (any chat)\n"
     "<code>.mists off</code> / <code>.mists on</code> turns .fix, .videshi and .deladd off or on together; "
     "<code>.mists</code> shows their status\n"
+    "<b>Videshi broadcast</b> (any chat)\n"
+    "<code>.lelebc</code> - counts the unread DMs in the Videshi folder; <code>.lelebc confirm</code> "
+    "sends each of them your /forgein quick reply (<code>.lelebc status</code> / <code>.lelebc cancel</code>)\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3736,6 +3745,9 @@ async def _handle_outgoing(event):
         return
     if _MISTS_RE.match(low_cmd):
         await cmd_mists(event, low_cmd)
+        return
+    if _LELEBC_RE.match(low_cmd):
+        await cmd_lelebc(event, low_cmd)
         return
     if low_cmd in (".ping", "/ping"):
         await _ack(event, _runtime_status_text())
@@ -4340,7 +4352,7 @@ async def _category_is_foreign(chat_id) -> bool:
     return bool(country) and country != separator.HOME_COUNTRY
 
 
-async def _send_foreign_reply(chat_id) -> None:
+async def _send_foreign_reply(chat_id, peer=None) -> None:
     """Send the first existing FOREIGN_SHORTCUT quick reply to this chat."""
     names = [n.strip().lstrip("/").lower() for n in config.FOREIGN_SHORTCUT.split(",") if n.strip()]
     res = await client(GetQuickRepliesRequest(hash=0))
@@ -4353,7 +4365,8 @@ async def _send_foreign_reply(chat_id) -> None:
     ids = [m.id for m in shortcut_msgs]
     if not ids:
         raise ValueError(f"quick reply /{target.shortcut} is empty")
-    peer = await client.get_input_entity(chat_id)
+    if peer is None:
+        peer = await client.get_input_entity(chat_id)
     marker = _expect_automatic_outgoing(chat_id, [getattr(m, "message", "") or "" for m in shortcut_msgs])
     try:
         result = await client(SendQuickReplyMessagesRequest(
@@ -4501,6 +4514,122 @@ async def cmd_mists(event, low_cmd: str) -> None:
             + scan_note
             + "\nTurn them one by one with .fix / .videshi / .deladd on|off.")
     await _confirm_in_saved(event, note, "mists")
+
+
+_pending_lelebc: dict = {}
+_lelebc_run: dict = {}
+LELEBC_GAP = (3.0, 6.0)
+LELEBC_BATCH = 50
+
+
+async def _videshi_unread() -> tuple[dict, int]:
+    """Videshi chats with unread messages from the customer (or marked unread).
+    Returns ``({user id: peer}, how many chats Videshi holds)``."""
+    members = await _sep_folders.members()
+    ids = list(members)
+    unread = {}
+    for start in range(0, len(ids), LELEBC_BATCH):
+        batch = ids[start:start + LELEBC_BATCH]
+        try:
+            res = await client(GetPeerDialogsRequest(
+                peers=[tl_types.InputDialogPeer(peer=members[uid]) for uid in batch]))
+        except FloodWaitError as error:
+            await asyncio.sleep(int(error.seconds) + 1)
+            res = await client(GetPeerDialogsRequest(
+                peers=[tl_types.InputDialogPeer(peer=members[uid]) for uid in batch]))
+        for dialog in getattr(res, "dialogs", None) or []:
+            uid = getattr(getattr(dialog, "peer", None), "user_id", None)
+            if uid in members and (getattr(dialog, "unread_count", 0) or getattr(dialog, "unread_mark", False)):
+                unread[uid] = members[uid]
+        await asyncio.sleep(1)
+    return unread, len(members)
+
+
+def _remember_foreign_sent(chat_id, sent) -> None:
+    """Tell the /category guard /forgein went here, so it isn't sent again."""
+    if _category is None:
+        return
+    _category.ignore.update(sent)
+    _category.chats["f:" + str(chat_id)] = {"ts": time.time(), "ids": list(sent)}
+    _category.save()
+
+
+async def _lelebc_send(targets: dict) -> None:
+    done, failed = 0, []
+    _lelebc_run.update(total=len(targets), done=0, failed=0)
+    for uid, peer in targets.items():
+        for attempt in range(2):
+            try:
+                sent = await _send_foreign_reply(uid, peer)
+                _remember_foreign_sent(uid, sent or [])
+                done += 1
+                break
+            except FloodWaitError as error:
+                if attempt or error.seconds > 900:
+                    failed.append(f"{uid}: Telegram asked to wait {error.seconds}s")
+                    break
+                await asyncio.sleep(int(error.seconds) + 1)
+            except Exception as error:  # noqa: BLE001
+                failed.append(f"{uid}: {type(error).__name__}: {error}")
+                break
+        _lelebc_run.update(done=done, failed=len(failed))
+        await asyncio.sleep(random.uniform(*LELEBC_GAP))
+    text = f"LELEBC DONE: /forgein sent to {done} of {len(targets)} unread Videshi chat(s)."
+    if failed:
+        text += f"\n{len(failed)} failed:\n" + "\n".join(failed[:30])
+    ui.info(f"[lelebc] sent {done}/{len(targets)}")
+    try:
+        await client.send_message("me", text[:4000])
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[lelebc] couldn't report in Saved Messages ({error})")
+
+
+async def cmd_lelebc(event, low_cmd: str) -> None:
+    """`.lelebc`: preview how many unread Videshi DMs get /forgein;
+    `.lelebc confirm` sends it, `.lelebc cancel` drops the preview,
+    `.lelebc status` shows a running send."""
+    choice = _LELEBC_RE.match(low_cmd).group(1) or ""
+    task = _lelebc_run.get("task")
+    running = task is not None and not task.done()
+    if choice == "status":
+        note = (f"Sending /forgein: {_lelebc_run.get('done', 0)}/{_lelebc_run.get('total', 0)} done, "
+                f"{_lelebc_run.get('failed', 0)} failed." if running else "No .lelebc send is running.")
+        await _confirm_in_saved(event, note, "lelebc")
+        return
+    if choice == "cancel":
+        _pending_lelebc.clear()
+        await _confirm_in_saved(event, ".lelebc cancelled - nothing was sent.", "lelebc")
+        return
+    if running:
+        await _confirm_in_saved(event, "A .lelebc send is already running; .lelebc status shows it.", "lelebc")
+        return
+    if choice == "confirm":
+        targets = _pending_lelebc.get("targets")
+        if not targets or time.monotonic() > _pending_lelebc.get("until", 0):
+            await _confirm_in_saved(event, "Nothing to confirm (or it expired). Send .lelebc first.", "lelebc")
+            return
+        _pending_lelebc.clear()
+        _lelebc_run["task"] = asyncio.create_task(_lelebc_send(targets))
+        await _confirm_in_saved(event, f"Sending /forgein to {len(targets)} unread Videshi chat(s), one every "
+                                       f"{LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. The result comes here when "
+                                       "done; .lelebc status shows progress.", "lelebc")
+        return
+    if _sep_folders is None:
+        await _confirm_in_saved(event, "The separator isn't ready yet, so the Videshi folder can't be read.", "lelebc")
+        return
+    try:
+        targets, total = await _videshi_unread()
+    except Exception as error:  # noqa: BLE001
+        await _confirm_in_saved(event, f"Couldn't read the Videshi folder: {type(error).__name__}: {error}", "lelebc")
+        return
+    if not targets:
+        await _confirm_in_saved(event, f"No unread DMs in Videshi ({total} chat(s) in the folder). "
+                                       "Nothing to send.", "lelebc")
+        return
+    _pending_lelebc.update(targets=targets, until=time.monotonic() + 600)
+    await _confirm_in_saved(event, f"{len(targets)} of {total} Videshi chat(s) are unread. Each one gets your "
+                                   "/forgein quick reply.\nSend .lelebc confirm within 10 minutes to send, "
+                                   "or .lelebc cancel.", "lelebc")
 
 
 async def cmd_categoryguard(event) -> None:

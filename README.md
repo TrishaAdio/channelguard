@@ -292,6 +292,10 @@ Your Business quick reply `/category` can be sent once in each chat:
 - The bot recognises `/category` by comparing what you sent with the quick reply's content, so a message you type by hand with exactly the same text counts too.
 - The shortcut name is `CATEGORY_SHORTCUT` in `.env` (default `category`; blank turns this off). State is kept in `data/category.json`.
 
+### `.lelebc`: send `/forgein` to unread Videshi DMs
+
+`.lelebc` (any chat) reads the **Videshi** folder and counts the chats with unread messages (or marked unread). Nothing is sent yet. `.lelebc confirm` within 10 minutes sends each of them your `/forgein` quick reply (`FOREIGN_SHORTCUT`), one every 3-6 seconds, and the result arrives in Saved Messages. `.lelebc status` shows progress and `.lelebc cancel` drops the preview. Read Videshi chats are skipped. Each chat it reaches is marked in the `/category` guard so `/forgein` isn't sent there again automatically, and the sent messages get the usual `/foreign` auto delete.
+
 ### `.mists`: all switches at once
 
 `.mists off` (any chat) turns off the `/category` guard with its `/forgein` auto send (`.fix`), the Videshi separator (`.videshi`) and the delete after `/add` (`.deladd`) together. `.mists on` turns all three back on and re-sorts your DMs into Videshi. `.mists` shows each one's status. You can still switch them one by one afterwards.
