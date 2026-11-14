@@ -328,9 +328,13 @@ class FolderManager:
         return lines or ["No Unread folder found (a folder named 'Unread' or set to "
                          "'exclude read chats')."]
 
-    async def members(self) -> dict:
-        """{user id: InputPeer} of every chat in any Videshi folder right now."""
-        async with self.lock:
+    async def members(self, *, wait_for_edits: bool = True) -> dict:
+        """{user id: InputPeer} of every chat in any Videshi folder right now.
+        ``wait_for_edits=False`` reads without waiting for a running folder edit."""
+        if wait_for_edits:
+            async with self.lock:
+                folders = await self._folders()
+        else:
             folders = await self._folders()
         found = {}
         for _n, f in self._videshi(folders):
