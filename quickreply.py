@@ -83,8 +83,8 @@ All three at once (any chat):
                                  .mists shows their status
 
 Videshi broadcast (any chat):
-  .lelebc                        count the unread DMs in Videshi, then
-  .lelebc confirm                send each of them /forgein
+  .lelebc                        send /forgein to every unread DM in
+                                 Videshi (.lelebc status = progress)
 
 Business quick replies require Telegram Premium (the payment logger does not).
 
@@ -183,7 +183,7 @@ _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.
 _SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 _FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
 _MISTS_RE = re.compile(r"^[./]mists(?:\s+(on|off|status))?$", re.IGNORECASE)
-_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(confirm|cancel|status))?$", re.IGNORECASE)
+_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(status))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -3384,8 +3384,8 @@ HELP_TEXT = (
     "<code>.mists off</code> / <code>.mists on</code> turns .fix, .videshi and .deladd off or on together; "
     "<code>.mists</code> shows their status\n"
     "<b>Videshi broadcast</b> (any chat)\n"
-    "<code>.lelebc</code> - counts the unread DMs in the Videshi folder; <code>.lelebc confirm</code> "
-    "sends each of them your /forgein quick reply (<code>.lelebc status</code> / <code>.lelebc cancel</code>)\n"
+    "<code>.lelebc</code> - sends your /forgein quick reply to every unread DM in the Videshi folder "
+    "right away (<code>.lelebc status</code> shows progress)\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -4516,7 +4516,6 @@ async def cmd_mists(event, low_cmd: str) -> None:
     await _confirm_in_saved(event, note, "mists")
 
 
-_pending_lelebc: dict = {}
 _lelebc_run: dict = {}
 LELEBC_GAP = (3.0, 6.0)
 LELEBC_BATCH = 50
@@ -4585,8 +4584,7 @@ async def _lelebc_send(targets: dict) -> None:
 
 
 async def cmd_lelebc(event, low_cmd: str) -> None:
-    """`.lelebc`: preview how many unread Videshi DMs get /forgein;
-    `.lelebc confirm` sends it, `.lelebc cancel` drops the preview,
+    """`.lelebc`: send /forgein to every unread DM in Videshi right away;
     `.lelebc status` shows a running send."""
     choice = _LELEBC_RE.match(low_cmd).group(1) or ""
     task = _lelebc_run.get("task")
@@ -4596,23 +4594,8 @@ async def cmd_lelebc(event, low_cmd: str) -> None:
                 f"{_lelebc_run.get('failed', 0)} failed." if running else "No .lelebc send is running.")
         await _confirm_in_saved(event, note, "lelebc")
         return
-    if choice == "cancel":
-        _pending_lelebc.clear()
-        await _confirm_in_saved(event, ".lelebc cancelled - nothing was sent.", "lelebc")
-        return
     if running:
         await _confirm_in_saved(event, "A .lelebc send is already running; .lelebc status shows it.", "lelebc")
-        return
-    if choice == "confirm":
-        targets = _pending_lelebc.get("targets")
-        if not targets or time.monotonic() > _pending_lelebc.get("until", 0):
-            await _confirm_in_saved(event, "Nothing to confirm (or it expired). Send .lelebc first.", "lelebc")
-            return
-        _pending_lelebc.clear()
-        _lelebc_run["task"] = asyncio.create_task(_lelebc_send(targets))
-        await _confirm_in_saved(event, f"Sending /forgein to {len(targets)} unread Videshi chat(s), one every "
-                                       f"{LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. The result comes here when "
-                                       "done; .lelebc status shows progress.", "lelebc")
         return
     if _sep_folders is None:
         await _confirm_in_saved(event, "The separator isn't ready yet, so the Videshi folder can't be read.", "lelebc")
@@ -4626,10 +4609,10 @@ async def cmd_lelebc(event, low_cmd: str) -> None:
         await _confirm_in_saved(event, f"No unread DMs in Videshi ({total} chat(s) in the folder). "
                                        "Nothing to send.", "lelebc")
         return
-    _pending_lelebc.update(targets=targets, until=time.monotonic() + 600)
-    await _confirm_in_saved(event, f"{len(targets)} of {total} Videshi chat(s) are unread. Each one gets your "
-                                   "/forgein quick reply.\nSend .lelebc confirm within 10 minutes to send, "
-                                   "or .lelebc cancel.", "lelebc")
+    _lelebc_run["task"] = asyncio.create_task(_lelebc_send(targets))
+    await _confirm_in_saved(event, f"Sending /forgein to {len(targets)} of {total} Videshi chat(s) (the unread "
+                                   f"ones), one every {LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. The result comes "
+                                   "here when done; .lelebc status shows progress.", "lelebc")
 
 
 async def cmd_categoryguard(event) -> None:
