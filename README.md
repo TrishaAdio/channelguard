@@ -294,7 +294,7 @@ Your Business quick reply `/category` can be sent once in each chat:
 
 ### `.lelebc`: send `/forgein` to unread Videshi DMs
 
-`.lelebc` (any chat) reads the **Videshi** folder and counts the chats with unread messages (or marked unread). Nothing is sent yet. `.lelebc confirm` within 10 minutes sends each of them your `/forgein` quick reply (`FOREIGN_SHORTCUT`), one every 3-6 seconds, and the result arrives in Saved Messages. `.lelebc status` shows progress and `.lelebc cancel` drops the preview. Read Videshi chats are skipped. Each chat it reaches is marked in the `/category` guard so `/forgein` isn't sent there again automatically, and the sent messages get the usual `/foreign` auto delete.
+`.lelebc` (any chat) reads the **Videshi** folder and straight away sends your `/forgein` quick reply (`FOREIGN_SHORTCUT`) to every chat with unread messages (or marked unread), one every 3-6 seconds. The result arrives in Saved Messages; `.lelebc status` shows progress. Read Videshi chats are skipped. Each chat it reaches is marked in the `/category` guard so `/forgein` isn't sent there again automatically, and the sent messages get the usual `/foreign` auto delete.
 
 ### `.mists`: all switches at once
 
