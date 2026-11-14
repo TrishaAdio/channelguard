@@ -63,6 +63,9 @@ CATEGORY_SHORTCUT = os.getenv("CATEGORY_SHORTCUT", "category").strip().lstrip("/
 # (the first one that exists is used). Blank turns the redirect off.
 FOREIGN_SHORTCUT = os.getenv("FOREIGN_SHORTCUT", "forgein,foreign").strip()
 SEPARATOR = os.getenv("SEPARATOR", "0").strip().lower() not in ("0", "false", "no", "")
+# The /category guard and its /forgein auto send. Toggle live with .fix on|off
+# (saved here). Default on.
+CATEGORY_FIX = os.getenv("CATEGORY_FIX", "1").strip().lower() not in ("0", "false", "no", "")
 
 # --- Payment logger (quickreply.py extension) -----------------------------
 # Persistent fallback for the payment upload channel. ``.setchannel`` writes

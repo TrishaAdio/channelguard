@@ -55,6 +55,7 @@ Backup + screenshot ZIPs (Saved Messages):
 
 DM country separator (any chat):
   .separator on|off|status       file DMs from outside India into the
+  (.videshi on|off|status is the same command)
                                  "Videshi" folder and out of "Unread";
                                  Indian DMs stay put
   .separator scan                re-sort DMs now (also runs on every start);
@@ -71,6 +72,19 @@ Auto delete (on by default, any chat):
                                  has seen them; in a chat where you sent /add,
                                  the first links or files go after 3 min and
                                  later ones after 50 min
+  .deladd off | .deladd on       turn off/on only the timer after /add
+
+/category guard (any chat):
+  .fix off | .fix on             turn off/on the /category once-per-chat
+                                 guard and the /forgein auto send
+
+All three at once (any chat):
+  .mists off | .mists on         .fix, .videshi and .deladd together;
+                                 .mists shows their status
+
+Videshi broadcast (any chat):
+  .lelebc                        count the unread DMs in Videshi, then
+  .lelebc confirm                send each of them /forgein
 
 Business quick replies require Telegram Premium (the payment logger does not).
 
@@ -108,6 +122,7 @@ from telethon.tl.functions.messages import (
     EditExportedChatInviteRequest,
     EditMessageRequest,
     ExportChatInviteRequest,
+    GetPeerDialogsRequest,
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
     HideChatJoinRequestRequest,
@@ -165,7 +180,10 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.IGNORECASE)
-_SEPARATOR_RE = re.compile(r"^[./]separator(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
+_SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
+_FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
+_MISTS_RE = re.compile(r"^[./]mists(?:\s+(on|off|status))?$", re.IGNORECASE)
+_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(confirm|cancel|status))?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -222,6 +240,7 @@ _state = {
     "activity_generation": 0,
     "ss_auto": config.SS_AUTO,
     "separator": config.SEPARATOR,
+    "category_fix": config.CATEGORY_FIX,
 }
 _greeted: set[int] = set()
 _automatic_outgoing: dict[int, dict] = {}
@@ -3344,19 +3363,29 @@ HELP_TEXT = (
     "<b>Videshi</b> folder and leave your Unread folder; when it is full (200) the "
     "quietest chats leave for new ones. Indian DMs stay put. Runs on every start; "
     "<code>.separator scan</code> re-sorts now; "
-    "<code>.separator check</code> in a DM shows its country in Saved Messages\n"
+    "<code>.separator check</code> in a DM shows its country in Saved Messages. "
+    "<code>.videshi off</code> / <code>.videshi on</code> does the same as .separator off/on\n"
     "<code>.gdpa</code> - in a customer's DM: deletes itself and puts their country's "
     "per capita income ($) in your draft, without sending it\n"
     "<b>/category</b> (Business quick reply)\n"
     "Once per chat; the kept one is never deleted. Every repeat is deleted; send it twice "
     "within 1 minute (both deleted) and the next one is allowed. Outside India, /category is deleted and "
     "<code>/forgein</code> is sent instead (once per chat). <code>.categoryguard reset</code> in a chat "
-    "allows it again there; <code>.categoryguard</code> shows the status\n"
+    "allows it again there; <code>.categoryguard</code> shows the status. "
+    "<code>.fix off</code> / <code>.fix on</code> in any chat turns this guard and the /forgein "
+    "auto send off or on\n"
     "<b>Auto delete</b> (on by default)\n"
     "Every /category and /foreign message is deleted for both sides 60-70 minutes after the "
     "customer has seen it (unseen ones stay). In a chat where you sent <code>/add</code>, the "
     "first links or files you send go after 3 minutes and every later link or file after 50 "
-    "minutes (the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat\n"
+    "minutes (the /add receipt stays). <code>AUTODEL ON</code> / <code>AUTODEL OFF</code> in any chat. "
+    "<code>.deladd off</code> / <code>.deladd on</code> turns off/on only the delete after /add\n"
+    "<b>All at once</b> (any chat)\n"
+    "<code>.mists off</code> / <code>.mists on</code> turns .fix, .videshi and .deladd off or on together; "
+    "<code>.mists</code> shows their status\n"
+    "<b>Videshi broadcast</b> (any chat)\n"
+    "<code>.lelebc</code> - counts the unread DMs in the Videshi folder; <code>.lelebc confirm</code> "
+    "sends each of them your /forgein quick reply (<code>.lelebc status</code> / <code>.lelebc cancel</code>)\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -3691,7 +3720,7 @@ async def _handle_outgoing(event):
     # the exact message body we registered, not every send in that chat.
     if chat_id != _state["self_id"] and await _consume_automatic_outgoing(event):
         return
-    if _category is not None and chat_id != _state["self_id"]:
+    if _category is not None and _state["category_fix"] and chat_id != _state["self_id"]:
         _watch_category(event)
     if _autodel is not None and chat_id != _state["self_id"]:
         _autodel.watch(event)
@@ -3707,6 +3736,18 @@ async def _handle_outgoing(event):
     low_cmd = raw_text.strip().lower()
     if autodel.COMMAND_RE.match(low_cmd):
         await cmd_autodel(event, low_cmd)
+        return
+    if autodel.DELADD_RE.match(low_cmd):
+        await cmd_deladd(event, low_cmd)
+        return
+    if _FIX_RE.match(low_cmd):
+        await cmd_fix(event, low_cmd)
+        return
+    if _MISTS_RE.match(low_cmd):
+        await cmd_mists(event, low_cmd)
+        return
+    if _LELEBC_RE.match(low_cmd):
+        await cmd_lelebc(event, low_cmd)
         return
     if low_cmd in (".ping", "/ping"):
         await _ack(event, _runtime_status_text())
@@ -4311,7 +4352,7 @@ async def _category_is_foreign(chat_id) -> bool:
     return bool(country) and country != separator.HOME_COUNTRY
 
 
-async def _send_foreign_reply(chat_id) -> None:
+async def _send_foreign_reply(chat_id, peer=None) -> None:
     """Send the first existing FOREIGN_SHORTCUT quick reply to this chat."""
     names = [n.strip().lstrip("/").lower() for n in config.FOREIGN_SHORTCUT.split(",") if n.strip()]
     res = await client(GetQuickRepliesRequest(hash=0))
@@ -4324,7 +4365,8 @@ async def _send_foreign_reply(chat_id) -> None:
     ids = [m.id for m in shortcut_msgs]
     if not ids:
         raise ValueError(f"quick reply /{target.shortcut} is empty")
-    peer = await client.get_input_entity(chat_id)
+    if peer is None:
+        peer = await client.get_input_entity(chat_id)
     marker = _expect_automatic_outgoing(chat_id, [getattr(m, "message", "") or "" for m in shortcut_msgs])
     try:
         result = await client(SendQuickReplyMessagesRequest(
@@ -4374,10 +4416,14 @@ async def cmd_autodel(event, low_cmd: str) -> None:
             f"Auto delete OFF: nothing new is queued. {_autodel.count} already "
             "queued message(s) still go on time.")
     ui.info(f"[autodel] {'ON' if turn_on else 'OFF'}")
+    await _confirm_in_saved(event, note, "autodel")
+
+
+async def _confirm_in_saved(event, note: str, tag: str) -> None:
+    """Answer in Saved Messages; in a customer's DM the command deletes itself."""
     if event.chat_id == _state["self_id"]:
         await _ack(event, note)
         return
-    # In a customer's DM: remove the command, confirm in Saved Messages.
     try:
         await event.delete()
     except Exception:  # noqa: BLE001
@@ -4385,7 +4431,205 @@ async def cmd_autodel(event, low_cmd: str) -> None:
     try:
         await client.send_message("me", note)
     except Exception as error:  # noqa: BLE001
-        ui.warn(f"[autodel] couldn't confirm in Saved Messages ({error})")
+        ui.warn(f"[{tag}] couldn't confirm in Saved Messages ({error})")
+
+
+async def cmd_deladd(event, low_cmd: str) -> None:
+    """`.deladd on|off|status`: the auto delete after /add only."""
+    if _autodel is None:
+        await _ack(event, "Auto delete is not running.")
+        return
+    choice = autodel.DELADD_RE.match(low_cmd).group(1) or "status"
+    if choice in ("on", "off"):
+        _autodel.set_add_enabled(choice == "on")
+        ui.info(f"[autodel] after /add {choice.upper()}")
+    if _autodel.add_enabled:
+        note = ("Auto delete after /add is ON: in a chat where you send /add, the first links or "
+                "files go in 3 min and later ones in 50 min.")
+    else:
+        note = (f"Auto delete after /add is OFF: links and files after /add are not deleted. "
+                f"{_autodel.add_count} already queued message(s) still go on time. "
+                "/category and /foreign auto delete is not affected.")
+    if not _autodel.enabled:
+        note += "\n(AUTODEL is OFF overall, so nothing new is deleted right now.)"
+    await _confirm_in_saved(event, note, "autodel")
+
+
+async def cmd_fix(event, low_cmd: str) -> None:
+    """`.fix on|off|status`: the /category guard and its /forgein auto send,
+    persisted as CATEGORY_FIX in .env."""
+    choice = _FIX_RE.match(low_cmd).group(1) or "status"
+    if choice in ("on", "off"):
+        _set_category_fix(choice == "on")
+    if _category is None:
+        note = "The /category guard is off (CATEGORY_SHORTCUT is blank), so .fix has nothing to switch."
+    elif _state["category_fix"]:
+        note = ("/category fix is ON: /category is kept once per chat (repeats deleted), and outside "
+                "India it is deleted and /forgein is sent instead.")
+    else:
+        note = ("/category fix is OFF: /category is never deleted and /forgein is not sent "
+                "automatically. Turn it back on with .fix on")
+    await _confirm_in_saved(event, note, "category")
+
+
+def _set_category_fix(enabled: bool) -> None:
+    try:
+        config.save_env({"CATEGORY_FIX": "1" if enabled else "0"})
+    except OSError as error:
+        ui.warn(f"Couldn't persist CATEGORY_FIX: {error}")
+    _state["category_fix"] = enabled
+    ui.info(f"[category] fix {'ON' if enabled else 'OFF'}")
+
+
+def _set_separator(enabled: bool) -> None:
+    try:
+        config.save_env({"SEPARATOR": "1" if enabled else "0"})
+    except OSError as error:
+        ui.warn(f"Couldn't persist SEPARATOR: {error}")
+    _state["separator"] = enabled
+
+
+async def cmd_mists(event, low_cmd: str) -> None:
+    """`.mists on|off|status`: one switch for .fix, .videshi and .deladd together."""
+    choice = _MISTS_RE.match(low_cmd).group(1) or "status"
+    scan_note = ""
+    if choice in ("on", "off"):
+        enabled = choice == "on"
+        _set_category_fix(enabled)
+        _set_separator(enabled)
+        if _autodel is not None:
+            _autodel.set_add_enabled(enabled)
+        if enabled and _sep_folders is not None:
+            started = _start_separator_scan(_state["self_id"])
+            scan_note = ("\nSorting your DMs into Videshi now; the result comes here when done."
+                         if started else "\nA Videshi scan is already running.")
+    def onoff(value) -> str:
+        return "ON" if value else "OFF"
+    deladd = _autodel.add_enabled if _autodel is not None else False
+    head = {"on": "All turned ON.", "off": "All turned OFF."}.get(choice, "Status:")
+    note = (f"{head}\n"
+            f".fix (/category guard + /forgein auto send): {onoff(_state['category_fix'])}\n"
+            f".videshi (foreign DMs -> Videshi folder): {onoff(_state['separator'])}\n"
+            f".deladd (delete after /add): {onoff(deladd)}"
+            + scan_note
+            + "\nTurn them one by one with .fix / .videshi / .deladd on|off.")
+    await _confirm_in_saved(event, note, "mists")
+
+
+_pending_lelebc: dict = {}
+_lelebc_run: dict = {}
+LELEBC_GAP = (3.0, 6.0)
+LELEBC_BATCH = 50
+
+
+async def _videshi_unread() -> tuple[dict, int]:
+    """Videshi chats with unread messages from the customer (or marked unread).
+    Returns ``({user id: peer}, how many chats Videshi holds)``."""
+    members = await _sep_folders.members()
+    ids = list(members)
+    unread = {}
+    for start in range(0, len(ids), LELEBC_BATCH):
+        batch = ids[start:start + LELEBC_BATCH]
+        try:
+            res = await client(GetPeerDialogsRequest(
+                peers=[tl_types.InputDialogPeer(peer=members[uid]) for uid in batch]))
+        except FloodWaitError as error:
+            await asyncio.sleep(int(error.seconds) + 1)
+            res = await client(GetPeerDialogsRequest(
+                peers=[tl_types.InputDialogPeer(peer=members[uid]) for uid in batch]))
+        for dialog in getattr(res, "dialogs", None) or []:
+            uid = getattr(getattr(dialog, "peer", None), "user_id", None)
+            if uid in members and (getattr(dialog, "unread_count", 0) or getattr(dialog, "unread_mark", False)):
+                unread[uid] = members[uid]
+        await asyncio.sleep(1)
+    return unread, len(members)
+
+
+def _remember_foreign_sent(chat_id, sent) -> None:
+    """Tell the /category guard /forgein went here, so it isn't sent again."""
+    if _category is None:
+        return
+    _category.ignore.update(sent)
+    _category.chats["f:" + str(chat_id)] = {"ts": time.time(), "ids": list(sent)}
+    _category.save()
+
+
+async def _lelebc_send(targets: dict) -> None:
+    done, failed = 0, []
+    _lelebc_run.update(total=len(targets), done=0, failed=0)
+    for uid, peer in targets.items():
+        for attempt in range(2):
+            try:
+                sent = await _send_foreign_reply(uid, peer)
+                _remember_foreign_sent(uid, sent or [])
+                done += 1
+                break
+            except FloodWaitError as error:
+                if attempt or error.seconds > 900:
+                    failed.append(f"{uid}: Telegram asked to wait {error.seconds}s")
+                    break
+                await asyncio.sleep(int(error.seconds) + 1)
+            except Exception as error:  # noqa: BLE001
+                failed.append(f"{uid}: {type(error).__name__}: {error}")
+                break
+        _lelebc_run.update(done=done, failed=len(failed))
+        await asyncio.sleep(random.uniform(*LELEBC_GAP))
+    text = f"LELEBC DONE: /forgein sent to {done} of {len(targets)} unread Videshi chat(s)."
+    if failed:
+        text += f"\n{len(failed)} failed:\n" + "\n".join(failed[:30])
+    ui.info(f"[lelebc] sent {done}/{len(targets)}")
+    try:
+        await client.send_message("me", text[:4000])
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[lelebc] couldn't report in Saved Messages ({error})")
+
+
+async def cmd_lelebc(event, low_cmd: str) -> None:
+    """`.lelebc`: preview how many unread Videshi DMs get /forgein;
+    `.lelebc confirm` sends it, `.lelebc cancel` drops the preview,
+    `.lelebc status` shows a running send."""
+    choice = _LELEBC_RE.match(low_cmd).group(1) or ""
+    task = _lelebc_run.get("task")
+    running = task is not None and not task.done()
+    if choice == "status":
+        note = (f"Sending /forgein: {_lelebc_run.get('done', 0)}/{_lelebc_run.get('total', 0)} done, "
+                f"{_lelebc_run.get('failed', 0)} failed." if running else "No .lelebc send is running.")
+        await _confirm_in_saved(event, note, "lelebc")
+        return
+    if choice == "cancel":
+        _pending_lelebc.clear()
+        await _confirm_in_saved(event, ".lelebc cancelled - nothing was sent.", "lelebc")
+        return
+    if running:
+        await _confirm_in_saved(event, "A .lelebc send is already running; .lelebc status shows it.", "lelebc")
+        return
+    if choice == "confirm":
+        targets = _pending_lelebc.get("targets")
+        if not targets or time.monotonic() > _pending_lelebc.get("until", 0):
+            await _confirm_in_saved(event, "Nothing to confirm (or it expired). Send .lelebc first.", "lelebc")
+            return
+        _pending_lelebc.clear()
+        _lelebc_run["task"] = asyncio.create_task(_lelebc_send(targets))
+        await _confirm_in_saved(event, f"Sending /forgein to {len(targets)} unread Videshi chat(s), one every "
+                                       f"{LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. The result comes here when "
+                                       "done; .lelebc status shows progress.", "lelebc")
+        return
+    if _sep_folders is None:
+        await _confirm_in_saved(event, "The separator isn't ready yet, so the Videshi folder can't be read.", "lelebc")
+        return
+    try:
+        targets, total = await _videshi_unread()
+    except Exception as error:  # noqa: BLE001
+        await _confirm_in_saved(event, f"Couldn't read the Videshi folder: {type(error).__name__}: {error}", "lelebc")
+        return
+    if not targets:
+        await _confirm_in_saved(event, f"No unread DMs in Videshi ({total} chat(s) in the folder). "
+                                       "Nothing to send.", "lelebc")
+        return
+    _pending_lelebc.update(targets=targets, until=time.monotonic() + 600)
+    await _confirm_in_saved(event, f"{len(targets)} of {total} Videshi chat(s) are unread. Each one gets your "
+                                   "/forgein quick reply.\nSend .lelebc confirm within 10 minutes to send, "
+                                   "or .lelebc cancel.", "lelebc")
 
 
 async def cmd_categoryguard(event) -> None:
@@ -4458,12 +4702,7 @@ async def cmd_separator(event) -> None:
         await _separator_check(event)
         return
     if choice in ("on", "off"):
-        enabled = choice == "on"
-        try:
-            config.save_env({"SEPARATOR": "1" if enabled else "0"})
-        except OSError as error:
-            ui.warn(f"Couldn't persist SEPARATOR: {error}")
-        _state["separator"] = enabled
+        _set_separator(choice == "on")
     if choice in ("scan", "on") and _state["separator"]:
         started = _start_separator_scan(event.chat_id)
         await _ack(event, _separator_status_text() + (

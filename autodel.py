@@ -10,9 +10,11 @@
     minutes later. These go on time whether the customer read them or not.
     The /add message itself (the receipt) is never touched.
 
-The only control is ``AUTODEL ON`` / ``AUTODEL OFF`` (any case, optional . or
-/ in front), sent in any chat. In a customer's DM the command deletes itself
-and the confirmation goes to Saved Messages.
+``AUTODEL ON`` / ``AUTODEL OFF`` (any case, optional . or / in front), sent in
+any chat, turns all of it on or off. ``.deladd off`` / ``.deladd on`` turns
+only the /add rules off or on; /category and /foreign keep their timer. In a
+customer's DM the command deletes itself and the confirmation goes to Saved
+Messages.
 
 Telegram does not mark a message as coming from a quick reply, so a send is
 recognised by matching its text or media against the stored quick replies,
@@ -69,6 +71,7 @@ MAX_TRIES = 6                        # a deletion that keeps failing is then dro
 BATCH = 100                          # Telegram deletes at most 100 per request
 
 COMMAND_RE = re.compile(r"^[./]?autodel\s+(on|off)$", re.IGNORECASE)
+DELADD_RE = re.compile(r"^[./]deladd(?:\s+(on|off|status))?$", re.IGNORECASE)
 
 
 LINK_RE = re.compile(r"(?:https?://|tg://|t\.me/|telegram\.me/)", re.IGNORECASE)
@@ -97,6 +100,7 @@ class AutoDelete:
         self.clock = clock
         self.on_deleted = on_deleted
         self.enabled = True
+        self.add_enabled = True
         # {"chat", "ids", "due", "tries", "why"}; due 0 = waiting to be read
         self.pending: list[dict] = []
         self.prints: dict[str, list[set]] = {}   # shortcut -> fingerprints per message
@@ -127,6 +131,7 @@ class AutoDelete:
             ui.warn(f"[autodel] {self.path.name} was unreadable ({error}); kept as {broken.name}")
             return
         self.enabled = bool(data.get("enabled", True))
+        self.add_enabled = bool(data.get("add_enabled", True))
         for chat, first_at in (data.get("add_chats") or {}).items():
             try:
                 self.add_chats[int(chat)] = float(first_at)
@@ -146,7 +151,7 @@ class AutoDelete:
                 continue
 
     def save(self) -> None:
-        data = {"enabled": self.enabled, "pending": self.pending,
+        data = {"enabled": self.enabled, "add_enabled": self.add_enabled, "pending": self.pending,
                 "add_chats": {str(k): v for k, v in self.add_chats.items()}}
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,6 +167,19 @@ class AutoDelete:
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
         self.save()
+
+    def set_add_enabled(self, enabled: bool) -> None:
+        """Turn the /add rules on or off. Off also forgets which chats had /add,
+        so turning it back on only watches chats with a new /add."""
+        self.add_enabled = enabled
+        if not enabled:
+            self.add_chats.clear()
+        self.save()
+
+    @property
+    def add_count(self) -> int:
+        """How many queued messages came from the /add rules."""
+        return sum(len(item["ids"]) for item in self.pending if item["why"].startswith("add"))
 
     @property
     def count(self) -> int:
@@ -213,6 +231,8 @@ class AutoDelete:
     # -- watching outgoing messages ---------------------------------------
     def note_add(self, chat_id: int) -> None:
         """/add was sent here: from now on links and files in this chat go on a timer."""
+        if not self.add_enabled:
+            return
         self.add_chats.setdefault(int(chat_id), 0.0)
         self.save()
 
@@ -267,7 +287,7 @@ class AutoDelete:
         if group and group in self.albums:
             return self.albums[group]
         chat_id = int(chat_id)
-        if chat_id in self.add_chats:
+        if self.add_enabled and chat_id in self.add_chats:
             # After /add the content decides, not the quick reply it came from.
             if not has_link_or_file(message):
                 return None
