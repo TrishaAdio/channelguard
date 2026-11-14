@@ -83,8 +83,10 @@ All three at once (any chat):
                                  .mists shows their status
 
 Videshi broadcast (any chat):
-  .lelebc                        send /forgein to every unread DM in
-                                 Videshi (.lelebc status = progress)
+  .lelebc                        send /forgein to every unread Videshi
+                                 DM where the customer wrote last
+  .lelebc reverse                delete all of it for both sides again
+  .lelebc cancel | status        stop / show the running one (one at a time)
 
 Business quick replies require Telegram Premium (the payment logger does not).
 
@@ -123,6 +125,7 @@ from telethon.tl.functions.messages import (
     EditMessageRequest,
     ExportChatInviteRequest,
     GetPeerDialogsRequest,
+    MarkDialogUnreadRequest,
     GetQuickRepliesRequest,
     GetQuickReplyMessagesRequest,
     HideChatJoinRequestRequest,
@@ -183,7 +186,7 @@ _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.
 _SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 _FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
 _MISTS_RE = re.compile(r"^[./]mists(?:\s+(on|off|status))?$", re.IGNORECASE)
-_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(status))?$", re.IGNORECASE)
+_LELEBC_RE = re.compile(r"^[./]lelebc(?:\s+(status|reverse|cancel)(?:\s+all)?)?$", re.IGNORECASE)
 
 # Owner-only Saved Messages broadcast:
 #   /broadcast 9:30 AM 18 JUL THANKS FOR
@@ -3385,7 +3388,9 @@ HELP_TEXT = (
     "<code>.mists</code> shows their status\n"
     "<b>Videshi broadcast</b> (any chat)\n"
     "<code>.lelebc</code> - sends your /forgein quick reply to every unread DM in the Videshi folder "
-    "right away (<code>.lelebc status</code> shows progress)\n"
+    "where the customer wrote last. <code>.lelebc reverse</code> deletes all of it for both sides and "
+    "marks those chats unread again. <code>.lelebc cancel</code> stops a running one, "
+    "<code>.lelebc status</code> shows it; only one runs at a time\n"
     "<b>Block</b>\n"
     "<code>L</code> in a private chat - clear the conversation for both sides and block"
 )
@@ -4517,6 +4522,15 @@ async def cmd_mists(event, low_cmd: str) -> None:
 
 
 _lelebc_run: dict = {}
+
+
+class LelebcCancelled(Exception):
+    pass
+
+
+def _lelebc_checkpoint() -> None:
+    if _lelebc_run.get("stop"):
+        raise LelebcCancelled
 LELEBC_GAP = (3.0, 6.0)
 LELEBC_BATCH = 50
 
@@ -4532,20 +4546,34 @@ async def _flood_safe(request):
             await asyncio.sleep(int(error.seconds) + 1)
 
 
+def _last_is_theirs(dialog, messages) -> bool:
+    """The newest message in this DM came from the customer, not from us."""
+    top = getattr(dialog, "top_message", None)
+    uid = getattr(getattr(dialog, "peer", None), "user_id", None)
+    for message in messages:
+        if (getattr(message, "id", None) == top
+                and getattr(getattr(message, "peer_id", None), "user_id", None) == uid):
+            return not getattr(message, "out", True)
+    return False
+
+
 async def _videshi_unread() -> tuple[dict, int]:
-    """Videshi chats with unread messages from the customer (or marked unread).
-    Returns ``({user id: peer}, how many chats Videshi holds)``."""
+    """Unread Videshi chats (unread messages or marked unread) whose newest
+    message came from the customer. Returns ``({user id: peer}, folder size)``."""
     members = await _sep_folders.members(wait_for_edits=False)
     ids = list(members)
     unread = {}
     for start in range(0, len(ids), LELEBC_BATCH):
+        _lelebc_checkpoint()
         batch = ids[start:start + LELEBC_BATCH]
         _lelebc_run["phase"] = f"reading Videshi: {start}/{len(ids)} chats checked"
         res = await _flood_safe(GetPeerDialogsRequest(
             peers=[tl_types.InputDialogPeer(peer=members[uid]) for uid in batch]))
+        messages = getattr(res, "messages", None) or []
         for dialog in getattr(res, "dialogs", None) or []:
             uid = getattr(getattr(dialog, "peer", None), "user_id", None)
-            if uid in members and (getattr(dialog, "unread_count", 0) or getattr(dialog, "unread_mark", False)):
+            is_unread = getattr(dialog, "unread_count", 0) or getattr(dialog, "unread_mark", False)
+            if uid in members and is_unread and _last_is_theirs(dialog, messages):
                 unread[uid] = members[uid]
         await asyncio.sleep(1)
     return unread, len(members)
@@ -4568,6 +4596,25 @@ async def _lelebc_report(text: str) -> None:
         ui.warn(f"[lelebc] couldn't report in Saved Messages ({error})")
 
 
+def _lelebc_load() -> dict:
+    try:
+        return json.loads(_lelebc_file().read_text(encoding="utf-8")).get("chats") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _lelebc_save(chats: dict) -> None:
+    path = _lelebc_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps({"chats": chats}), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _lelebc_file() -> Path:
+    return config.DATA_DIR / "lelebc.json"
+
+
 async def _lelebc_job() -> None:
     _lelebc_run.update(total=0, done=0, failed=0, phase="reading the Videshi folder")
     try:
@@ -4577,16 +4624,23 @@ async def _lelebc_job() -> None:
                              "Nothing was sent.")
         return
     if not targets:
-        await _lelebc_report(f"LELEBC: no unread DMs in Videshi ({total} chat(s) in the folder). Nothing sent.")
+        await _lelebc_report(f"LELEBC: no unread Videshi DM where the customer wrote last "
+                             f"({total} chat(s) in the folder). Nothing sent.")
         return
     _lelebc_run.update(total=len(targets), phase="sending")
-    print(ui.green("[lelebc] ") + f"{len(targets)} of {total} Videshi chats unread, sending /forgein", flush=True)
+    print(ui.green("[lelebc] ") + f"{len(targets)} of {total} Videshi chats waiting on you, sending /forgein",
+          flush=True)
+    record = _lelebc_load()
     done, failed = 0, []
     for uid, peer in targets.items():
+        _lelebc_checkpoint()
         for attempt in range(2):
             try:
-                sent = await _send_foreign_reply(uid, peer)
-                _remember_foreign_sent(uid, sent or [])
+                sent = list(await _send_foreign_reply(uid, peer) or [])
+                _remember_foreign_sent(uid, sent)
+                entry = record.setdefault(str(uid), {"ids": [], "hash": getattr(peer, "access_hash", 0)})
+                entry["ids"] = sorted(set(entry["ids"]) | set(sent))
+                _lelebc_save(record)
                 done += 1
                 break
             except FloodWaitError as error:
@@ -4601,45 +4655,130 @@ async def _lelebc_job() -> None:
                 break
         _lelebc_run.update(done=done, failed=len(failed))
         await asyncio.sleep(random.uniform(*LELEBC_GAP))
-    text = f"LELEBC DONE: /forgein sent to {done} of {len(targets)} unread Videshi chat(s) ({total} in the folder)."
+    text = f"LELEBC DONE: /forgein sent to {done} of {len(targets)} Videshi chat(s) ({total} in the folder)."
     if failed:
         text += f"\n{len(failed)} failed:\n" + "\n".join(failed[:30])
+    await _lelebc_report(text + "\n.lelebc reverse deletes them all again.")
+
+
+def _forget_lelebc_marks(uid: int, ids: set) -> None:
+    """Undo what a .lelebc send left behind: the /category guard mark and the
+    queued auto delete for those messages."""
+    if _category is not None:
+        key = "f:" + str(uid)
+        mark = _category.chats.get(key)
+        if mark and set(mark.get("ids") or []) <= ids:
+            _category.chats.pop(key, None)
+            _category.save()
+    if _autodel is not None:
+        changed = False
+        for item in list(_autodel.pending):
+            if item["chat"] == uid and set(item["ids"]) & ids:
+                item["ids"] = [i for i in item["ids"] if i not in ids]
+                if not item["ids"]:
+                    _autodel.pending.remove(item)
+                changed = True
+        if changed:
+            _autodel.save()
+
+
+async def _lelebc_reverse_job() -> None:
+    record = _lelebc_load()
+    _lelebc_run.update(total=len(record), done=0, failed=0, phase="reversing")
+    if not record:
+        await _lelebc_report("LELEBC REVERSE: nothing to delete - no .lelebc messages are on record.")
+        return
+    done, failed = 0, []
+    for key in list(record):
+        _lelebc_checkpoint()
+        uid, entry = int(key), record[key]
+        ids = [int(i) for i in entry.get("ids") or []]
+        peer = tl_types.InputPeerUser(user_id=uid, access_hash=int(entry.get("hash") or 0))
+        try:
+            for attempt in range(2):
+                try:
+                    await client.delete_messages(peer, ids, revoke=True)
+                    break
+                except FloodWaitError as error:
+                    if attempt or error.seconds > 900:
+                        raise
+                    _lelebc_run["phase"] = f"Telegram asked to wait {error.seconds}s"
+                    await asyncio.sleep(int(error.seconds) + 1)
+                    _lelebc_run["phase"] = "reversing"
+            _forget_lelebc_marks(uid, set(ids))
+            try:
+                await client(MarkDialogUnreadRequest(peer=tl_types.InputDialogPeer(peer=peer), unread=True))
+            except Exception as error:  # noqa: BLE001
+                ui.warn(f"[lelebc] {uid}: couldn't mark unread again ({error})")
+            record.pop(key, None)
+            _lelebc_save(record)
+            done += 1
+        except Exception as error:  # noqa: BLE001
+            failed.append(f"{uid}: {type(error).__name__}: {error}")
+        _lelebc_run.update(done=done, failed=len(failed))
+        await asyncio.sleep(1)
+    text = (f"LELEBC REVERSE DONE: deleted the .lelebc /forgein for both sides in {done} chat(s) and marked "
+            "them unread again. .lelebc can run again.")
+    if failed:
+        text += f"\n{len(failed)} failed (kept on record, .lelebc reverse retries them):\n" + "\n".join(failed[:30])
     await _lelebc_report(text)
 
 
-async def _lelebc_guarded() -> None:
+async def _lelebc_guarded(job) -> None:
     try:
-        await _lelebc_job()
+        await job()
+    except LelebcCancelled:
+        what = "deleted" if _lelebc_run.get("kind") == ".lelebc reverse" else "sent"
+        await _lelebc_report(f"LELEBC CANCELLED: {_lelebc_run.get('kind')} stopped after "
+                             f"{_lelebc_run.get('done', 0)} of {_lelebc_run.get('total', 0)} chat(s) {what}. "
+                             + ("Already sent ones stay; .lelebc reverse deletes them."
+                                if what == "sent" else "The rest stay on record for the next reverse."))
     except Exception as error:  # noqa: BLE001
         await _lelebc_report(f"LELEBC stopped: {type(error).__name__}: {error}")
 
 
 async def cmd_lelebc(event, low_cmd: str) -> None:
-    """`.lelebc`: send /forgein to every unread DM in Videshi right away;
-    `.lelebc status` shows what a running one is doing."""
-    choice = _LELEBC_RE.match(low_cmd).group(1) or ""
+    """`.lelebc` sends /forgein to unread Videshi DMs where the customer wrote
+    last; `.lelebc reverse` deletes everything .lelebc sent; `.lelebc cancel`
+    stops a running one; `.lelebc status` shows it. Only one runs at a time."""
+    choice = (_LELEBC_RE.match(low_cmd).group(1) or "").lower()
     task = _lelebc_run.get("task")
     running = task is not None and not task.done()
+    kind = _lelebc_run.get("kind", ".lelebc")
     if choice == "status":
         if not running:
-            note = "No .lelebc is running."
-        elif _lelebc_run.get("phase") == "sending":
-            note = (f"Sending /forgein: {_lelebc_run.get('done', 0)}/{_lelebc_run.get('total', 0)} done, "
+            note = f"Nothing is running. {len(_lelebc_load())} chat(s) have .lelebc messages on record."
+        elif _lelebc_run.get("phase") in ("sending", "reversing"):
+            note = (f"{kind} running: {_lelebc_run.get('done', 0)}/{_lelebc_run.get('total', 0)} done, "
                     f"{_lelebc_run.get('failed', 0)} failed.")
         else:
-            note = f".lelebc is running: {_lelebc_run.get('phase', 'starting')}."
+            note = f"{kind} running: {_lelebc_run.get('phase', 'starting')}."
         await _confirm_in_saved(event, note, "lelebc")
         return
+    if choice == "cancel":
+        if not running:
+            await _confirm_in_saved(event, "Nothing to cancel - no .lelebc is running.", "lelebc")
+            return
+        _lelebc_run["stop"] = True
+        await _confirm_in_saved(event, f"Cancelling {kind}: it stops before the next chat.", "lelebc")
+        return
     if running:
-        await _confirm_in_saved(event, "A .lelebc is already running; .lelebc status shows it.", "lelebc")
+        await _confirm_in_saved(event, f"{kind} is already running - only one at a time. "
+                                       ".lelebc status shows it, .lelebc cancel stops it.", "lelebc")
+        return
+    if choice == "reverse":
+        _lelebc_run.update(stop=False, kind=".lelebc reverse", task=asyncio.create_task(_lelebc_guarded(_lelebc_reverse_job)))
+        await _confirm_in_saved(event, f"LELEBC REVERSE started: deleting the /forgein .lelebc sent in "
+                                       f"{len(_lelebc_load())} chat(s) for both sides. The result comes here.",
+                                "lelebc")
         return
     if _sep_folders is None:
         await _confirm_in_saved(event, "The separator isn't ready yet, so the Videshi folder can't be read.", "lelebc")
         return
-    _lelebc_run["task"] = asyncio.create_task(_lelebc_guarded())
-    await _confirm_in_saved(event, f"LELEBC started: reading the Videshi folder, then sending /forgein to every "
-                                   f"unread chat, one every {LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. The result "
-                                   "comes here; .lelebc status shows progress.", "lelebc")
+    _lelebc_run.update(stop=False, kind=".lelebc", task=asyncio.create_task(_lelebc_guarded(_lelebc_job)))
+    await _confirm_in_saved(event, f"LELEBC started: sending /forgein to every unread Videshi chat where the "
+                                   f"customer wrote last, one every {LELEBC_GAP[0]:.0f}-{LELEBC_GAP[1]:.0f}s. "
+                                   "The result comes here; .lelebc status / .lelebc cancel.", "lelebc")
 
 
 async def cmd_categoryguard(event) -> None:
