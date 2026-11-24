@@ -323,6 +323,14 @@ On by default, nothing to configure:
 - The queue is kept in `data/autodel.json`, so a restart loses nothing; anything that fell due while the bot was off is deleted when it starts again.
 - Quick replies are recognised by their content, like `/category` above. Texts under 12 characters never match on their own.
 
+### `.wipe`: leave and clear every chat
+
+`.wipe` (Saved Messages) leaves and clears **every** chat except Saved Messages: groups and channels are left, and private chats are cleared for both sides. It runs on the logged-in account.
+
+- It previews first (`.wipe` shows how many chats it will touch) and does nothing until you send `.wipe confirm` within 10 minutes. `.wipe cancel` drops the preview, or stops a running wipe before its next chat.
+- `.wipe status` shows progress; the result arrives in Saved Messages. Only one wipe runs at a time.
+- **This cannot be undone.** Left groups/channels need a new invite to rejoin, and cleared private chats are gone for both sides.
+
 ## Files
 
 | File            | Role                                                          |
