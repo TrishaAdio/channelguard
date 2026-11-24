@@ -51,6 +51,9 @@ Backup + screenshot ZIPs (Saved Messages):
                                  that IST day's payment screenshots as a ZIP
   .ssauto [on|off]               auto-send each finished day's ZIP to SS_CHANNEL
   .ssto <@channel|id>            where the daily ZIPs go (default @ohthatsthepoint)
+  .wipe                          leave and clear EVERY chat except Saved
+                                 Messages; previews, then .wipe confirm
+                                 (.wipe cancel / .wipe status)
   .help                          show every command and template parameter
 
 DM country separator (any chat):
@@ -2865,6 +2868,141 @@ async def cmd_stats(event) -> None:
     )
 
 
+_wipe_run: dict = {}
+_pending_wipe: dict = {}
+WIPE_GAP = (1.0, 2.0)
+
+
+class WipeCancelled(Exception):
+    pass
+
+
+def _wipe_checkpoint() -> None:
+    if _wipe_run.get("stop"):
+        raise WipeCancelled
+
+
+async def _wipe_report(text: str) -> None:
+    ui.info(f"[wipe] {text.splitlines()[0]}")
+    try:
+        await client.send_message("me", text[:4000])
+    except Exception as error:  # noqa: BLE001
+        ui.warn(f"[wipe] couldn't report in Saved Messages ({error})")
+
+
+async def _wipe_targets() -> list:
+    """Every dialog except Saved Messages, as (entity, name, is_user)."""
+    found = []
+    async for dialog in client.iter_dialogs():
+        if dialog.id == _state["self_id"]:
+            continue
+        found.append((dialog.entity, dialog.name or str(dialog.id), bool(dialog.is_user)))
+    return found
+
+
+async def _wipe_job() -> None:
+    _wipe_run.update(total=0, done=0, failed=0, phase="listing your chats")
+    try:
+        targets = await _wipe_targets()
+    except Exception as error:  # noqa: BLE001
+        await _wipe_report(f"WIPE: couldn't list your chats ({type(error).__name__}: {error}). Nothing done.")
+        return
+    _wipe_run.update(total=len(targets), phase="wiping")
+    print(ui.green("[wipe] ") + f"leaving and clearing {len(targets)} chat(s)", flush=True)
+    done, failed = 0, []
+    for entity, name, is_user in targets:
+        _wipe_checkpoint()
+        try:
+            await client.delete_dialog(entity, revoke=True)
+            done += 1
+        except FloodWaitError as error:
+            if error.seconds > 900:
+                failed.append(f"{name}: Telegram asked to wait {error.seconds}s")
+            else:
+                _wipe_run["phase"] = f"Telegram asked to wait {error.seconds}s"
+                await asyncio.sleep(int(error.seconds) + 1)
+                _wipe_run["phase"] = "wiping"
+                try:
+                    await client.delete_dialog(entity, revoke=True)
+                    done += 1
+                except Exception as retry:  # noqa: BLE001
+                    failed.append(f"{name}: {type(retry).__name__}: {retry}")
+        except Exception as error:  # noqa: BLE001
+            failed.append(f"{name}: {type(error).__name__}: {error}")
+        _wipe_run.update(done=done, failed=len(failed))
+        await asyncio.sleep(random.uniform(*WIPE_GAP))
+    text = f"WIPE DONE: left and cleared {done} of {len(targets)} chat(s). Saved Messages was kept."
+    if failed:
+        text += f"\n{len(failed)} failed:\n" + "\n".join(failed[:30])
+    await _wipe_report(text)
+
+
+async def _wipe_guarded() -> None:
+    try:
+        await _wipe_job()
+    except WipeCancelled:
+        await _wipe_report(f"WIPE CANCELLED: stopped after {_wipe_run.get('done', 0)} of "
+                           f"{_wipe_run.get('total', 0)} chat(s). The ones already done stay gone.")
+    except Exception as error:  # noqa: BLE001
+        await _wipe_report(f"WIPE stopped: {type(error).__name__}: {error}")
+
+
+async def cmd_wipe(event, low: str) -> None:
+    """`.wipe` leaves and clears every chat except Saved Messages. Because it
+    can't be undone it previews first and waits for `.wipe confirm`;
+    `.wipe cancel` drops the preview or stops a running wipe; `.wipe status`
+    shows a running one. Only one wipe runs at a time."""
+    parts = low.split()
+    sub = parts[1] if len(parts) > 1 else ""
+    task = _wipe_run.get("task")
+    running = task is not None and not task.done()
+
+    if sub == "status":
+        if not running:
+            note = "No wipe is running."
+        elif _wipe_run.get("phase") == "wiping":
+            note = (f"Wiping: {_wipe_run.get('done', 0)}/{_wipe_run.get('total', 0)} done, "
+                    f"{_wipe_run.get('failed', 0)} failed.")
+        else:
+            note = f"Wipe running: {_wipe_run.get('phase', 'starting')}."
+        await _ack(event, note)
+        return
+    if sub == "cancel":
+        had_preview = bool(_pending_wipe.get("until"))
+        _pending_wipe.clear()
+        if running:
+            _wipe_run["stop"] = True
+            await _ack(event, "Cancelling the wipe: it stops before the next chat.")
+        elif had_preview:
+            await _ack(event, "Wipe preview dropped - nothing was changed.")
+        else:
+            await _ack(event, "Nothing to cancel.")
+        return
+    if running:
+        await _ack(event, "A wipe is already running - only one at a time. "
+                          ".wipe status shows it, .wipe cancel stops it.")
+        return
+    if sub == "confirm":
+        if not _pending_wipe.get("until") or time.monotonic() > _pending_wipe.get("until", 0):
+            await _ack(event, "Nothing to confirm (or it expired). Send .wipe first.")
+            return
+        _pending_wipe.clear()
+        _wipe_run.update(stop=False, task=asyncio.create_task(_wipe_guarded()))
+        await _ack(event, "WIPE started: leaving and clearing every chat except Saved Messages. "
+                          "The result comes here; .wipe status / .wipe cancel.")
+        return
+
+    try:
+        count = len(await _wipe_targets())
+    except Exception as error:  # noqa: BLE001
+        await _ack(event, f"Couldn't list your chats: {type(error).__name__}: {error}")
+        return
+    _pending_wipe.update(until=time.monotonic() + 600)
+    await _ack(event, f"WIPE will LEAVE and CLEAR all {count} chat(s) for both sides - groups and channels "
+                      "are left, private chats are cleared. Saved Messages is kept. This CANNOT be undone.\n"
+                      "Send .wipe confirm within 10 minutes to do it, or .wipe cancel.")
+
+
 async def cmd_clear(event) -> None:
     """Exclude today's valid payments from stats without deleting audit links."""
     key = _today_key()
@@ -3392,7 +3530,11 @@ HELP_TEXT = (
     "marks those chats unread again. <code>.lelebc cancel</code> stops a running one, "
     "<code>.lelebc status</code> shows it; only one runs at a time\n"
     "<b>Block</b>\n"
-    "<code>L</code> in a private chat - clear the conversation for both sides and block"
+    "<code>L</code> in a private chat - clear the conversation for both sides and block\n"
+    "<b>Wipe</b> (Saved Messages)\n"
+    "<code>.wipe</code> - leave and clear EVERY chat except Saved Messages (groups/channels left, "
+    "private chats cleared for both sides). Previews first, then <code>.wipe confirm</code>; "
+    "<code>.wipe cancel</code> stops it, <code>.wipe status</code> shows progress. Cannot be undone"
 )
 
 
@@ -3846,6 +3988,9 @@ async def _handle_outgoing(event):
         return
     if command == ".qrrebuild":
         await cmd_qr_rebuild(event)
+        return
+    if command == ".wipe":
+        await cmd_wipe(event, low)
         return
     if low.startswith("/broadcast"):
         reply = await event.get_reply_message()
