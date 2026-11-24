@@ -2870,7 +2870,7 @@ async def cmd_stats(event) -> None:
 
 _wipe_run: dict = {}
 _pending_wipe: dict = {}
-WIPE_GAP = (1.0, 2.0)
+WIPE_CONCURRENCY = 20
 
 
 class WipeCancelled(Exception):
@@ -2909,28 +2909,40 @@ async def _wipe_job() -> None:
         return
     _wipe_run.update(total=len(targets), phase="wiping")
     print(ui.green("[wipe] ") + f"leaving and clearing {len(targets)} chat(s)", flush=True)
-    done, failed = 0, []
-    for entity, name, is_user in targets:
-        _wipe_checkpoint()
-        try:
-            await client.delete_dialog(entity, revoke=True)
-            done += 1
-        except FloodWaitError as error:
-            if error.seconds > 900:
-                failed.append(f"{name}: Telegram asked to wait {error.seconds}s")
-            else:
-                _wipe_run["phase"] = f"Telegram asked to wait {error.seconds}s"
-                await asyncio.sleep(int(error.seconds) + 1)
-                _wipe_run["phase"] = "wiping"
+    counters = {"done": 0, "failed": 0}
+    failed: list[str] = []
+    semaphore = asyncio.Semaphore(WIPE_CONCURRENCY)
+
+    async def wipe_one(entity, name):
+        async with semaphore:
+            if _wipe_run.get("stop"):
+                return
+            for attempt in range(2):
                 try:
                     await client.delete_dialog(entity, revoke=True)
-                    done += 1
-                except Exception as retry:  # noqa: BLE001
-                    failed.append(f"{name}: {type(retry).__name__}: {retry}")
-        except Exception as error:  # noqa: BLE001
-            failed.append(f"{name}: {type(error).__name__}: {error}")
-        _wipe_run.update(done=done, failed=len(failed))
-        await asyncio.sleep(random.uniform(*WIPE_GAP))
+                    counters["done"] += 1
+                    break
+                except FloodWaitError as error:
+                    if attempt or error.seconds > 900:
+                        failed.append(f"{name}: Telegram asked to wait {error.seconds}s")
+                        break
+                    await asyncio.sleep(int(error.seconds) + 1)
+                except Exception as error:  # noqa: BLE001
+                    failed.append(f"{name}: {type(error).__name__}: {error}")
+                    break
+            counters["failed"] = len(failed)
+            _wipe_run.update(done=counters["done"], failed=counters["failed"])
+
+    workers = [asyncio.create_task(wipe_one(entity, name)) for entity, name, _is_user in targets]
+    try:
+        await asyncio.gather(*workers)
+    except asyncio.CancelledError:
+        for worker in workers:
+            worker.cancel()
+        raise
+    if _wipe_run.get("stop"):
+        raise WipeCancelled
+    done = counters["done"]
     text = f"WIPE DONE: left and cleared {done} of {len(targets)} chat(s). Saved Messages was kept."
     if failed:
         text += f"\n{len(failed)} failed:\n" + "\n".join(failed[:30])
