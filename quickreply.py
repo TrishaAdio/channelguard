@@ -40,6 +40,8 @@ Payment logger (send these yourself in ANY chat):
   /cancel                        in the upload channel, reply to a payment post
                                  -> mark it fake, remove it from today's stats,
                                     and revoke/remove buyer-bound access
+  .minus <amount>                in the upload channel: subtract that amount
+                                 from today's total (e.g. .minus 232)
   /clear                         reset today's stats to zero
   .ping                          verify the quick-reply userbot is running
 
@@ -185,6 +187,7 @@ FIND_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+", re.IGNO
 # `/setchannelpostofpayment`.
 _SETCHANNEL_RE = re.compile(r"^[./]setchannel(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _UNBAN_RE = re.compile(r"^[./]unban(?:\s+([\s\S]+))?$", re.IGNORECASE)
+_MINUS_RE = re.compile(r"^[./]minus(?:\s+([\s\S]+))?$", re.IGNORECASE)
 _CATEGORY_RE = re.compile(r"^[./]cat(?:egory)?guard(?:\s+(reset|status))?$", re.IGNORECASE)
 _SEPARATOR_RE = re.compile(r"^[./](?:separator|videshi)(?:\s+(on|off|status|scan|check))?$", re.IGNORECASE)
 _FIX_RE = re.compile(r"^[./]fix(?:\s+(on|off|status))?$", re.IGNORECASE)
@@ -608,6 +611,7 @@ def _default_pay() -> dict:
         "done_template": DEFAULT_DONE,
         "channel_template": DEFAULT_CHANNEL,
         "payments": [],
+        "deductions": [],
     }
 
 
@@ -712,6 +716,32 @@ def _normalize_pay_data(value) -> tuple[dict, list[str]]:
                 payment[key] = converted
         payments.append(payment)
     data["payments"] = payments
+
+    raw_deductions = data.get("deductions", [])
+    if not isinstance(raw_deductions, list):
+        repairs.append("invalid deductions value replaced with an empty list")
+        raw_deductions = []
+    deductions = []
+    for index, raw in enumerate(raw_deductions):
+        if not isinstance(raw, dict):
+            repairs.append(f"deduction #{index + 1} skipped (expected an object)")
+            continue
+        deduction = dict(raw)
+        try:
+            amount = parse_amount(deduction.get("amount"))
+            ts = float(deduction.get("ts"))
+            if not math.isfinite(ts):
+                raise ValueError
+            datetime.fromtimestamp(ts, _TZ)
+        except (TypeError, ValueError, InvalidOperation, OverflowError, OSError):
+            repairs.append(f"deduction #{index + 1} skipped (invalid amount/time)")
+            continue
+        deduction["amount"] = format(amount, "f")
+        deduction["ts"] = ts
+        status = str(deduction.get("status") or "valid").lower()
+        deduction["status"] = status if status in ("valid", "cleared") else "cleared"
+        deductions.append(deduction)
+    data["deductions"] = deductions
     return data, repairs
 
 
@@ -870,6 +900,19 @@ def _payment_total(payments) -> Decimal:
     return sum((_money(payment["amount"]) for payment in payments), Decimal("0.00"))
 
 
+def _todays_deductions() -> list:
+    key = _today_key()
+    return [
+        d for d in _pay.get("deductions", [])
+        if d.get("status", "valid") == "valid" and _today_key(d["ts"]) == key
+    ]
+
+
+def _todays_net_total(payments=None) -> Decimal:
+    payments = _todays_payments() if payments is None else payments
+    return _payment_total(payments) - _payment_total(_todays_deductions())
+
+
 def fmt_inr(value) -> str:
     """Format exact money with the Rupee sign and Indian digit grouping."""
     value = _money(value)
@@ -924,7 +967,7 @@ def _pay_mapping(amount: Decimal, name: str, order_id: str = "",
                  include_current: bool = False, link: str = "") -> dict:
     amount = _money(amount)
     day = _todays_payments()
-    today_total = _payment_total(day)
+    today_total = _todays_net_total(day)
     today_count = len(day)
     if include_current:
         today_total += amount
@@ -2856,16 +2899,46 @@ async def cmd_setchannel(event) -> None:
     await _recover_pending_payments(recover_interrupted_adds=False)
 
 
-async def cmd_stats(event) -> None:
+def _stats_text() -> str:
     day = _todays_payments()
-    total = _payment_total(day)
+    total = _todays_net_total(day)
     rio = total * Decimal(str(config.RIO_PCT)) / Decimal("100")
     marco = total * Decimal(str(config.MARCO_PCT)) / Decimal("100")
-    await _ack(
-        event,
-        f"Today - {fmt_inr(total)} - {len(day)} payments\n"
-        f"Rio {fmt_inr(rio)} - Marco {fmt_inr(marco)}"
-    )
+    text = f"Today - {fmt_inr(total)} - {len(day)} payments\n"
+    minus = _payment_total(_todays_deductions())
+    if minus:
+        text += f"Collected {fmt_inr(_payment_total(day))} - minus {fmt_inr(minus)}\n"
+    return text + f"Rio {fmt_inr(rio)} - Marco {fmt_inr(marco)}"
+
+
+async def cmd_stats(event) -> None:
+    await _ack(event, _stats_text())
+
+
+async def cmd_minus(event) -> None:
+    channel = _optional_int(_pay.get("post_channel"))
+    if channel is None:
+        await _ack(event, "PAYMENT_CHANNEL is not set. Run .setchannel in the payment channel first.")
+        return
+    if int(event.chat_id) != channel:
+        await _ack(event, "Use .minus inside the payment channel.")
+        return
+    match = _MINUS_RE.match((event.raw_text or "").strip())
+    raw_amount = (match.group(1) or "").strip() if match else ""
+    try:
+        amount = parse_amount(raw_amount)
+    except ValueError:
+        await _ack(event, "Usage: .minus <amount>  (e.g. .minus 232)")
+        return
+    _pay.setdefault("deductions", []).append({
+        "amount": format(amount, "f"),
+        "ts": _now_ts(),
+        "chat_id": int(event.chat_id),
+        "message_id": int(event.id),
+        "status": "valid",
+    })
+    _save_pay()
+    await _ack(event, f"Minus {fmt_inr(amount)}\n" + _stats_text())
 
 
 _wipe_run: dict = {}
@@ -3028,6 +3101,9 @@ async def cmd_clear(event) -> None:
             payment["status"] = "cleared"
             payment["cleared_ts"] = cleared_ts
             cleared += 1
+    for deduction in _todays_deductions():
+        deduction["status"] = "cleared"
+        deduction["cleared_ts"] = cleared_ts
     _save_pay()
     await _ack(
         event,
@@ -3477,6 +3553,7 @@ HELP_TEXT = (
     "group this account admins (or reply to them)\n"
     "<code>/stats</code> - today's total, count, and split\n"
     "<code>/cancel</code> - in the upload channel, reply to a payment post: mark it fake, remove it from stats, and revoke buyer-bound access\n"
+    "<code>.minus &lt;amount&gt;</code> - in the upload channel: subtract that amount from today's total (e.g. <code>.minus 232</code>)\n"
     "<code>/clear</code> - reset today's stats to zero\n\n"
     "<b>Template parameters</b>\n"
     "<code>{amount}</code> this payment - <code>{name}</code> name from /add - "
@@ -3956,6 +4033,10 @@ async def _handle_outgoing(event):
     if low_cmd == "/clear":
         async with _payment_lock:
             await cmd_clear(event)
+        return
+    if _MINUS_RE.match(low_cmd):
+        async with _payment_lock:
+            await cmd_minus(event)
         return
 
     # Only a plain, unforwarded, text-only uppercase L triggers this destructive

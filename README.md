@@ -207,6 +207,7 @@ commands work in **any** chat, not only Saved Messages. The payment logger does
 | `.unban <id \| @username>` (or reply to the user) | lift that user's ban in every group/channel this account admins, and tell the admin bot to drop its durable ban records so nothing re-bans them |
 | `/stats` | today's total (INR), payment count, and Rio/Marco split |
 | reply to a payment post + `/cancel` (in the upload channel) | mark the post **FAKE PAYMENT**, exclude it from stats, revoke every buyer-bound link, and remove a buyer who already joined |
+| `.minus <amount>` (in the upload channel) | subtract that amount from today's total, e.g. `.minus 232`; `/stats` and `{todaytotal}` show the reduced total, the payment count is unchanged, and `/clear` resets it with the rest of today |
 | `/clear` | reset today's stats to zero |
 | `.ping` | verify that `quickreply.py` is running and receiving outgoing commands |
 | `.help` | show every command and template parameter |
