@@ -332,6 +332,10 @@ On by default, nothing to configure:
 - `.wipe status` shows progress; the result arrives in Saved Messages. Only one wipe runs at a time.
 - **This cannot be undone.** Left groups/channels need a new invite to rejoin, and cleared private chats are gone for both sides.
 
+## UPI payment proof OCR API (`ocrapi/`)
+
+A separate HTTP service that reads UPI payment screenshots and returns the amount, status, UTR, date, payee and payer as JSON with per-field confidence. See [`ocrapi/README.md`](ocrapi/README.md).
+
 ## Files
 
 | File            | Role                                                          |

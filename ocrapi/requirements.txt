@@ -1,0 +1,10 @@
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+paddlepaddle==3.2.0
+paddleocr==3.7.0
+paddlex[ocr-core]==3.7.2
+fastapi==0.165.0
+uvicorn==0.54.0
+python-multipart==0.0.34
+pillow==12.1.0
+httpx==0.28.1
+numpy==2.3.5
